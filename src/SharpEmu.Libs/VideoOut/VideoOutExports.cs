@@ -94,6 +94,12 @@ public static class VideoOutExports
             ? Math.Max(1, holdFlip)
             : 1;
     private static long _presentedFrameCount;
+    
+    // KytyPS5-style improved frame timing
+    private static readonly int _vblankPrecisionMicroseconds = 
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_VBLANK_PRECISION_US"), out var precision)
+            ? Math.Max(100, precision)
+            : 100;
 
     static VideoOutExports()
     {
@@ -1399,15 +1405,30 @@ public static class VideoOutExports
                     userData);
             }
 
+            // Improved timing: use higher precision timing like KytyPS5
             var interval = Stopwatch.Frequency / Math.Max(1, (long)refresh);
             next += interval;
             var now = Stopwatch.GetTimestamp();
             if (next < now)
             {
+                // Missed deadline, reset to now to avoid accumulating lag
                 next = now;
             }
 
-            HostTiming.SleepUntil(next);
+            // Use precise sleep like KytyPS5
+            var remainingMicroseconds = ((next - now) * 1_000_000L) / Stopwatch.Frequency;
+            if (remainingMicroseconds > 0)
+            {
+                if (remainingMicroseconds >= 1000)
+                {
+                    Thread.Sleep((int)(remainingMicroseconds / 1000));
+                }
+                // Spin-wait for remaining microseconds for precision
+                while (Stopwatch.GetTimestamp() < next)
+                {
+                    Thread.SpinWait(10);
+                }
+            }
         }
     }
 
@@ -1417,6 +1438,7 @@ public static class VideoOutExports
     /// the guest runs as fast as the GPU pipeline drains, so frame delivery
     /// is bursty and animation judders. When the emulator runs slower than
     /// the target rate the sleep never engages.
+    /// Improved timing based on KytyPS5's precise vblank implementation.
     /// </summary>
     private static void PaceFlip(int flipRate)
     {
@@ -1441,12 +1463,19 @@ public static class VideoOutExports
             return;
         }
 
-        var waitMilliseconds = (target - now) * 1000 / Stopwatch.Frequency;
-        if (waitMilliseconds is >= 0 and < 100)
+        // KytyPS5-style precise timing with microsecond precision
+        var remainingMicroseconds = ((target - now) * 1_000_000L) / Stopwatch.Frequency;
+        if (remainingMicroseconds > 0)
         {
-            // Precise wait: Thread.Sleep alone overshoots by a scheduler
-            // quantum, which caps the flip rate below the target cadence.
-            HostTiming.SleepUntil(target);
+            if (remainingMicroseconds >= 1000)
+            {
+                Thread.Sleep((int)(remainingMicroseconds / 1000));
+            }
+            // Spin-wait for remaining microseconds for precision
+            while (Stopwatch.GetTimestamp() < target)
+            {
+                Thread.SpinWait(10);
+            }
         }
 
         Interlocked.CompareExchange(ref _lastFlipPacingTimestamp, target, last);

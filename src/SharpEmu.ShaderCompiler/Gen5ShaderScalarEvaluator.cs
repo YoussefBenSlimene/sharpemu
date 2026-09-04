@@ -1949,6 +1949,16 @@ public static class Gen5ShaderScalarEvaluator
     {
         scalarConditionCode = false;
         error = string.Empty;
+        // RDNA2 GPR-index / VS-skip control: mode-only, no value produced.
+        // Static evaluation skips them entirely.
+        if (instruction.Opcode is "SSetVskip" or
+            "SSetGprIdxOn" or
+            "SSetGprIdxMode" or
+            "SSetGprIdxOff")
+        {
+            return true;
+        }
+
         if (instruction.Sources.Count != 2 ||
             !TryEvaluateScalarOperand(instruction.Sources[0], registers, out var left) ||
             !TryEvaluateScalarOperand(instruction.Sources[1], registers, out var right))

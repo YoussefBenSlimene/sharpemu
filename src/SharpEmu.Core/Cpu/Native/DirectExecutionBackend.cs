@@ -247,6 +247,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private CpuContext? _cpuContext;
 
+	// Main entry thread tracking for diagnostics. The entry thread runs guest code
+	// inline (ExecuteEntry -> CallNativeEntry) and is never added to _guestThreads,
+	// so the stall watchdog and RIP sampler cannot see it. Stash its host thread id
+	// and context so the stall snapshot can capture the *actual* guest RIP it is
+	// spinning at, instead of the stale last-import stub address.
+	private int _mainThreadHostThreadId;
+	private CpuContext? _mainThreadContext;
+
 	// Debugger seam; both null when no debugger is attached.
 	private ICpuDebugHook? _debugHook;
 
@@ -1137,6 +1145,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		Console.Error.WriteLine(_moduleManager.TryGetExport("L-Q3LEjIbgA", out ExportedFunction export2) ? ("[LOADER][INFO] ExportCheck map_direct: " + export2.LibraryName + ":" + export2.Name) : "[LOADER][INFO] ExportCheck map_direct: MISSING");
 		_entryPoint = entryPoint;
 		_cpuContext = context;
+		Volatile.Write(ref _mainThreadHostThreadId, unchecked((int)GetCurrentThreadId()));
+		_mainThreadContext = context;
 		_debugHook = executionOptions.DebugHook;
 		_returnFallbackTarget = context[CpuRegister.Rsi];
 		Volatile.Write(ref _globalFallbackTarget, _returnFallbackTarget);
@@ -2935,7 +2945,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int hostPauseJump = offset;
 		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4C);
+		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4D);
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11); // lock cmpxchg [r9], r10
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int hostRetryJump = offset;
@@ -3018,8 +3028,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int guestPauseJump = offset;
 		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4C);
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11);
+		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4D);
+		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11); // lock cmpxchg [r9], r10
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int guestRetryJump = offset;
 		EmitUInt32(code, ref offset, 0u);
@@ -6869,6 +6879,120 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			if (rsp != 0 && cpuContext.TryReadUInt64(rsp, out var value) && cpuContext.TryReadUInt64(rsp + 8, out var value2))
 			{
 				Console.Error.WriteLine($"[LOADER][ERROR] Stall stack: [rsp]=0x{value:X16} [rsp+8]=0x{value2:X16}");
+			}
+
+			// The entry thread is not in _guestThreads, so the thread dump above never
+			// includes it. Capture its host RIP directly: because the address space is
+			// identity-mapped, the host RIP *is* the guest RIP currently executing.
+			var mainTid = Volatile.Read(ref _mainThreadHostThreadId);
+			var mainContext = _mainThreadContext;
+			if (mainTid != 0 && mainContext is not null &&
+				TryCaptureHostThreadContext(mainTid, out var mainSnap) && mainSnap.IsValid)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] Stall main-thread: host_tid={mainTid} guest_rip=0x{mainSnap.Rip:X16} " +
+					$"guest_rsp=0x{mainSnap.Rsp:X16} guest_rax=0x{mainSnap.Rax:X16} guest_rbx=0x{mainSnap.Rbx:X16} " +
+					$"guest_rcx=0x{mainSnap.Rcx:X16} guest_rdx=0x{mainSnap.Rdx:X16}");
+			var curRip = mainSnap.Rip;
+				Span<byte> memBuf = stackalloc byte[8];
+				for (var ins = 0; ins < 12; ins++)
+				{
+					// Prefer the guest map; fall back to raw host memory (the entry
+					// thread may be spinning inside an emulator-emitted stub, which is
+					// host RWX memory not present in the guest region map).
+					byte[] insBytes;
+					if (!Disasm.IcedDecoder.TryReadGuestBytes(mainContext.Memory, curRip, 15, out insBytes))
+					{
+						insBytes = new byte[15];
+						bool hostOk;
+						unsafe
+						{
+							try
+							{
+								new ReadOnlySpan<byte>((void*)curRip, 15).CopyTo(insBytes);
+								hostOk = true;
+							}
+							catch { hostOk = false; }
+						}
+						if (!hostOk)
+						{
+							break;
+						}
+					}
+
+					if (!Disasm.IcedDecoder.TryDecode(curRip, insBytes, out var decoded))
+					{
+						break;
+					}
+
+					var memText = decoded.MemoryAddress.HasValue
+						? $"  ; [mem] -> 0x{decoded.MemoryAddress.Value:X16}"
+						: string.Empty;
+					if (decoded.MemoryAddress.HasValue &&
+						mainContext.Memory.TryRead(decoded.MemoryAddress.Value, memBuf))
+					{
+						memText += $" = 0x{System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(memBuf):X16}";
+					}
+					Console.Error.WriteLine($"[LOADER][ERROR]   spin 0x{curRip:X16}: {decoded.Text}{memText}");
+					curRip += (ulong)decoded.Length;
+				}
+
+				// The spin loop the entry thread lands in does `call rax` (a host
+				// wait primitive). Identify the Windows API it is waiting on so we can
+				// tell whether it is a semaphore/event/Sleep. Captured rax may itself
+				// be stale if we snapped mid-instruction, so also walk the module list.
+				try
+				{
+					var callTarget = mainSnap.Rax;
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] main-thread suggests call/resume target: rax=0x{callTarget:X16}");
+					var proc = System.Diagnostics.Process.GetCurrentProcess();
+					foreach (System.Diagnostics.ProcessModule mod in proc.Modules)
+					{
+						var baseAddr = (ulong)mod.BaseAddress.ToInt64();
+						var moduleSize = (ulong)mod.ModuleMemorySize;
+						if (callTarget >= baseAddr && callTarget < baseAddr + Math.Max(moduleSize, 0x1000u))
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][ERROR]   -> rax resolves to {mod.ModuleName}+0x{callTarget - baseAddr:X}");
+							break;
+						}
+					}
+				}
+				catch
+				{
+				}
+			}
+
+			// Dump who (if anyone) holds the VEH managed-entry spinlock. The raw,
+			// vectored, and unhandled-filter handlers all wrap their managed entry in
+			// this same lock; a faulting thread that blocks inside a handler while
+			// holding it wedges every other thread that subsequently faults.
+			if (_vehManagedEntryLock != 0)
+			{
+				unsafe
+				{
+					try
+					{
+						nint owner = *(nint*)_vehManagedEntryLock;
+						int depth = *(int*)(_vehManagedEntryLock + 8);
+						Console.Error.WriteLine(
+							$"[LOADER][ERROR] VEH managed-entry lock: owner_tid={owner} depth={depth} self={unchecked((int)GetCurrentThreadId())}");
+						if (owner != 0 &&
+							unchecked((uint)owner) != GetCurrentThreadId() &&
+							TryCaptureHostThreadContext(unchecked((int)owner), out var ownerSnap) &&
+							ownerSnap.IsValid)
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][ERROR] VEH lock owner: rip=0x{ownerSnap.Rip:X16} rsp=0x{ownerSnap.Rsp:X16} " +
+								$"rbp=0x{ownerSnap.Rbp:X16} rax=0x{ownerSnap.Rax:X16} rbx=0x{ownerSnap.Rbx:X16} " +
+								$"rcx=0x{ownerSnap.Rcx:X16} rdx=0x{ownerSnap.Rdx:X16}");
+						}
+					}
+					catch
+					{
+					}
+				}
 			}
 
 			var threads = SnapshotGuestThreads();

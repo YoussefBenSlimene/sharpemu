@@ -118,6 +118,87 @@ internal static unsafe class VulkanVideoPresenter
     internal static bool IsGuestTexture3D(uint type) =>
         type == Gen5TextureType3D;
 
+    private sealed class GuestImageResource
+    {
+        public ulong Address;
+        public long FlipVersion;
+        public uint Width;
+        public uint Height;
+        public uint Depth = 1;
+        public uint Type = Gen5TextureType2D;
+        // Unscaled guest-requested size; Width/Height are the physical (scaled) backing size.
+        public uint LogicalWidth;
+        public uint LogicalHeight;
+        public uint LogicalDepth = 1;
+        public uint MipLevels;
+        public uint GuestFormat;
+        public Format Format;
+        public Image Image;
+        public DeviceMemory Memory;
+        public ImageView View;
+        public ImageView[] MipViews = [];
+        public Dictionary<(Format Format, uint MipLevel, uint LevelCount, uint DstSelect), ImageView> FormatViews { get; } = new();
+        public RenderPass RenderPass;
+        public RenderPass InitialRenderPass;
+        public Framebuffer Framebuffer;
+        public Dictionary<Format, ReinterpretedGuestImageViews> ReinterpretCache { get; } = new();
+        public Dictionary<GuestDepthKey, DepthFramebufferResource> DepthFramebuffers { get; } = new();
+        public bool Initialized;
+        public bool InitialUploadPending;
+        public bool IsCpuBacked;
+        public ulong CpuContentFingerprint;
+        public bool SupportsStorageUsage;
+    }
+
+    private readonly record struct ReinterpretedGuestImageViews(
+        ImageView View,
+        ImageView[] MipViews,
+        RenderPass RenderPass,
+        RenderPass InitialRenderPass,
+        Framebuffer Framebuffer);
+
+    private readonly record struct GuestDepthKey(
+        ulong Address,
+        ulong ReadAddress,
+        uint Width,
+        uint Height,
+        uint GuestFormat,
+        uint SwizzleMode);
+
+    private sealed class GuestDepthResource
+    {
+        public GuestDepthKey Key;
+        public ulong Address;
+        public ulong ReadAddress;
+        public ulong WriteAddress;
+        public uint Width;
+        public uint Height;
+        // Unscaled guest-requested size; Width/Height are the physical (scaled) backing size.
+        public uint LogicalWidth;
+        public uint LogicalHeight;
+        public uint GuestFormat;
+        public uint SwizzleMode;
+        public Image Image;
+        public DeviceMemory Memory;
+        public ImageView View;
+        public Dictionary<uint, ImageView> SampleViews { get; } = new();
+        public bool Initialized;
+        public ImageLayout Layout = ImageLayout.Undefined;
+        public float GuestClearDepth = 1f;
+        public float ClearDepth = 1f;
+        public string InitializationSource = "none";
+    }
+
+    private sealed class DepthFramebufferResource
+    {
+        public required GuestDepthResource Depth;
+        public RenderPass LoadRenderPass;
+        public RenderPass ColorClearRenderPass;
+        public RenderPass DepthClearRenderPass;
+        public RenderPass BothClearRenderPass;
+        public Framebuffer Framebuffer;
+    }
+
     internal static uint GetGuestTextureDepth(uint type, uint depth) =>
         IsGuestTexture3D(type) ? Math.Max(depth, 1u) : 1u;
 
@@ -2041,6 +2122,8 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+
+
     internal static bool IsGpuGuestImageAvailable(
         ulong address,
         uint format,
@@ -3465,14 +3548,6 @@ internal static unsafe class VulkanVideoPresenter
             _guestImageVariants = new();
         private readonly Dictionary<long, GuestImageResource> _guestImageVersions = new();
         private readonly HashSet<long> _capturedGuestFlipVersions = [];
-        private readonly record struct GuestDepthKey(
-            ulong Address,
-            ulong ReadAddress,
-            uint Width,
-            uint Height,
-            uint GuestFormat,
-            uint SwizzleMode);
-
         private readonly Dictionary<GuestDepthKey, GuestDepthResource> _guestDepthImages = new();
         private readonly Dictionary<GuestDepthKey, ulong> _depthOnlyColorAddresses = new();
         private ulong _nextDepthOnlyColorAddress = 0xFFFF_FF00_0000_0000UL;
@@ -3682,79 +3757,6 @@ internal static unsafe class VulkanVideoPresenter
         private const Format DepthFormat = Format.D32Sfloat;
         private const ulong SwapchainAcquireTimeoutNs = 250_000_000;
 
-        private sealed class GuestDepthResource
-        {
-            public GuestDepthKey Key;
-            public ulong Address;
-            public ulong ReadAddress;
-            public ulong WriteAddress;
-            public uint Width;
-            public uint Height;
-            // Unscaled guest-requested size; Width/Height are the physical (scaled) backing size.
-            public uint LogicalWidth;
-            public uint LogicalHeight;
-            public uint GuestFormat;
-            public uint SwizzleMode;
-            public Image Image;
-            public DeviceMemory Memory;
-            public ImageView View;
-            public Dictionary<uint, ImageView> SampleViews { get; } = new();
-            public bool Initialized;
-            public ImageLayout Layout = ImageLayout.Undefined;
-            public float GuestClearDepth = 1f;
-            public float ClearDepth = 1f;
-            public string InitializationSource = "none";
-        }
-
-        private sealed class DepthFramebufferResource
-        {
-            public required GuestDepthResource Depth;
-            public RenderPass LoadRenderPass;
-            public RenderPass ColorClearRenderPass;
-            public RenderPass DepthClearRenderPass;
-            public RenderPass BothClearRenderPass;
-            public Framebuffer Framebuffer;
-        }
-
-        private sealed class GuestImageResource
-        {
-            public ulong Address;
-            public long FlipVersion;
-            public uint Width;
-            public uint Height;
-            public uint Depth = 1;
-            public uint Type = Gen5TextureType2D;
-            // Unscaled guest-requested size; Width/Height are the physical (scaled) backing size.
-            public uint LogicalWidth;
-            public uint LogicalHeight;
-            public uint LogicalDepth = 1;
-            public uint MipLevels;
-            public uint GuestFormat;
-            public Format Format;
-            public Image Image;
-            public DeviceMemory Memory;
-            public ImageView View;
-            public ImageView[] MipViews = [];
-            public Dictionary<(Format Format, uint MipLevel, uint LevelCount, uint DstSelect), ImageView> FormatViews { get; } = new();
-            public RenderPass RenderPass;
-            public RenderPass InitialRenderPass;
-            public Framebuffer Framebuffer;
-            public Dictionary<Format, ReinterpretedGuestImageViews> ReinterpretCache { get; } = new();
-            public Dictionary<GuestDepthKey, DepthFramebufferResource> DepthFramebuffers { get; } = new();
-            public bool Initialized;
-            public bool InitialUploadPending;
-            public bool IsCpuBacked;
-            public ulong CpuContentFingerprint;
-            public bool SupportsStorageUsage;
-        }
-
-        private readonly record struct ReinterpretedGuestImageViews(
-            ImageView View,
-            ImageView[] MipViews,
-            RenderPass RenderPass,
-            RenderPass InitialRenderPass,
-            Framebuffer Framebuffer);
-
         private sealed record PendingGuestSubmission(
             Fence Fence,
             CommandBuffer CommandBuffer,
@@ -3938,6 +3940,129 @@ internal static unsafe class VulkanVideoPresenter
                 };
                 _ = _setDebugUtilsObjectName(_device, &info);
             }
+        }
+
+        /// <summary>
+        /// Creates a Vulkan image for a display buffer that was registered via
+        /// VideoOut but never received an AGC render target setup. This handles
+        /// double-buffered display chains where only one buffer gets AGC rendering.
+        /// </summary>
+        private GuestImageResource? CreateGuestImageForDisplayBuffer(
+            ulong address,
+            uint guestFormat,
+            uint width,
+            uint height,
+            uint pitchInPixel)
+        {
+            if (address == 0 || width == 0 || height == 0)
+            {
+                return null;
+            }
+
+            // Decode the guest format. Display buffers registered via VideoOut use
+            // the raw format number from MapPixelFormatToGuestTextureFormat (56 for
+            // 8-bit RGBA, 9 for 10-bit). The combined guest format
+            // (0x80000000 | (format << 8) | numberType) is used elsewhere.
+            uint dataFormat;
+            uint numberType;
+            if ((guestFormat & 0x8000_0000u) != 0)
+            {
+                // Combined guest format
+                dataFormat = (guestFormat >> 8) & 0x1FFu;
+                numberType = guestFormat & 0xFFu;
+            }
+            else
+            {
+                // Raw display buffer format from VideoOut registration
+                dataFormat = guestFormat;
+                numberType = 0;
+            }
+
+            // Use existing render target format decoding
+            if (!TryDecodeRenderTargetFormat(dataFormat, numberType, out var vkFormat))
+            {
+                return null;
+            }
+
+            var imageInfo = new ImageCreateInfo
+            {
+                SType = StructureType.ImageCreateInfo,
+                ImageType = ImageType.Type2D,
+                Format = vkFormat.Format,
+                Extent = new Extent3D(width, height, 1),
+                MipLevels = 1,
+                ArrayLayers = 1,
+                Samples = SampleCountFlags.Count1Bit,
+                Tiling = ImageTiling.Optimal,
+                Usage = ImageUsageFlags.ColorAttachmentBit |
+                        ImageUsageFlags.TransferSrcBit |
+                        ImageUsageFlags.TransferDstBit |
+                        ImageUsageFlags.SampledBit,
+                SharingMode = SharingMode.Exclusive,
+                InitialLayout = ImageLayout.Undefined,
+            };
+
+            Check(
+                _vk.CreateImage(_device, &imageInfo, null, out var image),
+                "vkCreateImage(display buffer on-demand)");
+            _vk.GetImageMemoryRequirements(_device, image, out var requirements);
+            var allocationInfo = new MemoryAllocateInfo
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = requirements.Size,
+                MemoryTypeIndex = FindMemoryType(requirements.MemoryTypeBits, MemoryPropertyFlags.DeviceLocalBit),
+            };
+            Check(
+                _vk.AllocateMemory(_device, &allocationInfo, null, out var memory),
+                "vkAllocateMemory(display buffer on-demand)");
+            Check(
+                _vk.BindImageMemory(_device, image, memory, 0),
+                "vkBindImageMemory(display buffer on-demand)");
+
+            var viewInfo = new ImageViewCreateInfo
+            {
+                SType = StructureType.ImageViewCreateInfo,
+                Image = image,
+                ViewType = ImageViewType.Type2D,
+                Format = vkFormat.Format,
+                SubresourceRange = new ImageSubresourceRange
+                {
+                    AspectMask = ImageAspectFlags.ColorBit,
+                    BaseMipLevel = 0,
+                    LevelCount = 1,
+                    BaseArrayLayer = 0,
+                    LayerCount = 1,
+                },
+            };
+            Check(
+                _vk.CreateImageView(_device, &viewInfo, null, out var view),
+                "vkCreateImageView(display buffer on-demand)");
+
+            var debugName = $"display_buffer_0x{address:X16}";
+            SetDebugName(ObjectType.Image, image.Handle, $"{debugName} image");
+            SetDebugName(ObjectType.ImageView, view.Handle, $"{debugName} view");
+
+            return new GuestImageResource
+            {
+                Address = address,
+                Width = width,
+                Height = height,
+                Depth = 1,
+                Type = Gen5TextureType2D,
+                LogicalWidth = width,
+                LogicalHeight = height,
+                LogicalDepth = 1,
+                MipLevels = 1,
+                GuestFormat = guestFormat,
+                Format = vkFormat.Format,
+                Image = image,
+                Memory = memory,
+                View = view,
+                InitialUploadPending = false,
+                IsCpuBacked = false,
+                SupportsStorageUsage = true,
+                Initialized = true,
+            };
         }
 
         private void BeginDebugLabel(CommandBuffer commandBuffer, string name)
@@ -5886,7 +6011,49 @@ internal static unsafe class VulkanVideoPresenter
         {
             Agc.AgcExports.MarkAllSurfacesCleared();
             FlushBatchedGuestCommands();
-            _guestImages.TryGetValue(work.Address, out var source);
+
+            // On-demand creation: if the display buffer is known (registered via
+            // VideoOut) but not yet in _guestImages, create it now. This handles
+            // double-buffered display targets where only one buffer receives AGC
+            // render target setup (Mortal Shell: 0x8FC0000000 missing).
+            if (!_guestImages.TryGetValue(work.Address, out var source))
+            {
+                lock (_gate)
+                {
+                    if (_availableGuestImages.TryGetValue(work.Address, out var guestFormat))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] vk.flip_on_demand_create addr=0x{work.Address:X16} " +
+                            $"fmt=0x{guestFormat:X8} {work.Width}x{work.Height}");
+                        var created = CreateGuestImageForDisplayBuffer(
+                            work.Address,
+                            guestFormat,
+                            work.Width,
+                            work.Height,
+                            work.PitchInPixel);
+                        if (created is not null)
+                        {
+                            _guestImages[work.Address] = created;
+                            source = created;
+                            Console.Error.WriteLine(
+                                $"[LOADER][TRACE] vk.flip_on_demand_created addr=0x{work.Address:X16} ok");
+                        }
+                        else
+                        {
+                            Console.Error.WriteLine(
+                                $"[LOADER][WARN] vk.flip_on_demand_failed addr=0x{work.Address:X16} " +
+                                $"fmt=0x{guestFormat:X8} — format decode or allocation failed");
+                        }
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][WARN] vk.flip_not_available addr=0x{work.Address:X16} " +
+                            $"not in _availableGuestImages");
+                    }
+                }
+            }
+
             if (_deviceLost ||
                 source is null ||
                 !source.Initialized)
@@ -13837,6 +14004,7 @@ internal static unsafe class VulkanVideoPresenter
                 mipLevels,
                 guestFormat,
                 format);
+            bool wasAvailableGuestImage = false;
             if (_guestImages.TryGetValue(target.Address, out var existing))
             {
                 // View-compatible formats (sRGB vs UNORM of the same texel
@@ -13955,7 +14123,7 @@ internal static unsafe class VulkanVideoPresenter
                 _guestImages.Remove(target.Address);
                 lock (_gate)
                 {
-                    _availableGuestImages.Remove(target.Address);
+                    wasAvailableGuestImage = _availableGuestImages.Remove(target.Address);
                     _cpuBackedUploadGenerations.Remove(target.Address);
                     _guestImageExtents.Remove(target.Address);
                 }
@@ -14014,6 +14182,14 @@ internal static unsafe class VulkanVideoPresenter
                             $"[GIMG] retained addr=0x{target.Address:X} " +
                             $"{target.Width}x{target.Height} fmt={format} " +
                             $"initialized={retained.Initialized}");
+                    }
+
+                    if (wasAvailableGuestImage)
+                    {
+                        lock (_gate)
+                        {
+                            _availableGuestImages[target.Address] = guestFormat;
+                        }
                     }
 
                     return retained;
@@ -14177,6 +14353,14 @@ internal static unsafe class VulkanVideoPresenter
                 Console.Error.WriteLine(
                     $"[GIMG] created-as-rt addr=0x{target.Address:X} " +
                     $"{target.Width}x{target.Height} fmt={format}");
+            }
+
+            if (wasAvailableGuestImage)
+            {
+                lock (_gate)
+                {
+                    _availableGuestImages[target.Address] = guestFormat;
+                }
             }
 
             return resource;
@@ -18408,7 +18592,7 @@ internal static unsafe class VulkanVideoPresenter
                 // (usually black) image while Windows drivers happened to
                 // tolerate it.  Include all preceding writes before blitting
                 // the image into the swapchain.
-                SrcAccessMask = AccessFlags.MemoryWriteBit | AccessFlags.ShaderReadBit,
+                SrcAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.ShaderReadBit,
                 DstAccessMask = AccessFlags.TransferReadBit,
                 OldLayout = ImageLayout.ShaderReadOnlyOptimal,
                 NewLayout = ImageLayout.TransferSrcOptimal,

@@ -1282,10 +1282,24 @@ public static partial class Gen5MslTranslator
 
             var left = Temp("uint", RawSource(instruction, 0));
             var right = Temp("uint", RawSource(instruction, 1));
-            if (instruction.Opcode is "SBitcmp0B32" or "SBitcmp1B32")
+            // RDNA2 GPR-index / VS-skip control instructions: mode-only,
+            // produce no value. Static translator discards them.
+            if (instruction.Opcode is "SSetVskip" or
+                "SSetGprIdxOn" or
+                "SSetGprIdxMode" or
+                "SSetGprIdxOff")
             {
-                var isSet = $"(({left} >> ({right} & 31u)) & 1u) != 0u";
-                Line(instruction.Opcode == "SBitcmp1B32"
+                return true;
+            }
+
+            if (instruction.Opcode is "SBitcmp0B32" or "SBitcmp1B32" or
+                "SBitcmp0B64" or "SBitcmp1B64")
+            {
+                var bitWidth = instruction.Opcode.EndsWith("B64", StringComparison.Ordinal) ? 63u : 31u;
+                var isSet = $"(({left} >> ({right} & {bitWidth}u)) & 1u) != 0u";
+                var isBitcmp1 = instruction.Opcode == "SBitcmp1B32" ||
+                    instruction.Opcode == "SBitcmp1B64";
+                Line(isBitcmp1
                     ? $"scc = {isSet};"
                     : $"scc = !({isSet});");
                 return true;

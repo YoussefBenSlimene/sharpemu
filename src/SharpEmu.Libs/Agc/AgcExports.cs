@@ -75,6 +75,7 @@ public static partial class AgcExports
         ItDispatchDirect, ItDispatchIndirect, ItCondExec, ItWaitRegMem,
         ItIndirectBuffer, ItEventWrite, ItReleaseMem, ItDmaData,
         ItSetContextReg, ItSetShReg, ItSetUconfigReg, ItGetLodStats,
+        ItSetPredication,
     ];
 
     private const uint RZero = 0x00;
@@ -7142,6 +7143,16 @@ public static partial class AgcExports
             static _ => new SubmittedGpuState());
         EnsureGpuWaitMonitor(ctx, gpuState);
         TryForceSubmitOrphanPreamble(ctx, gpuState, waitAddress);
+        
+        // Cross-queue submission pumping: when a compute queue suspends on a wait,
+        // pump the graphics queue to process pending submissions that might produce
+        // the awaited label. This addresses the cross-queue synchronization gap where
+        // the compute queue waits on a label written by the graphics queue.
+        if (state != gpuState.Graphics && !gpuState.Graphics.IsSuspended)
+        {
+            PumpSubmittedQueue(ctx, gpuState, gpuState.Graphics);
+        }
+        
         TraceWaitProducerState(
             ctx.Memory,
             waiter,
@@ -7661,12 +7672,19 @@ public static partial class AgcExports
                 // Record + latch the written value so a same-frame label reset
                 // cannot lose the wakeup, and so the deadlock breaker can release
                 // a cross-queue waiter later (see ApplySubmittedReleaseMem).
-                if (wroteData && dataSelection is 1 or 2)
+                if (wroteData)
                 {
+                    var producedValue = dataSelection switch
+                    {
+                        1 => dataLo,
+                        2 => data,
+                        3 or 4 => unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp()),
+                        _ => 0UL
+                    };
                     GpuWaitRegistry.RecordProduced(
-                        ctx.Memory, destinationAddress, dataSelection == 1 ? dataLo : data);
+                        ctx.Memory, destinationAddress, producedValue);
                 }
-                else if (!wroteData && dataSelection is 1 or 2)
+                else if (dataSelection is 1 or 2)
                 {
                     // See ApplySubmittedReleaseMem: a dropped label write strands
                     // every waiter on this label permanently.
@@ -7782,12 +7800,19 @@ public static partial class AgcExports
                 // these labels and can reset them to 0 before the wake pass reads
                 // memory, which otherwise loses the wakeup and stalls at a black
                 // screen (Astro Bot: graphics queue waiting on a compute EOP label).
-                if (wroteData && dataSelection is 1 or 2)
+                if (wroteData)
                 {
+                    var producedValue = dataSelection switch
+                    {
+                        1 => dataLo,
+                        2 => data,
+                        3 => unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp()),
+                        _ => 0UL
+                    };
                     GpuWaitRegistry.RecordProduced(
-                        ctx.Memory, destinationAddress, dataSelection == 1 ? dataLo : data);
+                        ctx.Memory, destinationAddress, producedValue);
                 }
-                else if (!wroteData && dataSelection is 1 or 2)
+                else if (dataSelection is 1 or 2)
                 {
                     // A label write that fails is not a benign miss: this packet
                     // is the producer a suspended WAIT_REG_MEM is waiting for, and
@@ -10293,21 +10318,48 @@ private static long _indirectDrawProbeCount;
     private static long _indirectDrawEmitRejectCount;
     private static long _indirectMultiProbeCount;
 
-    private static void NoteRenderTargetAddress(ulong address)
+    private static void NoteRenderTargetAddress(ulong address, uint format = 0, uint numberType = 0)
     {
         if (address == 0)
         {
             return;
         }
 
+        bool firstTime = false;
         lock (_renderTargetProbeGate)
         {
             if (_renderTargetAddresses.Count < 512)
             {
+                firstTime = !_renderTargetAddresses.Contains(address);
                 _renderTargetAddresses.Add(address);
             }
         }
+
+        // Register the render target with the GPU system to make it GPU resident
+        // This follows the KytyPS5 approach where textures are registered for GPU access
+        var guestFormat = GetAgcGuestTextureFormat(format, numberType);
+        if (guestFormat != 0)
+        {
+            GuestGpu.Current.RegisterKnownDisplayBuffer(address, guestFormat);
+        }
+
+        // Request a color clear for newly registered render targets
+        // This ensures render targets start with a proper clear state like KytyPS5
+        if (firstTime)
+        {
+            VulkanVideoPresenter.RequestGuestColorClear(address);
+        }
     }
+
+    // Converts AGC format to guest texture format (similar to VulkanVideoPresenter.GetGuestTextureFormat)
+    private static uint GetAgcGuestTextureFormat(uint format, uint numberType) =>
+        IsKnownGuestTextureFormat(format)
+            ? 0x8000_0000u | ((format & 0x1FFu) << 8) | (numberType & 0xFFu)
+            : 0;
+
+    // Check if the format is a known guest texture format
+    private static bool IsKnownGuestTextureFormat(uint format) =>
+        format is >= 1 and <= 64; // Common AGC format range
 
     private static void NoteSampledAddress(ulong address, uint format = 0, uint numberType = 0)
     {
@@ -10370,15 +10422,17 @@ private static long _indirectDrawProbeCount;
                 continue;
             }
 
-            NoteRenderTargetAddress(address);
+            var format = (info >> 2) & 0x1Fu;
+            var numberType = (info >> 8) & 0x7u;
+            NoteRenderTargetAddress(address, format, numberType);
 
             targets.Add(new RenderTargetDescriptor(
                 slot,
                 address,
                 ((attrib2 >> 14) & 0x3FFFu) + 1,
                 (attrib2 & 0x3FFFu) + 1,
-                (info >> 2) & 0x1Fu,
-                (info >> 8) & 0x7u,
+                format,
+                numberType,
                 (attrib3 >> 14) & 0x1Fu));
         }
 

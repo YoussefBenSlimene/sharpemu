@@ -841,6 +841,15 @@ public static class Gen5ShaderTranslator
             0x0D => "SBitcmp1B32",
             0x0E => "SBitcmp0B64",
             0x0F => "SBitcmp1B64",
+            // RDNA2 added GPR-index and vertex-skip control to the SOPC
+            // encoding. The static translator ignores all four: they only
+            // mutate hardware execution mode (GPR indexing, VS skip mask)
+            // and do not produce a value, so downstream emitters treat them
+            // as no-ops.
+            0x10 => "SSetVskip",
+            0x11 => "SSetGprIdxOn",
+            0x12 => "SSetGprIdxMode",
+            0x13 => "SSetGprIdxOff",
             _ => string.Empty,
         };
 

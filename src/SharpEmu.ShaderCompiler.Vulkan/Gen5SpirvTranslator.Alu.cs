@@ -2328,15 +2328,29 @@ public static partial class Gen5SpirvTranslator
 
             var left = GetRawSource(instruction, 0);
             var right = GetRawSource(instruction, 1);
-            if (instruction.Opcode is "SBitcmp0B32" or "SBitcmp1B32")
+            // RDNA2 GPR-index / VS-skip control instructions: mode-only,
+            // produce no value. Static translator discards them.
+            if (instruction.Opcode is "SSetVskip" or
+                "SSetGprIdxOn" or
+                "SSetGprIdxMode" or
+                "SSetGprIdxOff")
             {
+                return true;
+            }
+
+            if (instruction.Opcode is "SBitcmp0B32" or "SBitcmp1B32" or
+                "SBitcmp0B64" or "SBitcmp1B64")
+            {
+                var bitWidth = instruction.Opcode.EndsWith("B64", StringComparison.Ordinal) ? 63u : 31u;
                 var shifted = ShiftRightLogical(
                     left,
-                    BitwiseAnd(right, UInt(31)));
+                    BitwiseAnd(right, UInt(bitWidth)));
                 var isSet = IsNotZero(BitwiseAnd(shifted, UInt(1)));
+                var isBitcmp1 = instruction.Opcode == "SBitcmp1B32" ||
+                    instruction.Opcode == "SBitcmp1B64";
                 Store(
                     _scc,
-                    instruction.Opcode == "SBitcmp1B32"
+                    isBitcmp1
                         ? isSet
                         : _module.AddInstruction(
                             SpirvOp.LogicalNot,
