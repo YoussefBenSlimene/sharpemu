@@ -161,6 +161,53 @@ public static class KernelPthreadCompatExports
     }
 
     /// <summary>
+    /// Completes every cond wait owned by <paramref name="threadId"/> as a
+    /// spurious wake. sceKernelRaiseException (Unity/Boehm stop-the-world)
+    /// targets a thread that may be parked inside pthread_cond_wait's host
+    /// loop; without breaking that wait the queued exception can never reach
+    /// an import-boundary safe point and the collector deadlocks the process.
+    /// A spurious completion makes the guest's standard while-loop re-check
+    /// its predicate, and the next HLE boundary delivers the signal handler.
+    /// </summary>
+    public static void ForceSpuriousWakeForThread(ulong threadId)
+    {
+        if (threadId == 0)
+        {
+            return;
+        }
+
+        lock (_stateGate)
+        {
+            foreach (var state in _condStates.Values)
+            {
+                lock (state.SyncRoot)
+                {
+                    for (var node = state.WaiterQueue.First; node is not null;)
+                    {
+                        var next = node.Next;
+                        var waiter = node.Value;
+                        if (waiter.ThreadId == threadId &&
+                            waiter.CompletionState == 0)
+                        {
+                            // Marked signaled (not timed-out): the resume path
+                            // re-acquires the mutex, exactly like a real
+                            // signal, so the guest loop observes the predicate
+                            // unchanged and calls back into the wait.
+                            _ = CompleteCondWaiterLocked(state, waiter, timedOut: false);
+                        }
+
+                        node = next;
+                    }
+                }
+            }
+        }
+
+        // Host-thread mutex waiters parked on the same thread must also break
+        // out so their owning loop re-evaluates at an import boundary.
+        ForceWakeHostMutexWaitersForThread(threadId);
+    }
+
+    /// <summary>
     /// Force-release mutexes still owned by a guest thread that is being torn
     /// down without a clean unlock (TBB worker_abort, abrupt exit). Otherwise
     /// waiters can spin forever and block splash→first GPU submit.
@@ -1868,6 +1915,31 @@ public static class KernelPthreadCompatExports
         finally
         {
             hostSignal?.Dispose();
+        }
+    }
+
+    // Breaks host-path mutex waiters owned by a thread out of their
+    // ManualResetEvent park. The grant stays false, so the loop re-runs its
+    // grant check; this exists purely so a force-raised exception can reach
+    // the thread's next import-boundary safe point (see
+    // ForceSpuriousWakeForThread).
+    private static void ForceWakeHostMutexWaitersForThread(ulong threadId)
+    {
+        lock (_stateGate)
+        {
+            foreach (var state in _mutexStates.Values)
+            {
+                lock (state.SyncRoot)
+                {
+                    for (var node = state.Waiters.First; node is not null; node = node.Next)
+                    {
+                        if (node.Value.ThreadId == threadId && !node.Value.Cooperative)
+                        {
+                            node.Value.HostSignal?.Set();
+                        }
+                    }
+                }
+            }
         }
     }
 

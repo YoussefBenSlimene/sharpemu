@@ -113,6 +113,14 @@ public static class KernelExceptionCompatExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
         }
 
+        // The real kernel interrupts the target immediately; a target parked
+        // inside pthread_cond_wait's host loop (or a host mutex waiter) would
+        // otherwise never observe the queued exception. Break its wait now so
+        // the thread reaches its next HLE boundary, where the pending
+        // exception is delivered (KytyPS5 wakes the waiter the same way via
+        // PthreadWakeForSignal before queuing the APC).
+        KernelPthreadCompatExports.ForceSpuriousWakeForThread(targetThread);
+
         if (string.Equals(
                 Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_EXCEPTIONS"),
                 "1",

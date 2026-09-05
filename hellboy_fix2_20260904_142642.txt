@@ -1,0 +1,10 @@
+﻿[INFO][SharpEmu.CLI] Program.cs:267 SharpEmu UNOFFICIAL ΓÇö https://github.com/sharpemu/sharpemu
+
+Local build (not produced by CI).
+[INFO][SharpEmu.CLI] Program.cs:268 Host hardware: CPU: 12th Gen Intel(R) Core(TM) i5-12450H; GPU: NVIDIA GeForce RTX 3050 6GB Laptop GPU; RAM: 16,108 MB (15.7 GB).
+[DEBUG] SharpEmu starting with 1 args
+[DEBUG] SharpEmu starting with 1 args
+[DEBUG] Full path: C:\ps5-emulator\ps5-games\[DLPSGAME.COM]-01.004 PPSA11264\[DLPSGAME.COM]-Hellboy Web of Wyrd 01.004 PPSA11264\eboot.bin
+[ERROR][SharpEmu.CLI] Program.cs:275 EBOOT file was not found: C:\ps5-emulator\ps5-games\[DLPSGAME.COM]-01.004 PPSA11264\[DLPSGAME.COM]-Hellboy Web of Wyrd 01.004 PPSA11264\eboot.bin
+[DEBUG] Running in mitigated child process (CET/CFG disabled).
+

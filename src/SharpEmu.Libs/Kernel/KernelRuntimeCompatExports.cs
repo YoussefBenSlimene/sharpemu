@@ -60,6 +60,7 @@ public static class KernelRuntimeCompatExports
     private static ulong _processProcParamAddress;
     private static ulong _nextReservedVirtualBase = 0x6000_0000_0UL;
     private static readonly List<ReleasedVirtualRange> _releasedVirtualRanges = new();
+    private static bool _flexibleRangeAnnounced;
     private static uint _gpoStateBits;
     private static readonly HashSet<int> _loadedSysmodules = new();
     private static readonly object _prtApertureGate = new();
@@ -801,9 +802,26 @@ public static class KernelRuntimeCompatExports
             _nextReservedVirtualBase = Math.Max(_nextReservedVirtualBase, mappedAddress + length);
         }
 
+        // The first flexible reservation fixes the guest heap's base. Unity's
+        // allocator probes beyond committed slices with
+        // sceKernelVirtualQuery(addr, next) and aborts thread creation when
+        // nothing answers, so announce the surrounding flexible span once —
+        // KytyPS5 pre-registers the whole range the same way.
+        if (!_flexibleRangeAnnounced && requestedAddress == 0)
+        {
+            _flexibleRangeAnnounced = true;
+            KernelMemoryCompatExports.AnnounceFlexibleHeapSpan(
+                mappedAddress,
+                Math.Max(
+                    FlexibleHeapAnnounceSpanBytes,
+                    length));
+        }
+
         KernelMemoryCompatExports.RegisterReservedVirtualRange(mappedAddress, length);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    private const ulong FlexibleHeapAnnounceSpanBytes = 0x10_0000_0000UL;
 
     internal static void RegisterReleasedVirtualRange(ulong address, ulong length)
     {

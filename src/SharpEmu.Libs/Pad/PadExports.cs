@@ -113,7 +113,11 @@ public static class PadExports
             return ctx.SetReturn(OrbisPadErrorDeviceNoHandle);
         }
 
-        var typeAccepted = extended ? type is 0 or 1 or 2 : type == StandardPortType;
+        // KytyPS5's PadOpen accepts both the standard port and the special
+        // port (type 2) for the personal user — several titles (Hellboy)
+        // call plain scePadOpen with the special port. Keep the extended-only
+        // parameter check for the plain entry point.
+        var typeAccepted = type is 0 or 2 || (extended && type == 1);
         if (userId != PrimaryUserId || !typeAccepted || index != 0 || (!extended && parameterAddress != 0))
         {
             return ctx.SetReturn(OrbisPadErrorDeviceNotConnected);

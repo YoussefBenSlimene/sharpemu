@@ -3,6 +3,7 @@
 
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using SharpEmu.HLE;
 
@@ -11,8 +12,19 @@ namespace SharpEmu.Libs.Kernel;
 public static class KernelSemaphoreCompatExports
 {
     private const int MaxSemaphoreNameLength = 128;
-    private static readonly ConcurrentDictionary<uint, KernelSemaphoreState> _semaphores = new();
-    private static int _nextSemaphoreHandle = 1;
+    private const int SemaphoreObjectSize = 0x40;
+
+    // Guest-visible semaphore identities. sceKernelCreateSema writes a
+    // pointer-sized (64-bit) object handle into the guest's slot — matching
+    // the real kernel (and KytyPS5), where *sem receives a KernelSema object
+    // pointer. Writing only 32 bits used to leave the slot's upper half as
+    // whatever was on the guest stack (commonly the 0xC0DEC0DE stack-canary
+    // fragment), so games that later re-read the full 8-byte slot handed back
+    // a garbage handle like 0xC0DEC0DE00000043; truncating that to 32 bits
+    // then silently aliased it onto an unrelated live semaphore, wedging
+    // Unity/Baselib worker handshakes forever (Hellboy boot deadlock).
+    private static readonly ConcurrentDictionary<ulong, KernelSemaphoreState> _semaphores = new();
+    private static long _nextSemaphoreHandle = 1;
 
     private sealed class KernelSemaphoreState
     {
@@ -24,6 +36,97 @@ public static class KernelSemaphoreCompatExports
         public int Count { get; set; }
         public int WaitingThreads { get; set; }
         public object Gate { get; } = new();
+    }
+
+    // Resolves the full 64-bit handle the guest passed. A handle is either a
+    // guest-memory object address (current scheme) or a small legacy 32-bit
+    // handle (upper half zero). Any nonzero upper half that does not match a
+    // registered object is treated as invalid rather than being truncated:
+    // silently dropping the upper bits maps garbage onto an unrelated
+    // semaphore and turns an error return into an eternal wait.
+    private static bool TryResolveSemaphore(ulong handle, [NotNullWhen(true)] out KernelSemaphoreState? semaphore)
+    {
+        if (_semaphores.TryGetValue(handle, out semaphore))
+        {
+            return true;
+        }
+
+        if ((handle >> 32) == 0)
+        {
+            return _semaphores.TryGetValue(handle, out semaphore);
+        }
+
+        return false;
+    }
+
+    // Some runtimes (Unity Baselib) store the sem_t slot itself inside a
+    // larger structure and pass the SLOT ADDRESS to the kernel-level
+    // sceKernelSignalSema/sceKernelWaitSema entry points instead of loading
+    // the slot's contents first. When the kernel object identity is the
+    // guest-object pointer, the slot address and its content are the same
+    // value; when they differ, treat the argument as a pointer to the slot
+    // and dereference it once before giving up.
+    private static bool TryResolveSemaphoreArgument(
+        CpuContext ctx,
+        ulong handle,
+        [NotNullWhen(true)] out KernelSemaphoreState? semaphore,
+        out ulong resolvedHandle)
+    {
+        if (TryResolveSemaphore(handle, out semaphore))
+        {
+            resolvedHandle = handle;
+            return true;
+        }
+
+        if (KernelMemoryCompatExports.TryReadUInt64Compat(ctx, handle, out var pointed) &&
+            pointed != 0 &&
+            pointed != handle &&
+            TryResolveSemaphore(pointed, out semaphore))
+        {
+            resolvedHandle = pointed;
+            return true;
+        }
+
+        resolvedHandle = handle;
+        return false;
+    }
+
+    private static KernelSemaphoreState RegisterSemaphore(
+        CpuContext ctx,
+        ulong semaphoreAddress,
+        string name,
+        int initialCount,
+        int maxCount,
+        out ulong handle)
+    {
+        // Allocate a guest-memory object so the identity is a plain pointer,
+        // exactly like the kernel's KernelSema objects on real hardware.
+        if (ctx.Memory is SharpEmu.HLE.IGuestMemoryAllocator allocator &&
+            allocator.TryAllocateGuestMemory(SemaphoreObjectSize, alignment: 0x10, out var objectAddress))
+        {
+            Span<byte> zeros = stackalloc byte[SemaphoreObjectSize];
+            _ = ctx.Memory.TryWrite(objectAddress, zeros);
+            handle = objectAddress;
+        }
+        else
+        {
+            // Fallback identity when guest-memory allocation is unavailable:
+            // keep the sequential handle but tag the upper half so full-width
+            // re-reads still round-trip through the guest slot.
+            var sequential = Interlocked.Increment(ref _nextSemaphoreHandle);
+            handle = unchecked(0x0000_1000_0000_0000UL | (ulong)unchecked((uint)sequential));
+        }
+
+        var state = new KernelSemaphoreState
+        {
+            Name = name,
+            WakeKey = GetSemaphoreWakeKey(handle),
+            InitialCount = initialCount,
+            MaxCount = maxCount,
+            Count = initialCount,
+        };
+        _semaphores[handle] = state;
+        return state;
     }
 
     [SysAbiExport(
@@ -56,22 +159,9 @@ public static class KernelSemaphoreCompatExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        var handle = unchecked((uint)Interlocked.Increment(ref _nextSemaphoreHandle));
-        if (handle == 0)
-        {
-            handle = unchecked((uint)Interlocked.Increment(ref _nextSemaphoreHandle));
-        }
+        RegisterSemaphore(ctx, semaphoreAddress, name, initialCount, maxCount, out var handle);
 
-        _semaphores[handle] = new KernelSemaphoreState
-        {
-            Name = name,
-            WakeKey = GetSemaphoreWakeKey(handle),
-            InitialCount = initialCount,
-            MaxCount = maxCount,
-            Count = initialCount,
-        };
-
-        if (!TryWriteUInt32(ctx, semaphoreAddress, handle))
+        if (!KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, semaphoreAddress, handle))
         {
             _semaphores.TryRemove(handle, out _);
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -79,7 +169,7 @@ public static class KernelSemaphoreCompatExports
 
         if (_traceSema)
         {
-            TraceSemaphore($"create handle=0x{handle:X8} name='{name}' attr=0x{attr:X} init={initialCount} max={maxCount}");
+            TraceSemaphore($"create handle=0x{handle:X16} name='{name}' attr=0x{attr:X} init={initialCount} max={maxCount}");
         }
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
@@ -91,11 +181,11 @@ public static class KernelSemaphoreCompatExports
         LibraryName = "libKernel")]
     public static int KernelWaitSema(CpuContext ctx)
     {
-        var handle = unchecked((uint)ctx[CpuRegister.Rdi]);
+        var handle = ctx[CpuRegister.Rdi];
         var needCount = unchecked((int)ctx[CpuRegister.Rsi]);
         var timeoutAddress = ctx[CpuRegister.Rdx];
 
-        if (!_semaphores.TryGetValue(handle, out var semaphore))
+        if (!TryResolveSemaphoreArgument(ctx, handle, out var semaphore, out handle))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
         }
@@ -123,7 +213,7 @@ public static class KernelSemaphoreCompatExports
 
                 if (_traceSema)
                 {
-                    TraceSemaphore($"wait handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} timeout={(timeoutAddress == 0 ? "infinite" : timeoutUsec)}");
+                    TraceSemaphore($"wait handle=0x{handle:X16} name='{semaphore.Name}' need={needCount} count={semaphore.Count} timeout={(timeoutAddress == 0 ? "infinite" : timeoutUsec)}");
                 }
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
             }
@@ -166,7 +256,7 @@ public static class KernelSemaphoreCompatExports
             {
                 if (_traceSema)
                 {
-                    TraceSemaphore($"wait-wake handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
+                    TraceSemaphore($"wait-wake handle=0x{handle:X16} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
                 }
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
@@ -178,7 +268,7 @@ public static class KernelSemaphoreCompatExports
 
             if (_traceSema)
             {
-                TraceSemaphore($"wait-timeout handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
+                TraceSemaphore($"wait-timeout handle=0x{handle:X16} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
             }
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
         }
@@ -206,7 +296,7 @@ public static class KernelSemaphoreCompatExports
                     GuestThreadExecution.TryConsumeCurrentThreadBlock(out _);
                     if (_traceSema)
                     {
-                        TraceSemaphore($"wait-recheck handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} {FormatCallSite(ctx)}");
+                        TraceSemaphore($"wait-recheck handle=0x{handle:X16} name='{semaphore.Name}' need={needCount} count={semaphore.Count} {FormatCallSite(ctx)}");
                     }
                     return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
                 }
@@ -214,7 +304,7 @@ public static class KernelSemaphoreCompatExports
 
             if (_traceSema)
             {
-                TraceSemaphore($"wait-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} timeout={(timeoutAddress == 0 ? "infinite" : timeoutUsec)} waiters={semaphore.WaitingThreads} {FormatCallSite(ctx)}");
+                TraceSemaphore($"wait-block handle=0x{handle:X16} name='{semaphore.Name}' need={needCount} count={semaphore.Count} timeout={(timeoutAddress == 0 ? "infinite" : timeoutUsec)} waiters={semaphore.WaitingThreads} {FormatCallSite(ctx)}");
             }
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
         }
@@ -227,7 +317,7 @@ public static class KernelSemaphoreCompatExports
     private static int WaitSemaphoreOnHostThread(
         CpuContext ctx,
         KernelSemaphoreState semaphore,
-        uint handle,
+        ulong handle,
         int needCount,
         ulong timeoutAddress,
         uint timeoutUsec)
@@ -240,7 +330,7 @@ public static class KernelSemaphoreCompatExports
             if (_traceSema)
             {
                 TraceSemaphore(
-                    $"wait-host-block handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} " +
+                    $"wait-host-block handle=0x{handle:X16} name='{semaphore.Name}' need={needCount} " +
                     $"count={semaphore.Count} timeout={(timeoutAddress == 0 ? "infinite" : timeoutUsec)} {FormatCallSite(ctx)}");
             }
             while (semaphore.Count < needCount)
@@ -261,7 +351,7 @@ public static class KernelSemaphoreCompatExports
             if (_traceSema)
             {
                 TraceSemaphore(
-                    $"wait-host-wake handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count} {FormatCallSite(ctx)}");
+                    $"wait-host-wake handle=0x{handle:X16} name='{semaphore.Name}' need={needCount} count={semaphore.Count} {FormatCallSite(ctx)}");
             }
             if (timeoutAddress != 0)
             {
@@ -272,16 +362,21 @@ public static class KernelSemaphoreCompatExports
         }
     }
 
-    private static string GetSemaphoreWakeKey(uint handle) => $"sceKernelWaitSema:{handle:X8}";
+    private static string GetSemaphoreWakeKey(ulong handle) => $"sceKernelWaitSema:{handle:X16}";
 
     [SysAbiExport(
         Nid = "12wOHk8ywb0",
         ExportName = "sceKernelPollSema",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelPollSema(CpuContext ctx, uint handle, int needCount)
+    public static int KernelPollSema(CpuContext ctx, ulong handle, int needCount)
     {
-        if (!_semaphores.TryGetValue(handle, out var semaphore))
+        return KernelPollSemaCore(ctx, handle, needCount);
+    }
+
+    private static int KernelPollSemaCore(CpuContext ctx, ulong handle, int needCount)
+    {
+        if (!TryResolveSemaphoreArgument(ctx, handle, out var semaphore, out handle))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
         }
@@ -297,7 +392,7 @@ public static class KernelSemaphoreCompatExports
             {
                 if (_traceSema)
                 {
-                    TraceSemaphore($"poll-busy handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
+                    TraceSemaphore($"poll-busy handle=0x{handle:X16} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
                 }
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
             }
@@ -305,7 +400,7 @@ public static class KernelSemaphoreCompatExports
             semaphore.Count -= needCount;
             if (_traceSema)
             {
-                TraceSemaphore($"poll handle=0x{handle:X8} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
+                TraceSemaphore($"poll handle=0x{handle:X16} name='{semaphore.Name}' need={needCount} count={semaphore.Count}");
             }
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
         }
@@ -316,9 +411,14 @@ public static class KernelSemaphoreCompatExports
         ExportName = "sceKernelSignalSema",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelSignalSema(CpuContext ctx, uint handle, int signalCount)
+    public static int KernelSignalSema(CpuContext ctx, ulong handle, int signalCount)
     {
-        if (!_semaphores.TryGetValue(handle, out var semaphore))
+        return KernelSignalSemaCore(ctx, handle, signalCount);
+    }
+
+    private static int KernelSignalSemaCore(CpuContext ctx, ulong handle, int signalCount)
+    {
+        if (!TryResolveSemaphoreArgument(ctx, handle, out var semaphore, out handle))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
         }
@@ -340,7 +440,7 @@ public static class KernelSemaphoreCompatExports
             Monitor.PulseAll(semaphore.Gate);
             if (_traceSema)
             {
-                TraceSemaphore($"signal handle=0x{handle:X8} name='{semaphore.Name}' signal={signalCount} count={semaphore.Count} waiters={semaphore.WaitingThreads} {FormatCallSite(ctx)}");
+                TraceSemaphore($"signal handle=0x{handle:X16} name='{semaphore.Name}' signal={signalCount} count={semaphore.Count} waiters={semaphore.WaitingThreads} {FormatCallSite(ctx)}");
             }
         }
 
@@ -355,9 +455,14 @@ public static class KernelSemaphoreCompatExports
         ExportName = "sceKernelCancelSema",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelCancelSema(CpuContext ctx, uint handle, int setCount, ulong waitingThreadsAddress)
+    public static int KernelCancelSema(CpuContext ctx, ulong handle, int setCount, ulong waitingThreadsAddress)
     {
-        if (!_semaphores.TryGetValue(handle, out var semaphore))
+        return KernelCancelSemaCore(ctx, handle, setCount, waitingThreadsAddress);
+    }
+
+    private static int KernelCancelSemaCore(CpuContext ctx, ulong handle, int setCount, ulong waitingThreadsAddress)
+    {
+        if (!TryResolveSemaphoreArgument(ctx, handle, out var semaphore, out handle))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
         }
@@ -379,7 +484,7 @@ public static class KernelSemaphoreCompatExports
             Monitor.PulseAll(semaphore.Gate);
             if (_traceSema)
             {
-                TraceSemaphore($"cancel handle=0x{handle:X8} name='{semaphore.Name}' set={setCount} count={semaphore.Count}");
+                TraceSemaphore($"cancel handle=0x{handle:X16} name='{semaphore.Name}' set={setCount} count={semaphore.Count}");
             }
         }
 
@@ -394,15 +499,16 @@ public static class KernelSemaphoreCompatExports
         LibraryName = "libKernel")]
     public static int KernelDeleteSema(CpuContext ctx)
     {
-        var handle = unchecked((uint)ctx[CpuRegister.Rdi]);
-        if (!_semaphores.TryRemove(handle, out var semaphore))
+        var handle = ctx[CpuRegister.Rdi];
+        if (!TryResolveSemaphoreArgument(ctx, handle, out var semaphore, out handle) ||
+            !_semaphores.TryRemove(handle, out _))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
         }
 
         if (_traceSema)
         {
-            TraceSemaphore($"delete handle=0x{handle:X8} name='{semaphore.Name}'");
+            TraceSemaphore($"delete handle=0x{handle:X16} name='{semaphore.Name}'");
         }
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
@@ -421,22 +527,15 @@ public static class KernelSemaphoreCompatExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        var handle = unchecked((uint)Interlocked.Increment(ref _nextSemaphoreHandle));
-        if (handle == 0)
-        {
-            handle = unchecked((uint)Interlocked.Increment(ref _nextSemaphoreHandle));
-        }
-
         var initialCount = unchecked((int)initialCountValue);
-        _semaphores[handle] = new KernelSemaphoreState
-        {
-            Name = $"posix@0x{semaphoreAddress:X16}",
-            WakeKey = GetSemaphoreWakeKey(handle),
-            InitialCount = initialCount,
-            MaxCount = int.MaxValue,
-            Count = initialCount,
-        };
-        if (!TryWriteUInt32(ctx, semaphoreAddress, handle))
+        var name = $"posix@0x{semaphoreAddress:X16}";
+        RegisterSemaphore(ctx, semaphoreAddress, name, initialCount, int.MaxValue, out var handle);
+
+        // sem_t is pointer/object-sized on the guest: write the full 64-bit
+        // identity so a later sem_wait re-read of the slot round-trips (a
+        // 32-bit write left the upper half as stack garbage; games that read
+        // all 8 bytes then handed back a corrupted handle).
+        if (!KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, semaphoreAddress, handle))
         {
             _semaphores.TryRemove(handle, out _);
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -444,7 +543,7 @@ public static class KernelSemaphoreCompatExports
 
         if (_traceSema)
         {
-            TraceSemaphore($"posix-init address=0x{semaphoreAddress:X16} handle=0x{handle:X8} count={initialCount}");
+            TraceSemaphore($"posix-init address=0x{semaphoreAddress:X16} handle=0x{handle:X16} count={initialCount}");
         }
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
@@ -504,7 +603,7 @@ public static class KernelSemaphoreCompatExports
 
         ctx[CpuRegister.Rdi] = handle;
         ctx[CpuRegister.Rsi] = 1;
-        return KernelPollSema(ctx, handle, 1);
+        return KernelPollSemaCore(ctx, handle, 1);
     }
 
     [SysAbiExport(
@@ -553,7 +652,7 @@ public static class KernelSemaphoreCompatExports
 
         ctx[CpuRegister.Rdi] = handle;
         ctx[CpuRegister.Rsi] = 1;
-        return KernelSignalSema(ctx, handle, 1);
+        return KernelSignalSemaCore(ctx, handle, 1);
     }
 
     [SysAbiExport(
@@ -574,7 +673,7 @@ public static class KernelSemaphoreCompatExports
         var valueAddress = ctx[CpuRegister.Rsi];
         if (valueAddress == 0 ||
             !TryGetPosixSemaphoreHandle(ctx, semaphoreAddress, out var handle) ||
-            !_semaphores.TryGetValue(handle, out var semaphore))
+            !TryResolveSemaphore(handle, out var semaphore))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
@@ -607,7 +706,7 @@ public static class KernelSemaphoreCompatExports
         var result = KernelDeleteSema(ctx);
         if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
         {
-            _ = TryWriteUInt32(ctx, semaphoreAddress, 0);
+            _ = KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, semaphoreAddress, 0);
         }
 
         return result;
@@ -620,12 +719,34 @@ public static class KernelSemaphoreCompatExports
         LibraryName = "libKernel")]
     public static int PthreadSemDestroy(CpuContext ctx) => PosixSemDestroy(ctx);
 
-    private static bool TryGetPosixSemaphoreHandle(CpuContext ctx, ulong semaphoreAddress, out uint handle)
+    private static bool TryGetPosixSemaphoreHandle(CpuContext ctx, ulong semaphoreAddress, out ulong handle)
     {
         handle = 0;
-        return semaphoreAddress != 0 &&
-               TryReadUInt32(ctx, semaphoreAddress, out handle) &&
-               handle != 0;
+        if (semaphoreAddress == 0)
+        {
+            return false;
+        }
+
+        // Prefer the full pointer-width identity sem_init wrote. Games may
+        // legitimately truncate when copying, so fall back to a 32-bit read
+        // for slots the old handle scheme populated.
+        if (KernelMemoryCompatExports.TryReadUInt64Compat(ctx, semaphoreAddress, out handle) &&
+            handle != 0 &&
+            TryResolveSemaphore(handle, out _))
+        {
+            return true;
+        }
+
+        uint narrowHandle;
+        if (TryReadUInt32(ctx, semaphoreAddress, out narrowHandle) &&
+            narrowHandle != 0 &&
+            TryResolveSemaphore(narrowHandle, out _))
+        {
+            handle = narrowHandle;
+            return true;
+        }
+
+        return false;
     }
 
     private static int SetReturn(CpuContext ctx, OrbisGen2Result result)

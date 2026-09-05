@@ -152,6 +152,11 @@ public static partial class KernelMemoryCompatExports
     }
 
     private static ulong _nextPhysicalAddress;
+
+    // Terminal address for sceKernelVirtualQuery next-region walks that run
+    // past every known range; probes at or beyond it fail.
+    private const ulong VirtualQueryTerminalSentinel = 0x1_0000_0000_0000UL;
+
     private static ulong _nextVirtualAddress;
     // First guest virtual address handed out for direct/flexible mappings
     // when the game does not request one. 4GB is free on Windows, but on
@@ -307,6 +312,13 @@ public static partial class KernelMemoryCompatExports
         return true;
     }
 
+    // Original reserved-virtual spans (sceKernelReserveVirtualRange). Committed
+    // slices replace these in _mappedRegions, so gaps between committed slices
+    // stop being queryable even though the guest only consumed part of the
+    // reservation. KytyPS5 keeps those tails as Reserved ranges; this parallel
+    // registry preserves them for sceKernelVirtualQuery's next-region walk.
+    private static readonly List<(ulong Address, ulong Length)> _reservedVirtualSpans = new();
+
     internal static void RegisterReservedVirtualRange(ulong address, ulong length)
     {
         if (address == 0 || length == 0)
@@ -323,7 +335,65 @@ public static partial class KernelMemoryCompatExports
                 IsFlexible: false,
                 IsDirect: false,
                 DirectStart: 0));
+            TrackReservedSpanLocked(address, length);
         }
+    }
+
+    private static void TrackReservedSpanLocked(ulong address, ulong length)
+    {
+        var end = address + length;
+        foreach (var span in _reservedVirtualSpans)
+        {
+            if (address >= span.Address && end <= span.Address + span.Length)
+            {
+                return;
+            }
+        }
+
+        _reservedVirtualSpans.Add((address, length));
+    }
+
+    // Announces the guest flexible heap span for VirtualQuery's next-region
+    // walk without inserting a mapped region: committing slices still owns
+    // _mappedRegions, while the still-uncommitted remainder answers probes.
+    internal static void AnnounceFlexibleHeapSpan(ulong address, ulong length)
+    {
+        if (address == 0 || length == 0)
+        {
+            return;
+        }
+
+        lock (_memoryGate)
+        {
+            TrackReservedSpanLocked(address, length);
+        }
+    }
+
+    // Returns the tail of a reserved span at or after the queried address —
+    // the portion the guest reserved but has not committed into a mapped
+    // region yet. KytyPS5 exposes these as Reserved virtual ranges.
+    private static bool TryFindReservedSpanTailLocked(ulong queryAddress, out MappedRegion region)
+    {
+        region = default;
+        foreach (var span in _reservedVirtualSpans)
+        {
+            var spanEnd = span.Address + span.Length;
+            if (queryAddress < span.Address || queryAddress >= spanEnd)
+            {
+                continue;
+            }
+
+            region = new MappedRegion(
+                queryAddress,
+                spanEnd - queryAddress,
+                Protection: 0,
+                IsFlexible: false,
+                IsDirect: false,
+                DirectStart: 0);
+            return true;
+        }
+
+        return false;
     }
 
     [SysAbiExport(
@@ -3570,8 +3640,30 @@ public static partial class KernelMemoryCompatExports
         var memoryType = 0;
         lock (_memoryGate)
         {
-            if (!TryFindVirtualQueryRegionLocked(queryAddress, findNext: (flags & 0x1) != 0, out region))
+            if (!TryFindVirtualQueryRegionLocked(queryAddress, findNext: (flags & 0x1) != 0, out region) &&
+                !((flags & 0x1) != 0 && TryFindReservedSpanTailLocked(queryAddress, out region)))
             {
+                if ((flags & 0x1) != 0 && queryAddress < VirtualQueryTerminalSentinel)
+                {
+                    // A next-region walk past every mapped/reserved range
+                    // answers with a single terminal region pinned at the
+                    // sentinel; probes at or beyond the sentinel fail so
+                    // enumeration walks end instead of cycling. Unity's early
+                    // heap probe needs the OK answer to bring up its worker
+                    // threads (Hellboy boot).
+                    Span<byte> terminal = stackalloc byte[OrbisVirtualQueryInfoSize];
+                    terminal.Clear();
+                    BinaryPrimitives.WriteUInt64LittleEndian(terminal[0..8], VirtualQueryTerminalSentinel);
+                    BinaryPrimitives.WriteUInt64LittleEndian(terminal[8..16], VirtualQueryTerminalSentinel);
+                    if (!TryWriteCompat(ctx, infoAddress, terminal))
+                    {
+                        return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                    }
+
+                    ctx[CpuRegister.Rax] = 0;
+                    return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
+
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
@@ -3724,6 +3816,21 @@ public static partial class KernelMemoryCompatExports
 
         if (!found)
         {
+            // KytyPS5 terminates a flags=1 walk past the last direct block
+            // with OK + start=end=PhysicalMemory::Size(); a plain error makes
+            // the guest's allocator abort its memory enumeration early.
+            if (findNext)
+            {
+                if (!ctx.TryWriteUInt64(infoAddress, DirectMemorySizeBytes) ||
+                    !ctx.TryWriteUInt64(infoAddress + sizeof(ulong), DirectMemorySizeBytes) ||
+                    !TryWriteInt32(ctx, infoAddress + (sizeof(ulong) * 2), 0))
+                {
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                }
+
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DELETED;
         }
 

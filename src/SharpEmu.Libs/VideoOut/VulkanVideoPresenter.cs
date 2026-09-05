@@ -4042,6 +4042,17 @@ internal static unsafe class VulkanVideoPresenter
             SetDebugName(ObjectType.Image, image.Handle, $"{debugName} image");
             SetDebugName(ObjectType.ImageView, view.Handle, $"{debugName} view");
 
+            // The image is created with InitialLayout=Undefined, but every later
+            // barrier (pre-draw attachment transition, flip capture) assumes a
+            // tracked layout of ShaderReadOnlyOptimal because the resource is
+            // marked Initialized. Transition it once here so the layout the
+            // barriers declare matches the image's actual layout; otherwise the
+            // first draw/capture records an invalid oldLayout (Undefined content
+            // stay undefined on strict drivers) and the display buffer never
+            // receives any rendered pixels (observed as a permanent black
+            // screen in Mortal Shell's double-buffered display targets).
+            TransitionNewGuestImageToSampled(image, mipLevels: 1);
+
             return new GuestImageResource
             {
                 Address = address,

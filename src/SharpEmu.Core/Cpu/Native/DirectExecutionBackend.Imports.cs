@@ -208,6 +208,14 @@ public sealed partial class DirectExecutionBackend
 		{
 			EnsureGuestRipSampler();
 		}
+		// An import boundary is the safe point where a queued
+		// sceKernelRaiseException (Unity/Boehm stop-the-world suspension) is
+		// delivered to a running executor: the guest thread is momentarily
+		// paused inside managed HLE code, so running its signal handler here
+		// cannot corrupt native control state. Without this consumption the
+		// collector's suspension request sits queued forever and the whole
+		// process deadlocks on the GC handshake (Hellboy boot).
+		TryDeliverPendingGuestExceptionAtImportBoundary(cpuContext);
 		int num2 = Volatile.Read(in _rawSentinelRecoveries);
 		if (num2 != _lastReportedRawSentinelRecoveries)
 		{

@@ -5073,6 +5073,22 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		Volatile.Write(ref _pendingGuestExceptionCount, _pendingGuestExceptions.Count);
 	}
 
+	// Import-boundary wrapper for the safe-point exception delivery. The
+	// executor has not loaded the import's register arguments yet, so the
+	// pending guest-exception context still holds the caller's live registers
+	// at the stub; passing an empty continuation makes the writer serialize
+	// those live registers, which is exactly the state a suspension handler
+	// wants to see. Non-target threads skip in O(1) via the pending count.
+	private void TryDeliverPendingGuestExceptionAtImportBoundary(CpuContext currentContext)
+	{
+		if (Volatile.Read(ref _pendingGuestExceptionCount) == 0)
+		{
+			return;
+		}
+
+		DeliverPendingGuestExceptionAtSafePoint(currentContext, default);
+	}
+
 	private bool TryRemovePendingGuestExceptionLocked(
 		ulong threadHandle,
 		out PendingGuestException pending)
@@ -6881,6 +6897,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				Console.Error.WriteLine($"[LOADER][ERROR] Stall stack: [rsp]=0x{value:X16} [rsp+8]=0x{value2:X16}");
 			}
 
+
+
 			// The entry thread is not in _guestThreads, so the thread dump above never
 			// includes it. Capture its host RIP directly: because the address space is
 			// identity-mapped, the host RIP *is* the guest RIP currently executing.
@@ -7029,11 +7047,66 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					}
 				}
 			}
+
+			DumpGuestMemoryForStallDiagnostics(cpuContext);
 		}
 		catch
 		{
 		}
 	}
+
+
+
+	// SHARPEMU_DUMP_GUEST_MEM=addr(+len) — one-shot hex dump of guest memory
+	// taken when the stall watchdog fires, so encrypted-module code regions
+	// (decrypted only at runtime) can be disassembled offline.
+	private static int _stallGuestMemDumped;
+
+	private static void DumpGuestMemoryForStallDiagnostics(CpuContext cpuContext)
+	{
+		var spec = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_GUEST_MEM");
+		if (string.IsNullOrWhiteSpace(spec) || Interlocked.Exchange(ref _stallGuestMemDumped, 1) != 0)
+		{
+			return;
+		}
+
+		try
+		{
+			foreach (var part in spec.Split(';', StringSplitOptions.RemoveEmptyEntries))
+			{
+				var pieces = part.Split('+', StringSplitOptions.RemoveEmptyEntries);
+				if (!ulong.TryParse(pieces[0].Trim(), System.Globalization.NumberStyles.HexNumber, null, out var address))
+				{
+					continue;
+				}
+
+				var length = pieces.Length > 1 &&
+					ulong.TryParse(pieces[1].Trim(), System.Globalization.NumberStyles.HexNumber, null, out var parsedLength)
+						? Math.Min(parsedLength, 0x10000)
+						: 0x400;
+				var buffer = new byte[length];
+				if (!cpuContext.Memory.TryRead(address, buffer))
+				{
+					Console.Error.WriteLine($"[LOADER][ERROR] Stall guest-mem dump 0x{address:X16}+0x{length:X}: <unreadable>");
+					continue;
+				}
+
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall guest-mem dump 0x{address:X16}+0x{length:X} begin");
+				for (var offset = 0; offset < buffer.Length; offset += 16)
+				{
+					var line = buffer.AsSpan(offset, Math.Min(16, buffer.Length - offset));
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] dump 0x{address + (ulong)offset:X16}: {BitConverter.ToString(line.ToArray()).Replace("-", " ")}");
+				}
+
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall guest-mem dump 0x{address:X16}+0x{length:X} end");
+			}
+		}
+		catch
+		{
+		}
+	}
+
 
 	private unsafe static bool TryCaptureHostThreadContext(int hostThreadId, out HostThreadContextSnapshot snapshot)
 	{
