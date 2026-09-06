@@ -215,6 +215,10 @@ public static partial class KernelMemoryCompatExports
         public required string Path { get; init; }
         public required string[] Entries { get; init; }
         public int NextIndex { get; set; }
+
+        // FreeBSD-style getdents consume a byte stream of packed dirent records,
+        // not one entry per call; the caller resumes at DentsOffset across calls.
+        public long DentsOffset { get; set; }
     }
 
     private readonly record struct DirectAllocation(ulong Start, ulong Length, int MemoryType);
@@ -7508,41 +7512,97 @@ public static partial class KernelMemoryCompatExports
             return (int)error;
         }
 
-        var currentIndex = directory.NextIndex;
-        if (basePointerAddress != 0 && !TryWriteUInt64Compat(ctx, basePointerAddress, (ulong)currentIndex))
+        // Build the full packed dirent stream once per call in Kyty layout:
+        // blocks of 512 bytes; each record is { hash u32, reclen u16, type u8,
+        // namlen u8, name bytes, NUL }, reclen = AlignUp(8 + namlen + 1, 4) and
+        // the final record of a block stretches to the block boundary.
+        const int DirBlockSize = 512;
+        var streamLength = (int)Math.Ceiling((directory.Entries.Length * 64.0 + DirBlockSize - 1) / DirBlockSize) * DirBlockSize;
+        var stream = new byte[Math.Max(DirBlockSize, streamLength)];
+        var recordOffset = 0;
+        var nextCeiling = 0;
+        var lastRecLenOffset = -1;
+        foreach (var entryName in directory.Entries)
+        {
+            var entryBytes = Encoding.UTF8.GetBytes(entryName);
+            var nameLength = Math.Min(entryBytes.Length, 255);
+            var recordLength = (8 + nameLength + 1 + 3) & ~3;
+            if (recordOffset + recordLength > nextCeiling)
+            {
+                if (lastRecLenOffset >= 0)
+                {
+                    BinaryPrimitives.WriteUInt16LittleEndian(
+                        stream.AsSpan(lastRecLenOffset, sizeof(ushort)),
+                        (ushort)(BinaryPrimitives.ReadUInt16LittleEndian(stream.AsSpan(lastRecLenOffset, sizeof(ushort))) + (nextCeiling - recordOffset)));
+                }
+
+                recordOffset = nextCeiling;
+                nextCeiling += DirBlockSize;
+            }
+
+            BinaryPrimitives.WriteUInt32LittleEndian(stream.AsSpan(recordOffset, sizeof(uint)), ComputeDirectoryEntryHash(entryBytes.AsSpan(0, nameLength)));
+            BinaryPrimitives.WriteUInt16LittleEndian(stream.AsSpan(recordOffset + 4, sizeof(ushort)), (ushort)recordLength);
+            var entryPath = Path.Combine(directory.Path, entryName);
+            stream[recordOffset + 6] = Directory.Exists(entryPath) ? (byte)4 : (byte)8;
+            stream[recordOffset + 7] = unchecked((byte)nameLength);
+            entryBytes.AsSpan(0, nameLength).CopyTo(stream.AsSpan(recordOffset + 8));
+            stream[recordOffset + 8 + nameLength] = 0;
+
+            lastRecLenOffset = recordOffset + 4;
+            recordOffset += recordLength;
+        }
+
+        if (lastRecLenOffset >= 0)
+        {
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                stream.AsSpan(lastRecLenOffset, sizeof(ushort)),
+                (ushort)(BinaryPrimitives.ReadUInt16LittleEndian(stream.AsSpan(lastRecLenOffset, sizeof(ushort))) + (nextCeiling - recordOffset)));
+        }
+
+        var totalStreamSize = nextCeiling;
+        if (directory.DentsOffset >= totalStreamSize)
+        {
+            LogIoTrace("getdents", directory.Path, $"fd={fd} result=eof offset={directory.DentsOffset} entries={directory.Entries.Length}");
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        var alignedCount = (requested / DirBlockSize) * DirBlockSize;
+        var sourceIndex = (int)directory.DentsOffset;
+        var bytesWritten = 0;
+        while (bytesWritten + DirBlockSize <= alignedCount && sourceIndex + DirBlockSize <= totalStreamSize)
+        {
+            var recordLengthHere = BinaryPrimitives.ReadUInt16LittleEndian(stream.AsSpan(sourceIndex + 4, sizeof(ushort)));
+            var nameLengthHere = stream[sourceIndex + 7];
+            if (nameLengthHere == 0 || recordLengthHere == 0)
+            {
+                break;
+            }
+
+            bytesWritten += DirBlockSize;
+            sourceIndex += DirBlockSize;
+        }
+
+        if (bytesWritten > 0)
+        {
+            if (!TryWriteCompat(ctx, bufferAddress, stream.AsSpan((int)directory.DentsOffset, bytesWritten)))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+        }
+
+        if (basePointerAddress != 0 && !TryWriteUInt64Compat(ctx, basePointerAddress, (ulong)directory.DentsOffset))
         {
             ctx[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (currentIndex >= directory.Entries.Length)
-        {
-            LogIoTrace("getdents", directory.Path, $"fd={fd} result=eof entries={directory.Entries.Length}");
-            ctx[CpuRegister.Rax] = 0;
-            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-        }
+        directory.DentsOffset += bytesWritten;
+        directory.NextIndex = directory.Entries.Length;
 
-        var entryName = directory.Entries[currentIndex];
-        directory.NextIndex = currentIndex + 1;
-
-        var entryBytes = Encoding.UTF8.GetBytes(entryName);
-        var nameLength = Math.Min(entryBytes.Length, 255);
-        var entryPath = Path.Combine(directory.Path, entryName);
-        var entryType = Directory.Exists(entryPath) ? (byte)4 : (byte)8;
-
-        var payload = new byte[512];
-        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, sizeof(uint)), ComputeDirectoryEntryHash(entryBytes.AsSpan(0, nameLength)));
-        BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(4, sizeof(ushort)), 512);
-        payload[6] = entryType;
-        payload[7] = unchecked((byte)nameLength);
-        entryBytes.AsSpan(0, nameLength).CopyTo(payload.AsSpan(8));
-
-        if (!TryWriteCompat(ctx, bufferAddress, payload))
-        {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-        }
-
-        ctx[CpuRegister.Rax] = 512;
+        var firstEntryName = directory.Entries is { Length: > 0 } ? directory.Entries[0] : string.Empty;
+        LogIoTrace("getdents", directory.Path, $"fd={fd} offset->{directory.DentsOffset} bytes={bytesWritten} total_stream={totalStreamSize} entries={directory.Entries.Length} first='{firstEntryName}'");
+        ctx[CpuRegister.Rax] = unchecked((ulong)bytesWritten);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 

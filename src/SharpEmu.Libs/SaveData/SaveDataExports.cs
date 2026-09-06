@@ -759,7 +759,25 @@ public static class SaveDataExports
 
             if (!existed && !create && !createIfMissing)
             {
-                return SetReturn(ctx, OrbisSaveDataErrorNotFound);
+                // Real consoles provision the per-app save area when the game is
+                // installed, so a first-time open-mode mount always finds a
+                // directory. Emulate that provisioning instead of surfacing
+                // NOT_FOUND: games that never issue a create-mode mount (Quake II
+                // opens SAVEDATA with mode=0x1 exclusively) brick their own
+                // installation phase otherwise.
+                try
+                {
+                    Directory.CreateDirectory(savePath);
+                    existed = Directory.Exists(savePath);
+                }
+                catch (IOException)
+                {
+                    return SetReturn(ctx, OrbisSaveDataErrorInternal);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    return SetReturn(ctx, OrbisSaveDataErrorInternal);
+                }
             }
 
             if (existed && create)

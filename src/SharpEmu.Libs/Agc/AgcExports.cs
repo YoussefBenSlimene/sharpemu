@@ -7562,8 +7562,18 @@ public static partial class AgcExports
                 $"resume=0x{waiter.ResumeAddress:X16} dwords={remainingDwords} forced=False");
         }
 
-        System.Diagnostics.Debug.Assert(state.HasActiveSubmission);
-        System.Diagnostics.Debug.Assert(state.IsSuspended);
+        // A waiter can outlive its submission (queue superseded, completed early,
+        // or a duplicate registration from a ring re-parse). Resuming against a
+        // state with no active submission would re-parse a stale extent; drop it.
+        if (!state.HasActiveSubmission)
+        {
+            state.IsSuspended = false;
+            state.HasActiveSubmission = false;
+            TraceAgc(
+                $"agc.dcb.resume_skipped_stale label=0x{waiter.WaitAddress:X16} " +
+                $"queue={waiter.QueueName} submission={waiter.SubmissionId}");
+            return;
+        }
         state.QueueName = waiter.QueueName ?? state.QueueName;
         state.ActiveSubmissionId = waiter.SubmissionId;
         state.IsSuspended = false;
@@ -9413,6 +9423,22 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
                 texture = new TextureDescriptor(
                     0, 1, 1, Gen5TextureFormatR8G8B8A8Unorm, 0, 0, 0, 0, 0, 1, 0xFAC);
             }
+            else if (texture.Width == 1 && texture.Height == 1 &&
+                     texture.Address != 0 &&
+                     _traced1x1LinearTextures.TryAdd(texture.Address, 0))
+            {
+                // Mortal Shell black screen: the final composite pass samples a
+                // descriptor that decodes as a 1x1 linear image (raw words are
+                // consistent — width/height fields are literally 0). KytyPS5
+                // decodes the same bytes identically, so this is guest state,
+                // not a decoder bug: Unity's streaming upload for the real
+                // texture never re-bound the descriptor. Log once per address
+                // so a follow-up run can watch for a later guest rewrite.
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] agc.texture_1x1_linear_binding addr=0x{texture.Address:X16} " +
+                    $"pc=0x{binding.Pc:X} tile={texture.TileMode} fmt={texture.Format} — " +
+                    "draw samples a 1x1 placeholder descriptor (streaming upload never re-bound?)");
+            }
 
             var isStorage = Gen5ShaderTranslator.RequiresStorageImage(
                 binding,
@@ -9441,6 +9467,8 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
 
     private static int _tracedAstroTitlePixelGlobals;
     private static int _tracedAstroTitlePixelGlobalProbe;
+    // One-time report per 1x1 placeholder texture descriptor address.
+    private static readonly ConcurrentDictionary<ulong, byte> _traced1x1LinearTextures = new();
 
     private static void TraceAstroTitlePixelGlobalProbe(Gen5ShaderEvaluation evaluation)
     {
