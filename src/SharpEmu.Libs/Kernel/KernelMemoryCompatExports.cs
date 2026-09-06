@@ -7686,6 +7686,10 @@ public static partial class KernelMemoryCompatExports
         Console.Error.WriteLine($"[LOADER][TRACE] {operation} path='{path}' {detail}");
     }
 
+    // Same gate as LogIoTrace; lets sibling partial classes (positional file IO)
+    // emit into the shared SHARPEMU_LOG_IO trace stream.
+    public static void LogIoTracePublic(string operation, string path, string detail) => LogIoTrace(operation, path, detail);
+
     private static void LogUniqueStatTrace(string guestPath, string hostPath, bool found)
     {
         if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IO"), "1", StringComparison.Ordinal))

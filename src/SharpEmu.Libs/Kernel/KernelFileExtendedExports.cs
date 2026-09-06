@@ -86,6 +86,11 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        KernelMemoryCompatExports.LogIoTracePublic(
+            "pread",
+            stream.Name,
+            $"fd={fd} req={requested} read={read} off={offset}");
+
         if (read > 0 && !ctx.Memory.TryWrite(bufferAddress, buffer.AsSpan(0, read)))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
