@@ -4482,7 +4482,7 @@ internal static unsafe class VulkanVideoPresenter
             _maxColorAttachments = selected.Limits.MaxColorAttachments;
             var selectedName = SilkMarshal.PtrToString((nint)selected.DeviceName) ?? "unknown";
             Console.Error.WriteLine(
-                $"[LOADER][INFO] Vulkan device: {selectedName} ({selected.DeviceType})");
+                $"[LOADER][INFO] Vulkan device: {selectedName} ({selected.DeviceType}) api={selected.ApiVersion >> 22}.{(selected.ApiVersion >> 12) & 0x3FF:X}");
             VideoOutExports.SetSelectedGpuName(selectedName);
             if (_window is not null)
             {
@@ -6029,6 +6029,43 @@ internal static unsafe class VulkanVideoPresenter
             // render target setup (Mortal Shell: 0x8FC0000000 missing).
             if (!_guestImages.TryGetValue(work.Address, out var source))
             {
+                // Variant fallback first: the composite draws DO render into the
+                // display-buffer addresses, but a size/format rebind (e.g. the
+                // game's 1600x900 RT descriptor vs the 3840x2160 flip descriptor)
+                // parks the rendered Vulkan image in _guestImageVariants and
+                // leaves _guestImages without an entry at this address. Creating
+                // a fresh blank image here used to present a black frame even
+                // though the previous submission painted the same guest address.
+                // Re-activating the most recent variant preserves that content.
+                GuestImageResource? variant = null;
+                lock (_gate)
+                {
+                    foreach (var candidate in _guestImageVariants.Values)
+                    {
+                        if (candidate.Address == work.Address &&
+                            candidate.LogicalWidth >= work.Width &&
+                            candidate.LogicalHeight >= work.Height &&
+                            candidate.Initialized &&
+                            (variant is null ||
+                             candidate.LogicalWidth * (long)candidate.LogicalHeight <
+                             variant.LogicalWidth * (long)variant.LogicalHeight))
+                        {
+                            variant = candidate;
+                        }
+                    }
+                }
+
+                if (variant is not null)
+                {
+                    _guestImages[work.Address] = variant;
+                    source = variant;
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vk.flip_variant_promoted addr=0x{work.Address:X16} " +
+                        $"{variant.LogicalWidth}x{variant.LogicalHeight} fmt={variant.Format} " +
+                        $"(flip wants {work.Width}x{work.Height})");
+                }
+                else
+                {
                 lock (_gate)
                 {
                     if (_availableGuestImages.TryGetValue(work.Address, out var guestFormat))
@@ -6062,6 +6099,7 @@ internal static unsafe class VulkanVideoPresenter
                             $"[LOADER][WARN] vk.flip_not_available addr=0x{work.Address:X16} " +
                             $"not in _availableGuestImages");
                     }
+                }
                 }
             }
 
@@ -13250,6 +13288,19 @@ internal static unsafe class VulkanVideoPresenter
                 RecordTranslatedDrawInPass(resources, extent);
                 _vk.CmdEndRenderPass(_commandBuffer);
 
+                if (_traceZeroDrawDiagnostics &&
+                    Interlocked.Increment(ref _zeroDrawDiagnosticCount) <=
+                    _traceZeroDrawDiagnosticLimit)
+                {
+                    TraceOffscreenDrawResult(
+                        work,
+                        resources,
+                        targets,
+                        framebuffer,
+                        renderPass,
+                        extent);
+                }
+
                 var toShaderRead = stackalloc ImageMemoryBarrier[targets.Length];
                 for (var index = 0; index < targets.Length; index++)
                 {
@@ -16318,6 +16369,202 @@ internal static unsafe class VulkanVideoPresenter
             _frameGuestImageVersions[frameSlot] = null;
             _capturedGuestFlipVersions.Remove(presentedGuestImage.FlipVersion);
             DestroyGuestImage(presentedGuestImage);
+        }
+
+        private static readonly bool _traceZeroDrawDiagnostics =
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_ZERO_DRAWS") == "1";
+        private static readonly int _traceZeroDrawDiagnosticLimit =
+            int.TryParse(
+                Environment.GetEnvironmentVariable("SHARPEMU_TRACE_ZERO_DRAWS_LIMIT"),
+                out var zeroDrawLimit) && zeroDrawLimit > 0
+                ? zeroDrawLimit
+                : 8;
+        private static int _zeroDrawDiagnosticCount;
+
+        /// <summary>
+        /// Submits the current batch, waits for it, reads the draw's first
+        /// color target back, and dumps the full pipeline/framebuffer state
+        /// so a draw that silently produces no pixels can be distinguished
+        /// from a capture/presentation gap (SHARPEMU_TRACE_ZERO_DRAWS=1).
+        /// </summary>
+        private void TraceOffscreenDrawResult(
+            VulkanOffscreenGuestDraw work,
+            TranslatedDrawResources resources,
+            GuestImageResource[] targets,
+            Framebuffer framebuffer,
+            RenderPass renderPass,
+            Extent2D extent)
+        {
+            try
+            {
+                FlushBatchedGuestCommands();
+                Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle(zero-draw trace)");
+                var target = targets[0];
+                var before = Convert.ToHexString(SHA256.HashData(
+                    work.Draw.PixelSpirv).AsSpan(0, 4));
+                var contents = ReadbackImageContents(target);
+                Console.Error.WriteLine(
+                    "[LOADER][TRACE] vk.draw_result " +
+                    $"ps=0x{work.ShaderAddress:X16} hash={before} " +
+                    $"first=0x{target.Address:X16} {target.Width}x{target.Height} " +
+                    $"fmt={target.Format} " +
+                    $"pipeline=0x{resources.Pipeline.Handle:X16} " +
+                    $"fb=0x{framebuffer.Handle:X16} rp=0x{renderPass.Handle:X16} " +
+                    $"extent={extent.Width}x{extent.Height} " +
+                    $"nonzero_bytes={contents?.NonZeroBytes ?? -1}/{contents?.TotalBytes ?? -1} " +
+                    $"nonblack_pixels={contents?.NonBlackPixels ?? -1}/{contents?.TotalPixels ?? -1} " +
+                    $"verts={work.Draw.VertexCount} indexed={work.Draw.IndexBuffer is not null} " +
+                    $"view={resources.Viewport} scissor={resources.Scissor} " +
+                    $"depth={resources.Depth.TestEnable}/{resources.Depth.WriteEnable} " +
+                    $"raster={resources.Raster} " +
+                    $"blends=[{string.Join(';', resources.Blends.Select(b => $"{(b.Enable ? 1 : 0)}:{b.ColorSrcFactor}/{b.ColorDstFactor}:{b.ColorFunc}"))}]");
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] zero-draw trace failed: {exception.Message}");
+            }
+        }
+
+        private sealed record DrawContents(int NonZeroBytes, int TotalBytes, int NonBlackPixels, int TotalPixels);
+
+        private DrawContents? ReadbackImageContents(GuestImageResource image)
+        {
+            var bytesPerPixel = GetReadbackBytesPerPixel(image.Format);
+            if (bytesPerPixel == 0)
+            {
+                return null;
+            }
+
+            var byteCount = checked((ulong)image.Width * image.Height * bytesPerPixel);
+            // Cap the readback so 4K traces stay cheap; the caller only needs
+            // "did anything change", and the first rows answer that.
+            byteCount = Math.Min(byteCount, 1UL << 20);
+            var buffer = CreateBuffer(
+                byteCount,
+                BufferUsageFlags.TransferDstBit,
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                out var memory);
+            try
+            {
+                Check(
+                    _vk.ResetCommandBuffer(_commandBuffer, 0),
+                    "vkResetCommandBuffer(draw result)");
+                var beginInfo = new CommandBufferBeginInfo
+                {
+                    SType = StructureType.CommandBufferBeginInfo,
+                    Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+                };
+                Check(_vk.BeginCommandBuffer(_commandBuffer, &beginInfo), "vkBeginCommandBuffer(draw result)");
+
+                var toTransfer = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.ColorAttachmentWriteBit,
+                    DstAccessMask = AccessFlags.TransferReadBit,
+                    OldLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    NewLayout = ImageLayout.TransferSrcOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = image.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.ColorAttachmentOutputBit,
+                    PipelineStageFlags.TransferBit,
+                    0, 0, null, 0, null, 1, &toTransfer);
+                var copy = new BufferImageCopy
+                {
+                    ImageSubresource = new ImageSubresourceLayers(
+                        ImageAspectFlags.ColorBit, 0, 0, 1),
+                    ImageExtent = new Extent3D(image.Width, image.Height, 1),
+                };
+                var region = image.Width * image.Height > (1UL << 20) / bytesPerPixel
+                    ? copy with
+                    {
+                        ImageExtent = new Extent3D(
+                            image.Width,
+                            (uint)((1UL << 20) / bytesPerPixel / image.Width),
+                            1),
+                    }
+                    : copy;
+                _vk.CmdCopyImageToBuffer(
+                    _commandBuffer,
+                    image.Image,
+                    ImageLayout.TransferSrcOptimal,
+                    buffer,
+                    1,
+                    &region);
+                var backToSampled = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferReadBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferSrcOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = image.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.FragmentShaderBit,
+                    0, 0, null, 0, null, 1, &backToSampled);
+                Check(_vk.EndCommandBuffer(_commandBuffer), "vkEndCommandBuffer(draw result)");
+                SubmitGuestCommandBuffer(_commandBuffer, [], []);
+                Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle(draw result)");
+
+                void* mapped = null;
+                Check(
+                    _vk.MapMemory(_device, memory, 0, byteCount, 0, &mapped),
+                    "vkMapMemory(draw result)");
+                var span = new ReadOnlySpan<byte>(mapped, checked((int)byteCount));
+                var nonZero = 0;
+                var nonBlack = 0;
+                var texelSize = (int)bytesPerPixel;
+                for (var offset = 0; offset + texelSize <= span.Length; offset += texelSize)
+                {
+                    var anySet = false;
+                    var anyNonBlack = false;
+                    for (var b = 0; b < texelSize; b++)
+                    {
+                        if (span[offset + b] != 0)
+                        {
+                            anySet = true;
+                            if (span[offset + b] != 0xFF)
+                            {
+                                anyNonBlack = true;
+                            }
+                        }
+                    }
+
+                    if (anySet)
+                    {
+                        nonZero++;
+                    }
+
+                    if (anyNonBlack)
+                    {
+                        nonBlack++;
+                    }
+                }
+
+                _vk.UnmapMemory(_device, memory);
+                return new DrawContents(
+                    nonZero * texelSize,
+                    span.Length,
+                    nonBlack,
+                    span.Length / texelSize);
+            }
+            finally
+            {
+                _vk.DestroyBuffer(_device, buffer, null);
+                _vk.FreeMemory(_device, memory, null);
+                _commandBuffer = _presentationCommandBuffer;
+            }
         }
 
         private void TraceGuestImageContents(GuestImageResource image)

@@ -1,3 +1,55 @@
+# Mortal Shell session addendum — 2026-09-05 (flip-time variant promotion)
+
+## New root-cause evidence (latest run `ms_long_20260905_105441`)
+
+The earlier "1x1 fallback texture" theory is **wrong** —
+`ms_agc_draws.txt` shows real 1024x1024 textures decoding fine
+(`decoded=addr=0x200C810000 1024x1024 fmt=10`, etc.). The 1x1 binding is a
+legitimate descriptor at `0x2004550000`.
+
+What the newest log proves instead:
+
+- 52,369 `VulkanOffscreenGuestDraw` work items execute, and many target
+  the **display buffers directly**:
+  `submission='SharpEmu offscreen mrt=1 ps=0x2005C00000 first=0x8FC0000000 3840x2160'`
+- But every `vk.present_taken addr=0x8FC0000000 version=N` reports
+  `drawKind=None hasPixels=False` — the flip never sees a drawn image.
+- The first flip logs `vk.flip_on_demand_create addr=0x8FC0000000` —
+  `_guestImages` did not contain the address even though offscreen draws
+  had rendered into it, so the presenter created a **fresh blank image**
+  and captured that. This is the `_guestImageVariants` split suspected
+  earlier: a size/format rebind at the same address parks the rendered
+  image in `_guestImageVariants` and leaves `_guestImages` empty.
+
+## Fix applied (`VulkanVideoPresenter.cs`)
+
+`ExecuteOrderedGuestFlip` now, before the blank on-demand path, scans
+`_guestImageVariants` for an initialized image at the flip address whose
+logical extent covers the flip size and promotes the smallest matching
+variant back into `_guestImages` (trace:
+`vk.flip_variant_promoted addr=...`). Only when no variant exists does
+the previous on-demand `CreateGuestImageForDisplayBuffer` path run.
+
+Also confirmed fixed earlier in this file: the on-demand display-buffer
+image gets an explicit `Undefined → ShaderReadOnly` transition
+(`TransitionNewGuestImageToSampled`) so the first pre-draw barrier
+declares a layout the image actually has; without it the display buffer
+never received any rendered pixels.
+
+## Next steps if the screen is still black
+
+1. Run with `SHARPEMU_TRACE_GUEST_IMAGE_EVENTS=1` and confirm
+   `[GIMG] recreate`/`retained` events at `0x8FC0000000`/`0x8FC2000000`
+   around flips; if `vk.flip_variant_promoted` never fires, the variant
+   that holds the composite may differ in format (add a format-agnostic
+   promotion fallback).
+2. If promotion fires but pixels stay zero, capture the promoted image
+   with `SHARPEMU_TRACE_GUEST_IMAGES=1` (readback at frames 1/30/120) to
+   distinguish "wrong image object" from "pipeline never wrote".
+
+---
+
+
 # Mortal Shell: Enhanced Edition — Black Screen Investigation
 
 **TID**: PPSA02868 | **Title**: Mortal Shell: Enhanced Edition | **Status**: Boots past initial stall, black screen
