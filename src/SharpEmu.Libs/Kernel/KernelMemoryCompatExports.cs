@@ -3344,8 +3344,41 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        TryZeroFreshDirectMapping(ctx, mappedAddress, length);
+
         GuestWriteWatch.OnDirectMapping(mappedAddress, length, protection);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Upper bound on auto-zeroing a fresh direct mapping. Boehm GC's
+    // stop-the-world handshake (Unity titles: Suspend/ResumeSemaphore
+    // acknowledge counters) and Baselib worker structures assume the kernel
+    // hands out zeroed direct pages, exactly like real PS5 hardware. Without
+    // this, structures allocated without an explicit initializer observe
+    // leftover host-page bytes as wild pointers/values — the deterministic
+    // 0x41E4Exxx_xxxx_2Dxx garbage pattern observed crashing Unity's
+    // Loading.PreloadManager right after scePthreadSelf (Hellboy).
+    private const ulong MaxAutoZeroDirectBytes = 64UL * 1024 * 1024;
+
+    private static void TryZeroFreshDirectMapping(CpuContext ctx, ulong address, ulong length)
+    {
+        if (address == 0 || length == 0 || length > MaxAutoZeroDirectBytes)
+        {
+            return;
+        }
+
+        // Chunked with the shared zero buffer (same pattern as the memset HLE)
+        // so a multi-hundred-MB mapping does not allocate a transient copy.
+        for (ulong offset = 0; offset < length;)
+        {
+            var chunkLength = (int)Math.Min((ulong)_zeroChunk.Length, length - offset);
+            if (!TryWriteCompat(ctx, address + offset, _zeroChunk.AsSpan(0, chunkLength)))
+            {
+                return;
+            }
+
+            offset += (ulong)chunkLength;
+        }
     }
 
     [SysAbiExport(
@@ -3430,6 +3463,14 @@ public static partial class KernelMemoryCompatExports
                 IsDirect: false,
                 DirectStart: 0));
         }
+
+        // Fresh flexible mappings must be zeroed: the backing host pages are
+        // recycled and contain stale bytes that guest code reads as wild
+        // pointers (Hellboy Loading.PreloadManager: pthread self / queue
+        // cursors like 0x41E4E00000002D4C). Done OUTSIDE _memoryGate: a
+        // multi-hundred-MB zeroing while holding the gate starves the main
+        // thread's concurrent map calls until the stall watchdog aborts boot.
+        TryZeroFreshDirectMapping(ctx, mappedAddress, length);
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
         {

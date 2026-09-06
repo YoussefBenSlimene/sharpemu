@@ -154,10 +154,115 @@ public static class KernelPthreadCompatExports
 
     private readonly record struct PthreadMutexAttrState(int Type, int Protocol);
 
-    static KernelPthreadCompatExports()
+    // Installs the guest-memory thread-object allocator used for every
+    // guest-visible pthread_t. All guest threads share one address space, so
+    // capturing the first seen allocator is safe; the closure allocates a
+    // zeroed object so guest code that dereferences the handle (Unity/Boehm
+    // read ScePthread fields) observes well-defined bytes instead of aliasing
+    // live guest allocations through a host-heap pointer (Hellboy
+    // Loading.PreloadManager AV right after scePthreadSelf).
+    private static void EnsureGuestThreadObjectAllocator(CpuContext ctx)
     {
-        RunSynchronizationSelfChecks();
-        GuestThreadExecution.GuestThreadAbandoned += AbandonMutexesOwnedByThread;
+        if (KernelPthreadState.GuestThreadObjectAllocator is not null ||
+            ctx.Memory is not IGuestMemoryAllocator allocator)
+        {
+            return;
+        }
+
+        var memory = ctx.Memory;
+        KernelPthreadState.GuestThreadObjectAllocator = size => AllocateZeroedGuestObject(allocator, memory, size);
+        GuestAllocationBridge.RequestZeroed = size => AllocateZeroedGuestObject(allocator, memory, size);
+        KernelPthreadState.GuestThreadObjectInitializer = objectAddress =>
+        {
+            // ScePthread+0x58 -> secondary thread block (cancel-state etc.).
+            // Hellboy's pthread wrappers do `mov r15,[self+0x58]` and then
+            // dereference r15; leave it non-NULL and zeroed.
+            var secondary = AllocateZeroedGuestObject(allocator, memory, 0x200);
+            if (secondary == 0)
+            {
+                return;
+            }
+
+            Span<byte> pointerBytes = stackalloc byte[8];
+            BinaryPrimitives.WriteUInt64LittleEndian(pointerBytes, secondary);
+            _ = memory.TryWrite(objectAddress + 0x58, pointerBytes);
+
+            // Mark the secondary block's cancel-state word (0x11C) nonzero so
+            // Hellboy's TCB-walk loop (`mov r15,[x+0x58]; cmp word [r15+11Ch],0
+            // jne done`) terminates on the first hop instead of walking into
+            // the zeroed tail and dereferencing NULL.
+            Span<byte> flagBytes = stackalloc byte[2];
+            BinaryPrimitives.WriteUInt16LittleEndian(flagBytes, 1);
+            _ = memory.TryWrite(secondary + 0x11C, flagBytes);
+
+            // Per-thread stats sub-structure: the scheduler walk does
+            // `mov rax,[thread+0x68]; mov eax,[rax+0x24]; movsxd esi,[rax+0x30]`
+            // for every thread object. Point it at a zeroed block; reuse the
+            // secondary block if the extra allocation fails.
+            var stats = AllocateZeroedGuestObject(allocator, memory, 0x100);
+            if (stats == 0)
+            {
+                stats = secondary;
+            }
+
+            Span<byte> statsBytes = stackalloc byte[8];
+            BinaryPrimitives.WriteUInt64LittleEndian(statsBytes, stats);
+            _ = memory.TryWrite(objectAddress + 0x68, statsBytes);
+            // The scheduler walk may address the secondary block directly
+            // (0x58-stride entries), so give it the same stats pointer.
+            _ = memory.TryWrite(secondary + 0x68, statsBytes);
+
+            // Make the stats block self-referential: every pointer field points
+            // back at the block, so the guest's chained reads (e.g. [obj+0x00]
+            // -> [x+0x38] -> [x+0x10] -> [x+rcx*8]) stay inside the zeroed
+            // 0x100 block instead of dereferencing NULL fields the real
+            // kernel would have filled.
+            for (var offset = 0; offset < 0x100; offset += 8)
+            {
+                _ = memory.TryWrite(stats + (ulong)offset, statsBytes);
+            }
+
+            // [thread+0x00] is the first pointer the wrapper dereferences
+            // (`mov rax,[r14]; mov rax,[rax+0x38]; ...`).
+            _ = memory.TryWrite(objectAddress, statsBytes);
+        };
+
+        // Retrofit thread objects created before the allocator was installed
+        // (main thread, very early helpers). Without this, the guest's
+        // all-threads walk dereferences their NULL +0x58/+0x68 fields.
+        foreach (var existingHandle in KernelPthreadState.SnapshotGuestAllocatedThreadHandles())
+        {
+            try
+            {
+                KernelPthreadState.GuestThreadObjectInitializer(existingHandle);
+            }
+            catch
+            {
+                // Best-effort retrofit.
+            }
+        }
+    }
+
+    // Public entry for other kernel exports (scePthreadCreate) that produce
+    // guest-visible pthread_t values before the first scePthreadSelf call.
+    internal static void EnsureGuestThreadObjectAllocatorForCreate(CpuContext ctx) =>
+        EnsureGuestThreadObjectAllocator(ctx);
+
+    private static ulong AllocateZeroedGuestObject(
+        IGuestMemoryAllocator allocator,
+        ICpuMemory memory,
+        int size)
+    {
+        if (size <= 0 ||
+            !allocator.TryAllocateGuestMemory((ulong)size, alignment: 0x10, out var address))
+        {
+            return 0;
+        }
+
+        // Zero explicitly: guest allocations are not guaranteed zeroed, and a
+        // stale alias here would defeat the entire purpose of the object.
+        var zeros = new byte[size];
+        return memory.TryWrite(address, zeros) ? address : 0UL;
     }
 
     /// <summary>
@@ -271,6 +376,7 @@ public static class KernelPthreadCompatExports
         LibraryName = "libKernel")]
     public static int PthreadSelf(CpuContext ctx)
     {
+        EnsureGuestThreadObjectAllocator(ctx);
         var currentThreadHandle = KernelPthreadState.GetCurrentThreadHandle();
         if (GuestThreadExecution.CurrentGuestThreadHandle != currentThreadHandle)
         {

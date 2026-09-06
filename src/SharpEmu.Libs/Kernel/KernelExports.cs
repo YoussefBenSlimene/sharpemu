@@ -204,6 +204,10 @@ public static class KernelExports
         var entryAddress = ctx[CpuRegister.Rdx];
         var argument = ctx[CpuRegister.Rcx];
         var name = nameAddress == 0 ? string.Empty : ReadCString(ctx, nameAddress, 256);
+        // Install the guest-object allocator before creating the handle so the
+        // very first pthread_t handed to guest code is already a guest-memory
+        // object (scePthreadCreate runs before the first scePthreadSelf).
+        KernelPthreadCompatExports.EnsureGuestThreadObjectAllocatorForCreate(ctx);
         var threadHandle = KernelPthreadState.CreateThreadHandle(name);
         KernelPthreadExtendedCompatExports.GetThreadStartScheduling(
             ctx,

@@ -8,6 +8,20 @@ using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.Kernel;
 
+/// <summary>
+/// Public bridge that lets the CPU backend's vectored exception handler
+/// service guest allocation requests (Hellboy's libScePosix node allocator
+/// returns NULL for pool slots the real kernel provides; the caller stores
+/// through the NULL pointer unconditionally and kills the process).
+/// Registered by <see cref="KernelPthreadCompatExports"/> once a guest
+/// address space exists.
+/// </summary>
+public static class GuestAllocationBridge
+{
+    /// <summary>Allocates a zeroed guest-memory block of <paramref name="size"/> bytes, or 0.</summary>
+    public static Func<int, ulong>? RequestZeroed { get; set; }
+}
+
 internal static class KernelPthreadState
 {
     private const int ThreadObjectSize = 0x1000;
@@ -15,6 +29,32 @@ internal static class KernelPthreadState
     private static readonly ConcurrentDictionary<ulong, ThreadIdentity> Threads = new();
     private static readonly byte[] ZeroThreadObject = new byte[ThreadObjectSize];
     private static long _nextUniqueThreadId = 1;
+
+    // Set by the CPU backend once a guest address space exists. Guest-visible
+    // pthread_t values must be guest-memory object pointers, exactly like the
+    // real kernel (and KytyPS5): scePthreadSelf/scePthreadCreate hand the
+    // handle to guest code, and runtimes (Unity/Boehm stop-the-world,
+    // Baselib) treat ScePthread as a structure they may read fields from.
+    // Host-heap pointers (Marshal.AllocHGlobal) handed out as pthread_t used
+    // to alias unrelated guest flexible-heap data when dereferenced through
+    // the guest address space, producing wild pointers like
+    // 0x41E4E00000002D3C and an Access Violation on Unity's
+    // Loading.PreloadManager thread (Hellboy boot).
+    internal static Func<int, ulong>? GuestThreadObjectAllocator { get; set; }
+
+    // Optional post-allocation hook (set by KernelPthreadCompatExports once a
+    // guest address space exists). Hellboy's libScePosix pthread wrappers load
+    // a secondary thread structure with `mov r15,[self+0x58]` and then read
+    // fields such as [r15+0x11C] (cancel-state checks). A fully zeroed object
+    // leaves that pointer NULL and crashes; pointing it at a zeroed guest
+    // block gives the guest well-defined memory, mirroring the kernel where
+    // ScePthread fields always reference valid allocations.
+    internal static Action<ulong>? GuestThreadObjectInitializer { get; set; }
+
+    // Handles that were allocated as guest-memory objects (not host-heap
+    // fallbacks). The retrofit pass must only touch these: writing through a
+    // host-heap handle interpreted as a guest address would corrupt memory.
+    private static readonly HashSet<ulong> _guestAllocatedHandles = new();
 
     [ThreadStatic]
     private static ulong _currentThreadHandle;
@@ -50,6 +90,14 @@ internal static class KernelPthreadState
 
         EnsureCurrentThreadRegistered();
         return _currentThreadUniqueId;
+    }
+
+    internal static ulong[] SnapshotGuestAllocatedThreadHandles()
+    {
+        lock (_guestAllocatedHandles)
+        {
+            return _guestAllocatedHandles.ToArray();
+        }
     }
 
     internal static string DescribeThreadHandle(ulong threadHandle)
@@ -122,11 +170,52 @@ internal static class KernelPthreadState
 
     private static ulong AllocateThreadHandle(ulong uniqueId, string name)
     {
-        var pointer = Marshal.AllocHGlobal(ThreadObjectSize);
-        Marshal.Copy(ZeroThreadObject, 0, pointer, ThreadObjectSize);
+        // Prefer a guest-memory object so the handle is a plain guest pointer,
+        // exactly like the kernel's ScePthread objects on real hardware. Guest
+        // code may dereference the handle through the guest address space; a
+        // host-heap pointer there aliases unrelated guest data (Hellboy
+        // PreloadManager AV). The zeroed object also makes field reads
+        // well-defined instead of aliasing live guest allocations.
+        ulong handle = 0;
+        var allocator = GuestThreadObjectAllocator;
+        if (allocator is not null)
+        {
+            try
+            {
+                handle = allocator(ThreadObjectSize);
+            }
+            catch
+            {
+                handle = 0;
+            }
+        }
 
-        var handle = unchecked((ulong)pointer.ToInt64());
+        if (handle == 0)
+        {
+            // Fallback identity when guest-memory allocation is unavailable
+            // (no address space yet, e.g. very early host-only threads).
+            var pointer = Marshal.AllocHGlobal(ThreadObjectSize);
+            Marshal.Copy(ZeroThreadObject, 0, pointer, ThreadObjectSize);
+            handle = unchecked((ulong)pointer.ToInt64());
+        }
+        else
+        {
+            lock (_guestAllocatedHandles)
+            {
+                _guestAllocatedHandles.Add(handle);
+            }
+        }
+
         Threads[handle] = new ThreadIdentity(uniqueId, string.IsNullOrWhiteSpace(name) ? $"Thread-{uniqueId:X}" : name);
+
+        try
+        {
+            GuestThreadObjectInitializer?.Invoke(handle);
+        }
+        catch
+        {
+            // Initialization is best-effort; the zeroed object remains valid.
+        }
 
         return handle;
     }
