@@ -144,10 +144,30 @@ public sealed partial class DirectExecutionBackend
 				return -1;
 			}
 			if (exceptionCode == 3221225477u &&
-				TryRecoverGuestAllocatorHole(exceptionRecord, contextRecord, rip))
+				TryRecoverGuestBadStoreFault(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverGuestProducerCursorFault(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
+		if (exceptionCode == 3221225477u &&
+			TryRecoverGuestAllocatorHole(exceptionRecord, contextRecord, rip))
+		{
+			return -1;
+		}
+		if (exceptionCode == 3221225477u &&
+			TryRecoverGuestNullChainTableFault(exceptionRecord, contextRecord, rip))
+		{
+			return -1;
+		}
+		if (exceptionCode == 3221225477u &&
+			TryRecoverGuestBadNamePointerFault(exceptionRecord, contextRecord, rip))
+		{
+			return -1;
+		}
 			if (exceptionCode == StatusIllegalInstruction &&
 				TryRecoverIllegalInstruction(contextRecord, rip))
 			{
@@ -667,6 +687,469 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		return true;
+	}
+
+	private static long _guestBadStoreRecoveries;
+
+	/// <summary>
+	/// Recovers guest stores to non-canonical addresses (Hellboy's
+	/// Loading.PreloadManager pushes work items through a cursor whose upper
+	/// half contains uninitialized guest-stack garbage: 0x41E4E00000002D4C and
+	/// friends). A non-canonical target can never be a valid store, so the
+	/// only meaningful recovery is to drop the store: decode the instruction
+	/// at RIP, require it to be a memory store, and resume after it. This
+	/// converts a process-killing AV into a lost queue entry.
+	/// </summary>
+	private unsafe static bool TryRecoverGuestBadStoreFault(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_BAD_STORE_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			rip < 0x10000)
+		{
+			return false;
+		}
+
+		var accessType = exceptionRecord->ExceptionInformation[0];
+		var faultTarget = exceptionRecord->ExceptionInformation[1];
+
+		byte[] code = new byte[15];
+		if (!TryReadHostBytes(rip, code))
+		{
+			return false;
+		}
+
+		var decoder = Iced.Intel.Decoder.Create(64, code);
+		decoder.IP = rip;
+		var instruction = decoder.Decode();
+
+		// Must be a store to memory. No memory operand is not recoverable here.
+		if (instruction.MemoryBase == Iced.Intel.Register.None &&
+			instruction.MemoryIndex == Iced.Intel.Register.None)
+		{
+			return false;
+		}
+
+		// Compute the effective address from the CONTEXT registers so we never
+		// misclassify a read loop that merely happens to have garbage in RSI
+		// (Hellboy: `cmp word [r15+11Ch],0` with r15=0 burned CPU in an
+		// infinite skip loop when the stale RSI value was checked instead).
+		var effective = instruction.MemoryDisplacement64;
+		if (instruction.MemoryBase != Iced.Intel.Register.None)
+		{
+			effective += ReadCtxReg(contextRecord, instruction.MemoryBase);
+		}
+		if (instruction.MemoryIndex != Iced.Intel.Register.None)
+		{
+			effective += ReadCtxReg(contextRecord, instruction.MemoryIndex) * (ulong)instruction.MemoryIndexScale;
+		}
+
+		var effHigh = effective >> 47;
+		var nonCanonical = effHigh != 0 && effHigh != 0x1FFFF;
+		// Windows reports an access to a non-canonical address as a *read* AV
+		// with target 0xFFFFFFFFFFFFFFFF (the canonicalization fault happens
+		// before the access type is resolved).
+		var canonicalizationFault = faultTarget == 0xFFFF_FFFF_FFFF_FFFFUL;
+
+		if (!nonCanonical && !canonicalizationFault)
+		{
+			return false;
+		}
+
+		// A non-canonical address can never be a valid guest access, so the
+		// only meaningful recovery is to skip the instruction entirely — for
+		// stores AND reads (Hellboy: `cmp byte [r15+12Eh],0` with a garbage
+		// r15 loaded from guest-side state). The consumer of the skipped read
+		// sees stale flags/values but the process survives; the alternative is
+		// killing the whole game over one garbage pointer read.
+		if (accessType != 0 && accessType != 1)
+		{
+			return false;
+		}
+
+		if (canonicalizationFault && !nonCanonical)
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, 248, rip + (ulong)instruction.Length);
+		var recovery = Interlocked.Increment(ref _guestBadStoreRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Guest bad-store recovery #{recovery}: " +
+				$"rip=0x{rip:X16} '{instruction}' target=0x{effective:X16} -> skip {instruction.Length} bytes " +
+				"(set SHARPEMU_DISABLE_BAD_STORE_RECOVERY=1 to disable)");
+			Console.Error.Flush();
+		}
+
+		return recovery <= 1_000_000;
+	}
+
+	private static unsafe ulong ReadCtxReg(void* contextRecord, Iced.Intel.Register register) => register switch
+	{
+		Iced.Intel.Register.RAX => ReadCtxU64(contextRecord, 120),
+		Iced.Intel.Register.RCX => ReadCtxU64(contextRecord, 128),
+		Iced.Intel.Register.RDX => ReadCtxU64(contextRecord, 136),
+		Iced.Intel.Register.RBX => ReadCtxU64(contextRecord, 144),
+		Iced.Intel.Register.RSP => ReadCtxU64(contextRecord, 152),
+		Iced.Intel.Register.RBP => ReadCtxU64(contextRecord, 160),
+		Iced.Intel.Register.RSI => ReadCtxU64(contextRecord, 168),
+		Iced.Intel.Register.RDI => ReadCtxU64(contextRecord, 176),
+		Iced.Intel.Register.R8 => ReadCtxU64(contextRecord, 184),
+		Iced.Intel.Register.R9 => ReadCtxU64(contextRecord, 192),
+		Iced.Intel.Register.R10 => ReadCtxU64(contextRecord, 200),
+		Iced.Intel.Register.R11 => ReadCtxU64(contextRecord, 208),
+		Iced.Intel.Register.R12 => ReadCtxU64(contextRecord, 216),
+		Iced.Intel.Register.R13 => ReadCtxU64(contextRecord, 224),
+		Iced.Intel.Register.R14 => ReadCtxU64(contextRecord, 232),
+		Iced.Intel.Register.R15 => ReadCtxU64(contextRecord, 240),
+		Iced.Intel.Register.RIP => ReadCtxU64(contextRecord, 248),
+		_ => 0,
+	};
+
+	private unsafe static bool TryRecoverGuestProducerCursorFault(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		// Hellboy (PPSA11264): libScePosix pthread wrappers read the cached
+		// pthread self with `mov r15,[r15+58h]`. When the caller's cached self
+		// is still 0 (kernel-managed TLS slot we don't populate), substitute
+		// the current guest thread handle — the same value scePthreadSelf
+		// returns — and re-execute the load.
+		if (rip >= 0x10000 &&
+			*(ulong*)rip == 0x0000_0000_588B_7F49UL) // 49 8B 7F 58 (mov r15,[r15+0x58])
+		{
+			var self = ReadCtxU64(contextRecord, 240); // R15
+			if (self == 0)
+			{
+				var threadHandle = SharpEmu.HLE.GuestThreadExecution.CurrentGuestThreadHandle;
+				if (threadHandle != 0)
+				{
+					WriteCtxU64(contextRecord, 240, threadHandle);
+					var count = Interlocked.Increment(ref _guestSelfSubstitutions);
+					if (count <= 16 || (count & (count - 1)) == 0)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][WARN] Guest pthread-self substitution #{count}: " +
+							$"rip=0x{rip:X16} r15=0 -> 0x{threadHandle:X16} (re-executing)");
+						Console.Error.Flush();
+					}
+
+					return true;
+				}
+			}
+		}
+
+		// Hellboy: the same pthread wrapper's cancel-state checks read
+		//   66 41 83 BF 1C 01 00 00 00   cmp word [r15+0x11C],0
+		//   41 80 BF 2E 01 00 00 00      cmp byte [r15+0x12E],0
+		// with a garbage r15 (a stale queue node pointer). Skipping the read
+		// leaves the retry loop spinning forever, so instead repoint r15 at
+		// the current guest thread object (zeroed, 0x1000 bytes) and
+		// re-execute: the checks read zeros and the loop terminates normally.
+		if (rip >= 0x10000)
+		{
+			var opcode = *(ulong*)rip;
+			// 66 41 83 BF 1C 01 00 00 -> LE qword 0x0000_011C_BF83_4166
+			var isCancelWordCheck = opcode == 0x0000_011C_BF83_4166UL;
+			// 41 80 BF 2E 01 00 00 00 -> LE qword 0x0000_0001_2EBF_8041
+			var isCancelByteCheck = opcode == 0x0000_0001_2EBF_8041UL;
+			if (isCancelWordCheck || isCancelByteCheck)
+			{
+				var self = ReadCtxU64(contextRecord, 240); // R15
+				var selfHigh = self >> 47;
+				var invalidSelf = self == 0 || (selfHigh != 0 && selfHigh != 0x1FFFF);
+				if (invalidSelf && _guestSelfSubstitutions < 100_000)
+				{
+					var threadHandle = SharpEmu.HLE.GuestThreadExecution.CurrentGuestThreadHandle;
+					if (threadHandle != 0)
+					{
+						WriteCtxU64(contextRecord, 240, threadHandle);
+						var count = Interlocked.Increment(ref _guestSelfSubstitutions);
+						if (count <= 16 || (count & (count - 1)) == 0)
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][WARN] Guest cancel-state r15 substitution #{count}: " +
+								$"rip=0x{rip:X16} r15=0x{self:X16} -> 0x{threadHandle:X16} (re-executing)");
+							Console.Error.Flush();
+						}
+
+						return true;
+					}
+				}
+			}
+		}
+
+		if (rip >= 0x10000)
+		{
+			// Hellboy: libScePosix allocates a list node whose backing call
+			// returned NULL and stores through it unconditionally:
+			//   4C 89 38                mov [rax],r15
+			//   48 C7 40 08 00 00 00 00 mov qword [rax+8],0
+			// Service the allocation with a zeroed guest block and re-execute.
+			var b = (byte*)rip;
+			if (b[0] == 0x4C && b[1] == 0x89 && b[2] == 0x38 &&
+				b[3] == 0x48 && b[4] == 0xC7 && b[5] == 0x40 && b[6] == 0x08 &&
+				b[7] == 0x00 && b[8] == 0x00 && b[9] == 0x00 && b[10] == 0x00)
+			{
+				var node = ReadCtxU64(contextRecord, 120); // RAX
+				if (node == 0)
+				{
+					var allocated = SharpEmu.Libs.Kernel.GuestAllocationBridge.RequestZeroed?.Invoke(0x18) ?? 0;
+					if (allocated != 0)
+					{
+						WriteCtxU64(contextRecord, 120, allocated);
+						var count = Interlocked.Increment(ref _guestNullAllocationFixups);
+						if (count <= 16 || (count & (count - 1)) == 0)
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][WARN] Guest null-allocation fixup #{count}: " +
+								$"rip=0x{rip:X16} rax=0 -> 0x{allocated:X16} (re-executing)");
+							Console.Error.Flush();
+						}
+
+						return true;
+					}
+				}
+			}
+		}
+
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_PRODUCER_CURSOR_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			rip < 0x10000)
+		{
+			return false;
+		}
+
+		// Hellboy (PPSA11264): Unity's Loading.PreloadManager pushes work items
+		// loaded from a guest structure. When an upstream field still contains
+		// garbage (observed as the non-canonical 0x41E4Exxx_xxxx_2Dxx pattern),
+		// the push faults and, unrecovered, kills the whole process right after
+		// the first presented frame. Match the exact instruction stream and
+		// emulate it: drop the bad item write (the consumer simply sees no
+		// entry for this tick), perform the counter increment on RDI, and
+		// resume at the trailing RET.
+		// Two variants of the same push helper:
+		//   89 06 48 83 07 04 C3 CC            mov [rsi],eax; add qword [rdi],4; ret
+		//   C5 FA 11 06 48 83 07 04 C3 CC ...  vmovups [rsi],xmm0; add qword [rdi],4; ret
+		var b0 = *((byte*)rip);
+		var b1 = *((byte*)rip + 1);
+		var b2 = *((byte*)rip + 2);
+		var b3 = *((byte*)rip + 3);
+		int storeLength;
+		if (b0 == 0x89 && b1 == 0x06)
+		{
+			storeLength = 2;
+		}
+		else if (b0 == 0xC5 && b1 == 0xFA && b2 == 0x11 && b3 == 0x06)
+		{
+			storeLength = 4;
+		}
+		else
+		{
+			return false;
+		}
+
+		var addOffset = rip + (ulong)storeLength;
+		// Bytes at addOffset: 48 83 07 04 C3 (add qword [rdi],4; ret)
+		if ((*(ulong*)addOffset & 0x0000_FFFF_FFFF_FFFFUL) != 0x0000_CCC3_0407_8348UL)
+		{
+			return false;
+		}
+
+		// Gate on the exact instruction signature only. Windows reports the AV
+		// as a *read* with target 0xFFFFFFFFFFFFFFFF when the store address is
+		// non-canonical, and as a write with a reserved-region target when it
+		// is canonical-but-unmapped, so the access type cannot be used.
+		var rsi = ReadCtxU64(contextRecord, 168);
+		var rdi = ReadCtxU64(contextRecord, 176);
+
+		// Emulate `add qword [rdi], 4` only when RDI points at host-mapped
+		// memory (probe first: a raw write through a bad pointer would re-enter
+		// the VEH). If unmapped, still recover by skipping the whole push — a
+		// lost cursor tick is recoverable; a dead process is not.
+		if (rdi != 0 && TryReadHostBytes(rdi, new byte[8]))
+		{
+			*(ulong*)rdi += 4;
+		}
+
+		var retDelta = (ulong)(storeLength + 4); // store + add -> trailing C3
+		WriteCtxU64(contextRecord, 248, rip + retDelta);
+		var recovery = Interlocked.Increment(ref _guestProducerCursorRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Guest producer-cursor adapter recovery #{recovery}: " +
+				$"rip=0x{rip:X16} rsi=0x{rsi:X16} rdi=0x{rdi:X16} -> resume 0x{rip + retDelta:X16} " +
+				"(bad cursor dropped; set SHARPEMU_DISABLE_PRODUCER_CURSOR_RECOVERY=1 to disable)");
+			Console.Error.Flush();
+		}
+
+		return true;
+	}
+
+	private static long _guestProducerCursorRecoveries;
+	private static long _guestSelfSubstitutions;
+	private static long _guestNullAllocationFixups;
+	private static long _guestNullChainRecoveries;
+	private static long _guestBadNamePointerRecoveries;
+
+	/// <summary>
+	/// Hellboy (PPSA11264): libScePosix's thread-name scan walks its node
+	/// list and loads each entry's name pointer
+	///   49 8B 76 18   mov rsi, [r14+0x18]   ; name char*
+	///   80 3E 2E     cmp byte [rsi], 0x2E   ; starts with '.'?
+	///   0F 85 ...    jne <next node>
+	/// When the node's name field holds garbage (an uninitialized Il2CPP
+	/// heap node; observed target 0x3E8), the load faults. Repoint RSI at
+	/// the faulting instruction's own code bytes — readable and guaranteed
+	/// not to start with '.' — and re-execute the comparison so the scan
+	/// simply moves on to the next node.
+	/// </summary>
+	private unsafe static bool TryRecoverGuestBadNamePointerFault(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (rip < 0x10000 ||
+			exceptionRecord->NumberParameters < 2)
+		{
+			return false;
+		}
+
+		var b = (byte*)rip;
+		// mov rsi,[r14+0x18]; cmp byte [rsi],0x2E; jne rel32
+		var matchesSignature =
+			b[0] == 0x49 && b[1] == 0x8B && b[2] == 0x76 && b[3] == 0x18 &&
+			b[4] == 0x80 && b[5] == 0x3E && b[6] == 0x2E &&
+			b[7] == 0x0F && b[8] == 0x85;
+		if (!matchesSignature)
+		{
+			return false;
+		}
+
+		// The name pointer must itself be the garbage (small/null-page
+		// target) — a fault through a large mapped address is a different bug.
+		var faultTarget = exceptionRecord->ExceptionInformation[1];
+		if (faultTarget >= 0x1_0000_0000UL && (faultTarget >> 47) is 0 or 0x1FFFF)
+		{
+			// Could still be an unmapped guest pointer; accept it — the
+			// recovery is identical (skip the comparison).
+		}
+
+		// Point RSI at the code bytes: byte [rsi] = 0x49 ('I') != '.',
+		// so the jne is taken and the scan advances to the next node.
+		WriteCtxU64(contextRecord, 168, rip); // RSI
+		var recovery = Interlocked.Increment(ref _guestBadNamePointerRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Guest bad-name-pointer recovery #{recovery}: " +
+				$"rip=0x{rip:X16} target=0x{faultTarget:X16} -> rsi=code, re-execute");
+			Console.Error.Flush();
+		}
+
+		return recovery <= 100_000;
+	}
+
+	/// <summary>
+	/// Hellboy (PPSA11264): Unity/Il2Cpp's thread-registry lookup walks a
+	/// kernel-managed pointer chain
+	///   mov rax,[r14]          ; registry root
+	///   mov rax,[rax+0x38]     ; -> table
+	///   mov rax,[rax+0x10]     ; -> bucket array
+	///   mov rax,[rax+rcx*8]    ; -> entry (index = thread slot)
+	///   mov [r13],rax
+	/// When the root's first qword is still zero (a structure the real kernel
+	/// populates but our HLE leaves empty), the very first hop reads [0+0x38]
+	/// and faults. Emulate the whole chain with NULL results: store 0 to
+	/// [r13] and resume after the chain — the caller treats a missing entry
+	/// as "thread not registered", which is the correct answer for a
+	/// registry the kernel never filled.
+	/// </summary>
+	private unsafe static bool TryRecoverGuestNullChainTableFault(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (rip < 0x10000 ||
+			exceptionRecord->NumberParameters < 2)
+		{
+			return false;
+		}
+
+		var rax = ReadCtxU64(contextRecord, 120);
+		if (rax != 0)
+		{
+			// The chain hop only faults at [rax+disp] when rax itself is
+			// NULL; any other base is a different bug.
+			var faultTarget = exceptionRecord->ExceptionInformation[1];
+			if (faultTarget >= 0x100)
+			{
+				return false;
+			}
+		}
+
+		// Match the full instruction window:
+		//   48 8B 40 xx   mov rax,[rax+xx]     (hop 2, faulting instruction)
+		//   48 8B 40 10   mov rax,[rax+0x10]
+		//   48 8B 04 C8   mov rax,[rax+rcx*8]
+		//   49 89 45 00   mov [r13],rax
+		var b = (byte*)rip;
+		var isHop2 = b[0] == 0x48 && b[1] == 0x8B && b[2] == 0x40; // mov rax,[rax+disp8]
+		if (!isHop2)
+		{
+			return false;
+		}
+
+		var hop2Length = 4;
+		var rest = b + hop2Length;
+		var matchesChain =
+			rest[0] == 0x48 && rest[1] == 0x8B && rest[2] == 0x40 && rest[3] == 0x10 &&
+			rest[4] == 0x48 && rest[5] == 0x8B && rest[6] == 0x04 && rest[7] == 0xC8 &&
+			rest[8] == 0x49 && rest[9] == 0x89 && rest[10] == 0x45 && rest[11] == 0x00;
+		if (!matchesChain)
+		{
+			return false;
+		}
+
+		// Emulate: rax = 0 through the whole chain, store 0 into [r13].
+		var r13 = ReadCtxU64(contextRecord, 224);
+		if (r13 != 0 && TryReadHostBytes(r13, new byte[8]))
+		{
+			try
+			{
+				*(ulong*)r13 = 0;
+			}
+			catch
+			{
+				// Store dropped; the caller still resumes.
+			}
+		}
+
+		WriteCtxU64(contextRecord, 120, 0); // rax = 0 (chain result)
+		var chainLength = hop2Length + 12; // 4 + (4 + 4 + 4)
+		WriteCtxU64(contextRecord, 248, rip + (ulong)chainLength);
+		var recovery = Interlocked.Increment(ref _guestNullChainRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Guest null-chain table recovery #{recovery}: " +
+				$"rip=0x{rip:X16} rax=0x{rax:X16} -> store NULL entry, resume 0x{rip + (ulong)chainLength:X16}");
+			Console.Error.Flush();
+		}
+
+		return recovery <= 100_000;
 	}
 
 	private static bool IsBenignHostDebugException(uint exceptionCode)

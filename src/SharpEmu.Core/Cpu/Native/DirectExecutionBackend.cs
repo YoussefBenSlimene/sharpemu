@@ -5228,6 +5228,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 
 		var trackedMemory = new TrackedCpuMemory(virtualMemory);
+
+		// Fresh host pages are recycled and contain stale bytes. The real
+		// kernel zero-fills new thread stacks and TLS. Without this, guest
+		// code reads garbage (cached pthread self, queue cursors like
+		// 0x41E4E00000002D4C) and crashes — Hellboy Loading.PreloadManager.
+		ZeroFreshGuestRegion(trackedMemory, stackBase, GuestThreadStackSize);
+		ZeroFreshGuestRegion(trackedMemory, tlsBase - GuestThreadTlsPrefixSize, GuestThreadTlsPrefixSize + GuestThreadTlsSize);
+
 		var context = new CpuContext(trackedMemory, creatorContext.TargetGeneration)
 		{
 			Rip = request.EntryPoint,
@@ -5280,6 +5288,22 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		virtualMemory = null!;
 		return false;
+	}
+
+	private static readonly byte[] _zeroPage = new byte[0x10000];
+
+	private static void ZeroFreshGuestRegion(TrackedCpuMemory memory, ulong address, ulong size)
+	{
+		for (ulong offset = 0; offset < size;)
+		{
+			var chunk = (int)Math.Min((ulong)_zeroPage.Length, size - offset);
+			if (!memory.TryWrite(address + offset, _zeroPage.AsSpan(0, chunk)))
+			{
+				return;
+			}
+
+			offset += (ulong)chunk;
+		}
 	}
 
 	private static bool TryMapGuestThreadRegion(
