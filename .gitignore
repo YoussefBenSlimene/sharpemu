@@ -45,3 +45,19 @@ ehthumbs.db
 .vscode/
 clean_test/
 .debug/
+
+# Debug run logs and one-off diagnostics (never commit)
+*.log
+*.out.log
+*.err.log
+mortal_shell_*.txt
+hellboy_*.txt
+ms_*.txt
+vk_*.txt
+sharpemu_run_log_*.txt
+run_log*.txt
+boot_timing_test.txt
+*.pid
+ms_shaders/
+dump*.bin
+!scripts/*.txt
