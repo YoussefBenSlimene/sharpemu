@@ -85,6 +85,22 @@ internal static class GpuWaitRegistry
     }
 
     /// <summary>
+    /// True when any producer — a parsed packet write or a CPU-observed store —
+    /// has ever targeted this label. A waiter on a never-produced label can only
+    /// be a completion fence the CP firmware raises; the serial parser cannot
+    /// satisfy it on its own.
+    /// </summary>
+    public static bool HasEverProduced(object memory, ulong address)
+    {
+        memory = Canonicalize(memory)!;
+        lock (_gate)
+        {
+            return _lastProduced.ContainsKey((memory, address)) ||
+                   _labelFrameIds.ContainsKey((memory, address));
+        }
+    }
+
+    /// <summary>
     /// Returns true if the label at (memory, address) was written in the
     /// current frame, or has never been written (uninitialized).
     /// Only labels written in a PREVIOUS frame are considered stale.
@@ -638,16 +654,39 @@ internal static class GpuWaitRegistry
                 {
                     var waiter = list[i];
                     if (!ReferenceEquals(waiter.Memory, memory) ||
-                        nowTicks - waiter.RegisteredTicks < minAgeTicks ||
-                        !_lastProduced.TryGetValue((memory, address), out var produced) ||
-                        !Compare(waiter, produced))
+                        nowTicks - waiter.RegisteredTicks < minAgeTicks)
                     {
                         continue;
                     }
 
-                    broken ??= new List<WaitingDcb>();
-                    broken.Add(waiter);
-                    list.RemoveAt(i);
+                    if (_lastProduced.TryGetValue((memory, address), out var produced) &&
+                        Compare(waiter, produced))
+                    {
+                        broken ??= new List<WaitingDcb>();
+                        broken.Add(waiter);
+                        list.RemoveAt(i);
+                        continue;
+                    }
+
+                    // No producer for this label was ever observed in the parsed
+                    // command stream (UE fence labels released by hardware on
+                    // async-completion fall in this class). The serial parser
+                    // cannot ever satisfy such a wait, so after the deadline
+                    // release it by replaying its own expected reference into
+                    // guest memory — the value the CP would have written.
+                    if (!_lastProduced.ContainsKey((memory, address)) &&
+                        _producerlessBreakEnabled &&
+                        waiter.CompareFunction is 3 or 5 or 6 &&
+                        (waiter.ReferenceValue & waiter.Mask) != 0)
+                    {
+                        var replay = waiter.ReferenceValue & waiter.Mask;
+                        if (TryWriteLabel(memory, waiter, replay))
+                        {
+                            broken ??= new List<WaitingDcb>();
+                            broken.Add(waiter);
+                            list.RemoveAt(i);
+                        }
+                    }
                 }
 
                 if (list.Count == 0)
@@ -667,6 +706,34 @@ internal static class GpuWaitRegistry
         }
 
         return broken;
+    }
+
+    // Releases waiters whose labels never had an in-stream producer once the
+    // deadlock deadline passes. Only the emulator's own parsing gap can create
+    // those; a real producer path is never pre-empted. Disable with
+    // SHARPEMU_GPU_PRODUCERLESS_BREAK=0.
+    private static readonly bool _producerlessBreakEnabled =
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_GPU_PRODUCERLESS_BREAK"),
+            "0",
+            StringComparison.Ordinal);
+
+    private static bool TryWriteLabel(object memory, in WaitingDcb waiter, ulong value)
+    {
+        try
+        {
+            if (memory is not SharpEmu.HLE.ICpuMemory cpuMemory)
+            {
+                return false;
+            }
+
+            Span<byte> bytes = BitConverter.GetBytes(waiter.Is64Bit ? value : (uint)value);
+            return cpuMemory.TryWrite(waiter.WaitAddress, bytes);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     // Under orphan force-submit, producers can run ahead of waiter

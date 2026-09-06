@@ -50,7 +50,13 @@ public static partial class KernelMemoryCompatExports
     private const int SeekSet = 0;
     private const int SeekCur = 1;
     private const int SeekEnd = 2;
-    private const ulong DirectMemorySizeBytes = 16384UL * 1024 * 1024;
+    // PS5 reports ~13.5 GiB of physical memory (13824 MiB total, Kyty parity),
+    // of which direct memory is TotalSize minus the flexible-memory carve-out.
+    // Reporting 16 GiB made UE titles reserve the entire pool in one
+    // sceKernelAllocateMainDirectMemory call and then fail every follow-up
+    // allocation (Mortal Shell black screen: RHI buffers never mapped).
+    private const ulong DirectMemoryTotalBytes = 13824UL * 1024 * 1024;
+    private const ulong DirectMemorySizeBytes = DirectMemoryTotalBytes - FlexibleMemorySizeBytes;
     private const ulong UnsetMainDirectMemoryPoolBase = ulong.MaxValue;
     private const ulong FlexibleMemorySizeBytes = 448UL * 1024 * 1024;
     private const int OrbisVirtualQueryInfoSize = 72;
@@ -3084,6 +3090,16 @@ public static partial class KernelMemoryCompatExports
                 }
                 else
                 {
+                    if (ShouldTraceDirectMemory())
+                    {
+                        var dump = string.Join(
+                            ", ",
+                            _directAllocations.Values
+                                .OrderBy(a => a.Start)
+                                .Select(a => $"[0x{a.Start:X16}+0x{a.Length:X16}]"));
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] main_direct TRY_AGAIN len=0x{length:X16} pool_base=0x{_mainDirectMemoryPoolBase:X16} limit=0x{allocationLimit:X16} allocations={dump}");
+                    }
                     TraceDirectMemoryCall(
                         ctx,
                         "allocate_main_direct",
@@ -6746,6 +6762,14 @@ public static partial class KernelMemoryCompatExports
 
         if (!TryAddU64(candidate, length, out var endAddress) || endAddress > effectiveEnd)
         {
+            if (ShouldTraceDirectMemory())
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] direct_range_reject len=0x{length:X16} align=0x{alignment:X16} " +
+                    $"search=[0x{searchStart:X16}..0x{searchEnd:X16}) limit=0x{allocationLimit:X16} " +
+                    $"effectiveEnd=0x{effectiveEnd:X16} candidate=0x{candidate:X16} " +
+                    $"endAddress=0x{endAddress:X16}");
+            }
             return false;
         }
 

@@ -6749,12 +6749,14 @@ public static partial class AgcExports
     // release it using the last value a real producer wrote to its label. Long
     // enough that legitimate GPU work (which completes within a frame) never
     // trips it; short enough that a wedged cross-queue cycle unblocks quickly.
+    // The serial parser parks cross-queue fences here on every UE async-compute
+    // submission, so a long deadline directly throttles the frame rate.
     private static readonly long _gpuDeadlockBreakTicks =
         (long.TryParse(
              Environment.GetEnvironmentVariable("SHARPEMU_GPU_DEADLOCK_BREAK_MS"),
              out var deadlockMs) && deadlockMs > 0
             ? deadlockMs
-            : 500L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
+            : 30L) * System.Diagnostics.Stopwatch.Frequency / 1000L;
 
     // Reads the WAIT_REG_MEM watched address, reference, mask, and 3-bit compare
     // function for both the AGC NOP-encapsulated (RWaitMem32/64) and the standard
@@ -7414,6 +7416,10 @@ public static partial class AgcExports
         {
             TryWriteUInt32(ctx, address, unchecked((uint)newValue));
         }
+
+        // Record the satisfied value as produced: follow-up waits on the same
+        // label in this frame must see the fence as signalled.
+        GpuWaitRegistry.RecordProduced(ctx.Memory, address, newValue);
     }
 
     // WAIT_REG_MEM packets whose condition is not met suspend their DCB into
