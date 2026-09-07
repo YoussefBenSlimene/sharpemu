@@ -1,6 +1,15 @@
-﻿
-Build succeeded.
-    0 Warning(s)
-    0 Error(s)
+﻿C:\ps5-emulator\sharpemu\src\SharpEmu.Core\Cpu\Native\DirectExecutionBackend.Exceptions.cs(1261,35): warning CS1570: XML comment has badly formed XML -- 'Missing equals sign between attribute and attribute value.' [C:\ps5-emulator\sharpemu\src\SharpEmu.Core\SharpEmu.Core.csproj]
+C:\ps5-emulator\sharpemu\src\SharpEmu.Core\Cpu\Native\DirectExecutionBackend.Exceptions.cs(1267,8): warning CS1570: XML comment has badly formed XML -- 'End tag 'summary' does not match the start tag 'next'.' [C:\ps5-emulator\sharpemu\src\SharpEmu.Core\SharpEmu.Core.csproj]
+C:\ps5-emulator\sharpemu\src\SharpEmu.Core\Cpu\Native\DirectExecutionBackend.Exceptions.cs(1268,1): warning CS1570: XML comment has badly formed XML -- 'Expected an end tag for element 'summary'.' [C:\ps5-emulator\sharpemu\src\SharpEmu.Core\SharpEmu.Core.csproj]
+C:\ps5-emulator\sharpemu\src\SharpEmu.Core\Cpu\Native\DirectExecutionBackend.Exceptions.cs(1231,30): error CS1503: Argument 2: cannot convert from 'ulong' to 'int' [C:\ps5-emulator\sharpemu\src\SharpEmu.Core\SharpEmu.Core.csproj]
 
-Time Elapsed 00:00:02.42
+Build FAILED.
+
+C:\ps5-emulator\sharpemu\src\SharpEmu.Core\Cpu\Native\DirectExecutionBackend.Exceptions.cs(1261,35): warning CS1570: XML comment has badly formed XML -- 'Missing equals sign between attribute and attribute value.' [C:\ps5-emulator\sharpemu\src\SharpEmu.Core\SharpEmu.Core.csproj]
+C:\ps5-emulator\sharpemu\src\SharpEmu.Core\Cpu\Native\DirectExecutionBackend.Exceptions.cs(1267,8): warning CS1570: XML comment has badly formed XML -- 'End tag 'summary' does not match the start tag 'next'.' [C:\ps5-emulator\sharpemu\src\SharpEmu.Core\SharpEmu.Core.csproj]
+C:\ps5-emulator\sharpemu\src\SharpEmu.Core\Cpu\Native\DirectExecutionBackend.Exceptions.cs(1268,1): warning CS1570: XML comment has badly formed XML -- 'Expected an end tag for element 'summary'.' [C:\ps5-emulator\sharpemu\src\SharpEmu.Core\SharpEmu.Core.csproj]
+C:\ps5-emulator\sharpemu\src\SharpEmu.Core\Cpu\Native\DirectExecutionBackend.Exceptions.cs(1231,30): error CS1503: Argument 2: cannot convert from 'ulong' to 'int' [C:\ps5-emulator\sharpemu\src\SharpEmu.Core\SharpEmu.Core.csproj]
+    3 Warning(s)
+    1 Error(s)
+
+Time Elapsed 00:00:13.14

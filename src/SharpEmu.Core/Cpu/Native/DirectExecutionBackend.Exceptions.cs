@@ -173,6 +173,11 @@ public sealed partial class DirectExecutionBackend
 		{
 			return -1;
 		}
+		if (exceptionCode == 3221225477u &&
+			TryRecoverUnpatchedTlsLoad(exceptionRecord, contextRecord, rip))
+		{
+			return -1;
+		}
 			if (exceptionCode == StatusIllegalInstruction &&
 				TryRecoverIllegalInstruction(contextRecord, rip))
 			{
@@ -1173,6 +1178,72 @@ public sealed partial class DirectExecutionBackend
 
 		return recovery <= 1_000_000;
 	}
+
+	/// <summary>
+	/// Finishes a guest <c>mov reg, fs:[0]</c> that reached the CPU unrewritten
+	/// (PR #791): the destination register receives the calling thread's guest
+	/// TLS base — the same result the load-time rewrite produces. Backstop for
+	/// code outside the patcher's scan range.
+	/// </summary>
+	private unsafe bool TryRecoverUnpatchedTlsLoad(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_TLS_LOAD_FAULT_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			_guestTlsBaseTlsIndex == uint.MaxValue)
+		{
+			return false;
+		}
+
+		Span<byte> code = stackalloc byte[SharpEmu.Core.Cpu.Emulation.TlsThreadPointerLoad.MaxLength];
+		if (!TryReadHostBytes(rip, code.ToArray()))
+		{
+			return false;
+		}
+
+		// The host FS base is zero, so an unrewritten fs:[0] reads linear
+		// address 0; anything else is a different fault.
+		if (exceptionRecord->ExceptionInformation[0] != 0 ||
+			exceptionRecord->ExceptionInformation[1] != 0)
+		{
+			return false;
+		}
+
+		if (!SharpEmu.Core.Cpu.Emulation.TlsThreadPointerLoad.TryDecode(
+				code,
+				out var destinationRegister,
+				out var length))
+		{
+			return false;
+		}
+
+		var tlsBase = (ulong)TlsGetValue(_guestTlsBaseTlsIndex);
+		if (tlsBase == 0)
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, 120 + (8 * destinationRegister), tlsBase);
+		WriteCtxU64(contextRecord, 248, rip + (ulong)length);
+		var recovery = Interlocked.Increment(ref _unpatchedTlsLoadRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Unpatched TLS thread-pointer load recovery #{recovery}: " +
+				$"rip=0x{rip:X16} reg={destinationRegister} tls=0x{tlsBase:X16} " +
+				"resume=0x" + $"{rip + (ulong)length:X16} (load-time patcher did not cover this address)");
+			Console.Error.Flush();
+		}
+
+		return recovery <= 1_000_000;
+	}
+
+	private static int _unpatchedTlsLoadRecoveries;
 
 	private static long _guestProducerCursorRecoveries;
 	private static long _guestGarbageReadRecoveries;
