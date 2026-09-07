@@ -1,3 +1,58 @@
+# Mortal Shell / Hellboy / Quake II session addendum — 2026-09-07
+
+## Fixed and verified (commit c25f851)
+
+1. **Fast boot (all titles)** — window opens at ~1s: HLE JIT warm sweep runs
+   on a background task; guest execution gates on `IModuleManager.WaitForWarmup()`;
+   host window opened eagerly via `HostVideoHost.EnsureWindowStarted`.
+
+2. **Hellboy crash — fixed** — ScePthread chain fields fail-safe, allocator
+   unwraps memory wrappers, VEH stats-chain + garbage-read recoveries.
+   Verified 277M+ imports with zero native exceptions.
+
+3. **Mortal Shell audio — working** — all 59 guest threads now get real
+   guest-memory pthread handles (allocator unwrap fix); AudioOut2 streams at
+   ~180 submits/s, 96% fill.
+
+4. **Quake II — boots, renders, reaches menu** — the fatal was
+   `sceKernelOpen` leaking the raw `0x8002xxxx` sentinel as an fd: the game
+   closed `fd=0x80020002` repeatedly and aborted. All raw `sceKernel*` file
+   syscalls (Open/Close/Stat/Fstat/Read/Write/Lseek) now return **-1 +
+   errno** on failure, matching real PS5 hardware. Plus NP async-request
+   manager (CreateAsyncRequest/CheckNpReachability/PollAsync — requests
+   complete as *reachable*; the signed-out result 0x80550006 was treated as
+   fatal by the game's social manager) and
+   sceNpWebApi2PushEventDeletePushContext stub. Verified: full init, audio
+   (AudioOut port 1, 48kHz 8ch), shader loading, "Installation" menu reached
+   with frames submitted.
+
+## Remaining (diagnosed, next steps)
+
+- **Quake II empty-message abort**: after the "Installation" screen, during
+  first-map/sound load, the game calls `Com_Error` with an **empty message**
+  (its own stderr.txt shows `Error - ` + border + nothing). The game
+  reliably reaches "Running game session" → "Starting Game" → pakfile →
+  mapdb (232 maps) → "Installation", plays WAV precache from pak0.pak, then
+  aborts. No AV, no failed import in between — a game-level Com_Error("") —
+  next step: trace the Com_Error call site (the guest abort NID is
+  L1SBTkC+Cvw at ret 0x8004B789A) and check what KEX passes; note the loose
+  asset directories (`/app0/baseq2/players`, `sound/player/steps`) do not
+  exist in this dump (assets are inside pak0.pak + Q2Game.kpf) — on real
+  hardware those O_DIRECTORY probes may succeed and seed state that avoids
+  the empty-error path.
+- **Mortal Shell black screen**: frames flow (11208 presents, all
+  `hasPixels=False`), composite draws render into the display buffers but
+  sample 1x1 placeholder descriptors (now logged via
+  `agc.texture_1x1_linear_binding`); Kyty decodes the identical bytes, so
+  the divergence is in guest-side streaming state, not the decoder.
+- **Hellboy stall**: PreloadManager spins in the libScePosix pthread-self
+  cache refresh (`0Z2sdqi9LGg+0x2256E`, 265M+ scePthreadSelf calls) while
+  all JobWorkers wait on event_flag 0x4 — the game's own thread-list/TLS
+  cache never validates. Spin-loop code-window + register dumps are in
+  place (SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS=1).
+
+
+
 # Mortal Shell session addendum — 2026-09-06 (thread handles + audio fixed)
 
 ## What changed this session
