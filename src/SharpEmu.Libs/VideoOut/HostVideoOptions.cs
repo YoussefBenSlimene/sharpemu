@@ -87,6 +87,9 @@ public static class HostVideoHost
         }
 
         VulkanVideoPresenter.EnsureStarted((uint)width, (uint)height);
-        MetalVideoPresenter.EnsureStarted((uint)width, (uint)height);
+        if (OperatingSystem.IsMacOS())
+        {
+            MetalVideoPresenter.EnsureStarted((uint)width, (uint)height);
+        }
     }
 }

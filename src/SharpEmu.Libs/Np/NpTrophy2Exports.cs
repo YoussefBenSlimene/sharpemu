@@ -80,32 +80,111 @@ public static class NpTrophy2Exports
         LibraryName = "libSceNpTrophy2")]
     public static int NpTrophy2ShowTrophyList(CpuContext ctx) => ReturnOk(ctx);
 
+    // KytyPS5 libNet.cpp LibNpTrophy2 layout (static_asserted there).
+    private const int TrophyDetailsSize = 1312;
+    private const int TrophyDataSize = 32;
+    private const int TrophyGradeBronze = 4;
+    private const int TrophyNameOffset = 32;
+    private const int TrophyNameSize = 128;
+    private const int TrophyDescriptionOffset = 160;
+    private const int TrophyDescriptionSize = 1024;
+
     /// <summary>
     /// Gen5 ABI: context, handle, trophy id, then SceNpTrophy2Details and
-    /// SceNpTrophy2Data output pointers.
+    /// SceNpTrophy2Data output pointers. Fills dummy bronze trophies the way
+    /// KytyPS5 does — Quake II treats NOT_FOUND here as a fatal Installation
+    /// error after "Quake2 Initialized".
     /// </summary>
-    /// <remarks>
-    /// Reports "no such trophy" rather than succeeding. Succeeding would require
-    /// filling both output structures, and their exact layouts are not confirmed
-    /// here — a title that trusted zeroed details would read an empty name and a
-    /// grade of zero as real data. NOT_FOUND is a documented outcome that callers
-    /// must already handle, so it degrades along a path the game tests.
-    /// </remarks>
     [SysAbiExport(
         Nid = "EwNylPdWUTM",
         ExportName = "sceNpTrophy2GetTrophyInfo",
         Target = Generation.Gen5,
         LibraryName = "libSceNpTrophy2")]
-    public static int NpTrophy2GetTrophyInfo(CpuContext ctx) =>
-        SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
+    public static int NpTrophy2GetTrophyInfo(CpuContext ctx)
+    {
+        var trophyId = unchecked((int)ctx[CpuRegister.Rdx]);
+        var detailsAddress = ctx[CpuRegister.Rcx];
+        var dataAddress = ctx[CpuRegister.R8];
+        if (!TryWriteTrophyDetails(ctx, detailsAddress, trophyId) ||
+            !TryWriteTrophyData(ctx, dataAddress, trophyId))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ReturnOk(ctx);
+    }
 
     [SysAbiExport(
         Nid = "y3zHpdZO6ME",
         ExportName = "sceNpTrophy2GetTrophyInfoArray",
         Target = Generation.Gen5,
         LibraryName = "libSceNpTrophy2")]
-    public static int NpTrophy2GetTrophyInfoArray(CpuContext ctx) =>
-        SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
+    public static int NpTrophy2GetTrophyInfoArray(CpuContext ctx)
+    {
+        var offset = unchecked((uint)ctx[CpuRegister.Rdx]);
+        var limit = unchecked((uint)ctx[CpuRegister.Rcx]);
+        var detailsAddress = ctx[CpuRegister.R8];
+        var dataAddress = ctx[CpuRegister.R9];
+        _ = ctx.TryReadUInt64(ctx[CpuRegister.Rsp] + sizeof(ulong), out var countAddress);
+
+        var outCount = offset == 0 && limit != 0 ? 1u : 0u;
+        if (countAddress != 0)
+        {
+            Span<byte> countBytes = stackalloc byte[sizeof(uint)];
+            BinaryPrimitives.WriteUInt32LittleEndian(countBytes, outCount);
+            if (!ctx.Memory.TryWrite(countAddress, countBytes))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        if (outCount != 0 &&
+            (!TryWriteTrophyDetails(ctx, detailsAddress, trophyId: 0) ||
+             !TryWriteTrophyData(ctx, dataAddress, trophyId: 0)))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ReturnOk(ctx);
+    }
+
+    private static bool TryWriteTrophyDetails(CpuContext ctx, ulong address, int trophyId)
+    {
+        if (address == 0)
+        {
+            return true;
+        }
+
+        Span<byte> details = stackalloc byte[TrophyDetailsSize];
+        details.Clear();
+        BinaryPrimitives.WriteInt32LittleEndian(details, trophyId);
+        BinaryPrimitives.WriteInt32LittleEndian(details.Slice(4, sizeof(int)), TrophyGradeBronze);
+        WriteAscii(details.Slice(TrophyNameOffset, TrophyNameSize), "Trophy");
+        WriteAscii(details.Slice(TrophyDescriptionOffset, TrophyDescriptionSize), "Trophy");
+        return ctx.Memory.TryWrite(address, details);
+    }
+
+    private static bool TryWriteTrophyData(CpuContext ctx, ulong address, int trophyId)
+    {
+        if (address == 0)
+        {
+            return true;
+        }
+
+        Span<byte> data = stackalloc byte[TrophyDataSize];
+        data.Clear();
+        BinaryPrimitives.WriteInt32LittleEndian(data, trophyId);
+        return ctx.Memory.TryWrite(address, data);
+    }
+
+    private static void WriteAscii(Span<byte> destination, string value)
+    {
+        var length = Math.Min(value.Length, destination.Length - 1);
+        for (var i = 0; i < length; i++)
+        {
+            destination[i] = (byte)value[i];
+        }
+    }
 
 
     private static int WriteIdAndReturn(CpuContext ctx, ulong outAddress, ref int nextId)

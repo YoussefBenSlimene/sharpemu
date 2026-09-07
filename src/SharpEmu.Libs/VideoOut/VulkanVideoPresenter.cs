@@ -6026,38 +6026,16 @@ internal static unsafe class VulkanVideoPresenter
             Agc.AgcExports.MarkAllSurfacesCleared();
             FlushBatchedGuestCommands();
 
-            // On-demand creation: if the display buffer is known (registered via
-            // VideoOut) but not yet in _guestImages, create it now. This handles
-            // double-buffered display targets where only one buffer receives AGC
-            // render target setup (Mortal Shell: 0x8FC0000000 missing).
-            if (!_guestImages.TryGetValue(work.Address, out var source))
+            // Prefer a painted image at this guest address. A size/format rebind
+            // (Mortal Shell: 1600x900 RT descriptor vs a 3840x2160 flip) parks the
+            // rendered Vulkan image in _guestImageVariants and either leaves
+            // _guestImages empty or holding a fresh, never-drawn replacement.
+            // Requiring the variant to cover the flip extent rejected the painted
+            // surface and created a blank on-demand buffer (permanent black screen).
+            _guestImages.TryGetValue(work.Address, out var source);
+            if (source is null || !source.Initialized)
             {
-                // Variant fallback first: the composite draws DO render into the
-                // display-buffer addresses, but a size/format rebind (e.g. the
-                // game's 1600x900 RT descriptor vs the 3840x2160 flip descriptor)
-                // parks the rendered Vulkan image in _guestImageVariants and
-                // leaves _guestImages without an entry at this address. Creating
-                // a fresh blank image here used to present a black frame even
-                // though the previous submission painted the same guest address.
-                // Re-activating the most recent variant preserves that content.
-                GuestImageResource? variant = null;
-                lock (_gate)
-                {
-                    foreach (var candidate in _guestImageVariants.Values)
-                    {
-                        if (candidate.Address == work.Address &&
-                            candidate.LogicalWidth >= work.Width &&
-                            candidate.LogicalHeight >= work.Height &&
-                            candidate.Initialized &&
-                            (variant is null ||
-                             candidate.LogicalWidth * (long)candidate.LogicalHeight <
-                             variant.LogicalWidth * (long)variant.LogicalHeight))
-                        {
-                            variant = candidate;
-                        }
-                    }
-                }
-
+                var variant = TryPromoteFlipVariant(work.Address, work.Width, work.Height);
                 if (variant is not null)
                 {
                     _guestImages[work.Address] = variant;
@@ -6065,10 +6043,12 @@ internal static unsafe class VulkanVideoPresenter
                     Console.Error.WriteLine(
                         $"[LOADER][TRACE] vk.flip_variant_promoted addr=0x{work.Address:X16} " +
                         $"{variant.LogicalWidth}x{variant.LogicalHeight} fmt={variant.Format} " +
-                        $"(flip wants {work.Width}x{work.Height})");
+                        $"initialized={variant.Initialized} (flip wants {work.Width}x{work.Height})");
                 }
-                else
-                {
+            }
+
+            if (source is null)
+            {
                 lock (_gate)
                 {
                     if (_availableGuestImages.TryGetValue(work.Address, out var guestFormat))
@@ -6102,7 +6082,6 @@ internal static unsafe class VulkanVideoPresenter
                             $"[LOADER][WARN] vk.flip_not_available addr=0x{work.Address:X16} " +
                             $"not in _availableGuestImages");
                     }
-                }
                 }
             }
 
@@ -6284,6 +6263,34 @@ internal static unsafe class VulkanVideoPresenter
                     DestroyGuestImage(snapshot);
                 }
             }
+        }
+
+        private GuestImageResource? TryPromoteFlipVariant(ulong address, uint flipWidth, uint flipHeight)
+        {
+            GuestImageResource? best = null;
+            long bestScore = long.MinValue;
+            var flipPixels = (long)flipWidth * flipHeight;
+            lock (_gate)
+            {
+                foreach (var candidate in _guestImageVariants.Values)
+                {
+                    if (candidate.Address != address)
+                    {
+                        continue;
+                    }
+
+                    var pixels = (long)candidate.LogicalWidth * candidate.LogicalHeight;
+                    var score = candidate.Initialized ? 1_000_000_000_000L : 0L;
+                    score -= Math.Abs(pixels - flipPixels);
+                    if (score > bestScore)
+                    {
+                        best = candidate;
+                        bestScore = score;
+                    }
+                }
+            }
+
+            return best is { Initialized: true } ? best : null;
         }
 
         private void ExecuteOrderedGuestFlipWait(VulkanOrderedGuestFlipWait work)

@@ -89,7 +89,7 @@ internal static partial class MetalVideoPresenter
 
     public static void EnsureStarted(uint width, uint height)
     {
-        if (width == 0 || height == 0)
+        if (!OperatingSystem.IsMacOS() || width == 0 || height == 0)
         {
             return;
         }

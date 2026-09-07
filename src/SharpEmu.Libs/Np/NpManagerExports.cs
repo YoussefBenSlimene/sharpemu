@@ -100,10 +100,13 @@ public static class NpManagerExports
 
             if (request.State == 0)
             {
-                // Complete the async request as signed out; the caller polls
-                // via sceNpPollAsync for the result.
+                // Complete the async request as reachable (result = OK). The
+                // signed-out error (0x80550006) is treated as fatal by Quake
+                // II's social manager, while "reachable" lets it proceed into
+                // offline mode; the individual WebApi calls then fail with
+                // 0x80553502, which the game logs and tolerates.
                 request.State = 1;
-                request.Result = NpErrorSignedOut;
+                request.Result = 0;
             }
         }
 
