@@ -168,6 +168,11 @@ public sealed partial class DirectExecutionBackend
 		{
 			return -1;
 		}
+		if (exceptionCode == 3221225477u &&
+			TryRecoverGuestGarbageReadFault(exceptionRecord, contextRecord, rip))
+		{
+			return -1;
+		}
 			if (exceptionCode == StatusIllegalInstruction &&
 				TryRecoverIllegalInstruction(contextRecord, rip))
 			{
@@ -921,6 +926,54 @@ public sealed partial class DirectExecutionBackend
 			}
 		}
 
+		// Hellboy: the libScePosix thread-stats walk
+		//   49 8B 06       mov rax,[r14]
+		//   48 8B 40 38    mov rax,[rax+0x38]
+		//   48 8B 40 10    mov rax,[rax+0x10]
+		//   48 8B 04 C8    mov rax,[rax+rcx*8]
+		// faults at [rax+0x38] (observed: read AV at target 0x38 with rax=0)
+		// when the first loaded pointer is NULL — an unpopulated guest thread
+		// object whose stats-block pointer the real kernel would have filled.
+		// Substitute a self-referential zeroed guest block for the NULL
+		// pointer and re-execute the load, so the chain stays in defined
+		// memory and the walk terminates normally.
+		if (rip >= 0x10000 &&
+			!string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_STATS_CHAIN_RECOVERY"),
+				"1",
+				StringComparison.Ordinal))
+		{
+			var chain = (byte*)rip;
+			var displacement = (chain[0] == 0x48 && chain[1] == 0x8B && chain[2] == 0x40)
+				? (ulong)chain[3]
+				: 0UL;
+			if (displacement is 0x38 or 0x10 &&
+				exceptionRecord->NumberParameters >= 2 &&
+				exceptionRecord->ExceptionInformation[0] == 0 &&
+				exceptionRecord->ExceptionInformation[1] == displacement)
+			{
+				var loadedPointer = ReadCtxU64(contextRecord, 120); // RAX
+				if (loadedPointer == 0)
+				{
+					var block = SharpEmu.Libs.Kernel.GuestAllocationBridge.RequestSelfReferential?.Invoke(0x100) ?? 0;
+					if (block != 0)
+					{
+						WriteCtxU64(contextRecord, 120, block);
+						var count = Interlocked.Increment(ref _guestStatsChainRecoveries);
+						if (count <= 16 || (count & (count - 1)) == 0)
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][WARN] Guest stats-chain recovery #{count}: " +
+								$"rip=0x{rip:X16} rax=0 -> 0x{block:X16} (re-executing)");
+							Console.Error.Flush();
+						}
+
+						return count <= 100_000;
+					}
+				}
+			}
+		}
+
 		if (string.Equals(
 				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_PRODUCER_CURSOR_RECOVERY"),
 				"1",
@@ -998,11 +1051,135 @@ public sealed partial class DirectExecutionBackend
 		return true;
 	}
 
+	/// <summary>
+	/// Last-resort recovery for guest reads through garbage pointers on guest
+	/// threads (Hellboy libScePosix walks over kernel structures SharpEmu does
+	/// not model: the fault target is unmapped in the guest address space).
+	/// The instruction is skipped and its GPR destination zeroed so the process
+	/// survives and keeps producing diagnostics instead of dying silently in
+	/// the middle of the AV dump. Capped; disable with
+	/// SHARPEMU_DISABLE_GARBAGE_READ_RECOVERY=1.
+	/// </summary>
+	private unsafe static bool TryRecoverGuestGarbageReadFault(
+		EXCEPTION_RECORD* exceptionRecord,
+		void* contextRecord,
+		ulong rip)
+	{
+		if (string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GARBAGE_READ_RECOVERY"),
+				"1",
+				StringComparison.Ordinal) ||
+			exceptionRecord->NumberParameters < 2 ||
+			exceptionRecord->ExceptionInformation[0] != 0 || // reads only
+			rip < 0x10000)
+		{
+			return false;
+		}
+
+		// Only guest-thread executors recover here; host threads keep the old
+		// dump-and-die behaviour so genuine emulator bugs stay visible.
+		var activeThread = _activeGuestThreadState;
+		if (activeThread is null || activeThread.Context is null)
+		{
+			return false;
+		}
+
+		var faultTarget = exceptionRecord->ExceptionInformation[1];
+		Span<byte> probe = stackalloc byte[1];
+		if (activeThread.Context.Memory.TryRead(faultTarget, probe))
+		{
+			// The guest can map this address — a real guest fault, not garbage.
+			return false;
+		}
+
+		byte[] code = new byte[15];
+		if (!TryReadHostBytes(rip, code))
+		{
+			return false;
+		}
+
+		var decoder = Iced.Intel.Decoder.Create(64, code);
+		decoder.IP = rip;
+		var instruction = decoder.Decode();
+		if (instruction.MemoryBase == Iced.Intel.Register.None &&
+			instruction.MemoryIndex == Iced.Intel.Register.None)
+		{
+			return false;
+		}
+
+		// The computed effective address (from the CONTEXT registers, never the
+		// stale target field alone) must be the faulting address, mirroring
+		// TryRecoverGuestBadStoreFault's misclassification guard.
+		var effective = instruction.MemoryDisplacement64;
+		if (instruction.MemoryBase != Iced.Intel.Register.None)
+		{
+			effective += ReadCtxReg(contextRecord, instruction.MemoryBase);
+		}
+		if (instruction.MemoryIndex != Iced.Intel.Register.None)
+		{
+			effective += ReadCtxReg(contextRecord, instruction.MemoryIndex) * (ulong)instruction.MemoryIndexScale;
+		}
+
+		if (effective != faultTarget)
+		{
+			return false;
+		}
+
+		// Simple GPR loads only: skip and zero the destination register.
+		var destination = instruction.Op0Register;
+		if (destination is < Iced.Intel.Register.RAX or > Iced.Intel.Register.R15 ||
+			destination == Iced.Intel.Register.RSP)
+		{
+			return false;
+		}
+
+		var destinationOffset = destination switch
+		{
+			Iced.Intel.Register.RAX => 120,
+			Iced.Intel.Register.RCX => 128,
+			Iced.Intel.Register.RDX => 136,
+			Iced.Intel.Register.RBX => 144,
+			Iced.Intel.Register.RBP => 160,
+			Iced.Intel.Register.RSI => 168,
+			Iced.Intel.Register.RDI => 176,
+			Iced.Intel.Register.R8 => 184,
+			Iced.Intel.Register.R9 => 192,
+			Iced.Intel.Register.R10 => 200,
+			Iced.Intel.Register.R11 => 208,
+			Iced.Intel.Register.R12 => 216,
+			Iced.Intel.Register.R13 => 224,
+			Iced.Intel.Register.R14 => 232,
+			Iced.Intel.Register.R15 => 240,
+			_ => 0,
+		};
+		if (destinationOffset == 0)
+		{
+			return false;
+		}
+
+		WriteCtxU64(contextRecord, destinationOffset, 0);
+		WriteCtxU64(contextRecord, 248, rip + (ulong)instruction.Length);
+		var recovery = Interlocked.Increment(ref _guestGarbageReadRecoveries);
+		if (recovery <= 16 || (recovery & (recovery - 1)) == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Guest garbage-read recovery #{recovery}: " +
+				$"rip=0x{rip:X16} '{instruction}' target=0x{effective:X16} -> skip {instruction.Length} bytes, " +
+				$"{destination} = 0 (thread '{activeThread.Name}'; " +
+				"set SHARPEMU_DISABLE_GARBAGE_READ_RECOVERY=1 to disable)");
+			Console.Error.Flush();
+		}
+
+		return recovery <= 1_000_000;
+	}
+
 	private static long _guestProducerCursorRecoveries;
+	private static long _guestGarbageReadRecoveries;
 	private static long _guestSelfSubstitutions;
 	private static long _guestNullAllocationFixups;
 	private static long _guestNullChainRecoveries;
 	private static long _guestBadNamePointerRecoveries;
+	private static long _guestStatsChainRecoveries;
 
 	/// <summary>
 	/// Hellboy (PPSA11264): libScePosix's thread-name scan walks its node

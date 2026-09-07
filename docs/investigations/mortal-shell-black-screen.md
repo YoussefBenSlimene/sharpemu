@@ -1,3 +1,73 @@
+# Mortal Shell session addendum — 2026-09-06 (thread handles + audio fixed)
+
+## What changed this session
+
+### Root cause fixed: all 59 guest threads had host-heap pthread handles
+
+The `2026-09-05 10:54` run log shows **every** scheduled guest thread
+(`FAPREventQueueListener`, `TaskGraphThreadNP/HP 0-10`,
+`AudioMixerRenderThread`, `AudioThread`, ...) holding a **host-heap
+fallback handle** (`0x00000231_D66BF6E0`-style) instead of a guest-memory
+object (`0x0000_6000_xxxx_xxxx`). Guest code (Unity TaskGraph, Boehm
+stop-the-world, FMOD/Baselib, the audio mixer) dereferences those handles
+through the guest address space, aliasing arbitrary guest data — dead
+audio, stuck texture streaming, whatever the aliasing produced.
+
+Root cause: `EnsureGuestThreadObjectAllocator` matched
+`ctx.Memory is not IGuestMemoryAllocator` **without unwrapping**
+`ICpuMemoryWrapper` chains (TrackedCpuMemory wraps the real allocator).
+When `ctx.Memory` was a wrapper the install silently never happened, and
+`AllocateThreadHandle` fell back to `Marshal.AllocHGlobal` forever. The
+install now unwraps the wrapper chain (same pattern as
+`GpuWaitRegistry.Canonicalize`).
+
+**Verified (`mortal_shell_fix_20260906_113022.txt`):** all threads now get
+guest-memory handles (`0x000060000000EB40`, `0x0000600000015840`, ...).
+
+### Audio: WORKING after the handle fix
+
+With real handles the AudioOut2 mixer pipeline runs:
+`[PERF][AUDIO] stream#1 1.0s queued_ms min=0 avg=4 max=13 cap=683
+submits/s=180 fill=96% blocked=0% empty=19 drops=0` — 180 submits/s at
+96% buffer fill (previously: the `AudioMixerRenderThread` was scheduled
+and then nothing ever happened).
+
+### Fast boot (KytyPS5 parity)
+
+Window opens at **1.1s** (`[BOOT] window up at 1.1s after process start`)
+instead of after the whole HLE JIT warmup; `hle-warm` runs in parallel
+(1.7s) and guest execution waits for it in `SharpEmuRuntime.Run` via the
+new `IModuleManager.WaitForWarmup()`. See the Hellboy doc section
+"Session results — 2026-09-06 late" for the full change list.
+
+### Black screen: state after the fixes + new diagnostic
+
+- KytyPS5 descriptor-decode comparison (`shaderBindings.h`
+  `ShaderTextureResource`): base-address (word0/1<<8), format
+  (`word1>>20 & 0x1FF`), tile (`word3>>20 & 0x1F`), type (`word3>>28`),
+  dst-select (`word3 & 0xFFF`) layouts match SharpEmu's decoder exactly.
+  The 1x1 descriptors decode identically in both emulators — they are
+  guest state (Unity streaming placeholders), **not** a decoder bug.
+- New one-time-per-address diagnostic
+  `agc.texture_1x1_linear_binding addr=... pc=... tile=... fmt=...` logs
+  every draw that samples a 1x1 placeholder descriptor (5 distinct
+  addresses in the verification run, tile modes 1 and 27, formats 10/14).
+  Next step when the screen is still black: watch those descriptor
+  addresses for a later guest rewrite (the real upload should re-bind
+  them), and instrument `ExecuteOffscreenDrawCore` to dump the resolved
+  framebuffer image vs `_guestImages[addr]` (the variant split remains
+  the presentation-side suspect: `vk.flip_variant_promoted` never fired
+  in `ms_long`, so the promotion path is still unproven).
+- The repeated `scePthreadMutexLock → EDEADLK` lines match PS5/FreeBSD
+  semantics (DEFAULT == ERRORCHECK) and are tolerated by the game.
+
+Status: boots fast, runs at full speed (151M+ imports in 150s), audio
+streaming. Screen output still needs visual verification after the
+thread-handle fix; the placeholder-binding diagnostic is in place for
+the next iteration if the screen is still black.
+
+---
+
 # Mortal Shell session addendum — 2026-09-05 (flip-time variant promotion)
 
 ## New root-cause evidence (latest run `ms_long_20260905_105441`)

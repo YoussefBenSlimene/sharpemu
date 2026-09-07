@@ -1661,7 +1661,13 @@ public static partial class KernelMemoryCompatExports
         ExportName = "_close",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelCloseUnderscore(CpuContext ctx) => KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi]));
+    public static int KernelCloseUnderscore(CpuContext ctx)
+    {
+        var result = KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi]));
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : KernelSyscallFailure(ctx, result, Ebadf);
+    }
 
     [SysAbiExport(
         Nid = "bY-PO6JhzhQ",
@@ -1681,7 +1687,13 @@ public static partial class KernelMemoryCompatExports
         ExportName = "sceKernelClose",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelClose(CpuContext ctx) => KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi]));
+    public static int KernelClose(CpuContext ctx)
+    {
+        var result = KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi]));
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : KernelSyscallFailure(ctx, result, Ebadf);
+    }
 
     [SysAbiExport(
         Nid = "eV9wAD2riIA",
@@ -1689,6 +1701,14 @@ public static partial class KernelMemoryCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int KernelStat(CpuContext ctx)
+    {
+        var result = KernelStatCore(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : KernelSyscallFailure(ctx, result);
+    }
+
+    private static int KernelStatCore(CpuContext ctx)
     {
         var pathAddress = ctx[CpuRegister.Rdi];
         var statAddress = ctx[CpuRegister.Rsi];
@@ -1754,6 +1774,14 @@ public static partial class KernelMemoryCompatExports
         return -1;
     }
 
+    // Same -1/errno conversion as PosixFailure, for the raw sceKernel* file
+    // exports (sceKernelOpen/Close/Stat/Fstat/Read/Write/Lseek): real PS5
+    // hardware returns -1 with errno from these syscalls, never the raw
+    // 0x8002xxxx sentinel. Leaking the sentinel makes callers that check
+    // `fd == -1` store it as a valid handle (Quake II closed fd 0x80020002).
+    internal static int KernelSyscallFailure(CpuContext ctx, int orbisResult, int notFoundErrno = Enoent) =>
+        PosixFailure(ctx, orbisResult, notFoundErrno);
+
     [SysAbiExport(
         Nid = "E6ao34wPw+U",
         ExportName = "stat",
@@ -1761,7 +1789,7 @@ public static partial class KernelMemoryCompatExports
         LibraryName = "libc")]
     public static int PosixStat(CpuContext ctx)
     {
-        var result = KernelStat(ctx);
+        var result = KernelStatCore(ctx);
         return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
             ? 0
             : PosixFailure(ctx, result);
@@ -1781,7 +1809,7 @@ public static partial class KernelMemoryCompatExports
     // POSIX fstat(2): a bad fd maps to EBADF rather than the path-oriented ENOENT.
     public static int PosixFstat(CpuContext ctx)
     {
-        var result = KernelFstat(ctx);
+        var result = KernelFstatCore(ctx);
         return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
             ? 0
             : PosixFailure(ctx, result, notFoundErrno: Ebadf);
@@ -2076,6 +2104,14 @@ public static partial class KernelMemoryCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int KernelFstat(CpuContext ctx)
+    {
+        var result = KernelFstatCore(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : KernelSyscallFailure(ctx, result, Ebadf);
+    }
+
+    private static int KernelFstatCore(CpuContext ctx)
     {
         var fd = unchecked((int)ctx[CpuRegister.Rdi]);
         var statAddress = ctx[CpuRegister.Rsi];
@@ -2411,7 +2447,13 @@ public static partial class KernelMemoryCompatExports
         ExportName = "sceKernelRead",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelRead(CpuContext ctx) => KernelReadUnderscore(ctx);
+    public static int KernelRead(CpuContext ctx)
+    {
+        var result = KernelReadUnderscore(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : KernelSyscallFailure(ctx, result, Ebadf);
+    }
 
     [SysAbiExport(
         Nid = "Oy6IpwgtYOk",
@@ -2451,7 +2493,7 @@ public static partial class KernelMemoryCompatExports
 
         if (result != OrbisGen2Result.ORBIS_GEN2_OK)
         {
-            return (int)result;
+            return KernelSyscallFailure(ctx, (int)result, Ebadf);
         }
 
         ctx[CpuRegister.Rax] = unchecked((ulong)position);
@@ -2618,7 +2660,13 @@ public static partial class KernelMemoryCompatExports
         ExportName = "sceKernelWrite",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelWrite(CpuContext ctx) => KernelWriteUnderscore(ctx);
+    public static int KernelWrite(CpuContext ctx)
+    {
+        var result = KernelWriteUnderscore(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : KernelSyscallFailure(ctx, result, Ebadf);
+    }
 
     [SysAbiExport(
         Nid = "lLMT9vJAck0",

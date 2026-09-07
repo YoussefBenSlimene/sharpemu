@@ -640,6 +640,17 @@ public sealed class SelfLoader : ISelfLoader
             Console.WriteLine($"[LOADER] Processing {relocations.Count} relocations...");
         }
 
+        // Boot-phase timing: relocation resolution is one of the dominant
+        // startup costs for large titles (Mortal Shell: 635310 relocations on
+        // a 124 MB image); SHARPEMU_LOG_BOOT=1 attributes the time per image.
+        var bootTimingEnabled = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOT"),
+            "1",
+            StringComparison.Ordinal);
+        var relocationStart = bootTimingEnabled
+            ? System.Diagnostics.Stopwatch.GetTimestamp()
+            : 0L;
+
         uint maxSymbolIndex = 0;
         foreach (var relocation in relocations)
         {
@@ -831,6 +842,12 @@ public sealed class SelfLoader : ISelfLoader
                 Console.Error.WriteLine(
                     $"[LOADER][RELOC] target=0x{descriptor.TargetAddress:X16} value=0x{targetValue:X16} addend=0x{descriptor.Addend:X} nid={(descriptor.ImportNid ?? "<sym>")}");
             }
+        }
+
+        if (bootTimingEnabled && relocationStart != 0)
+        {
+            Console.Error.WriteLine(
+                $"[BOOT] relocation resolution for tlsModule={tlsModuleId}: {System.Diagnostics.Stopwatch.GetElapsedTime(relocationStart).TotalSeconds:F1}s");
         }
 
         return stubsByAddress;

@@ -34,6 +34,132 @@ public static class NpManagerExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // Offline NP async-request manager (KytyPS5 network.cpp semantics):
+    // Quake II (KEX) creates an async request, submits reachability checks
+    // against it and polls for completion. Requests complete as "signed out"
+    // (0x80550006) since SharpEmu has no PSN session. Leaving any of the
+    // three below unresolved makes the game's NP init fail with a leaked
+    // sentinel id and Com_Error-fatal right after "Running game session".
+    private const int NpErrorSignedOut = unchecked((int)0x80550006);
+    private const int NpErrorRequestNotFound = unchecked((int)0x80550014);
+
+    private sealed class NpRequest
+    {
+        public bool Async;
+        // 0 = pending, 1 = complete.
+        public int State;
+        public int Result;
+    }
+
+    private static int _nextNpRequestId;
+    private static readonly Dictionary<int, NpRequest> _npRequests = new();
+    private static readonly object _npRequestGate = new();
+
+    [SysAbiExport(
+        Nid = "eiqMCt9UshI",
+        ExportName = "sceNpCreateAsyncRequest",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpCreateAsyncRequest(CpuContext ctx)
+    {
+        var paramAddress = ctx[CpuRegister.Rdi];
+        if (paramAddress == 0)
+        {
+            return ctx.SetReturn(NpErrorInvalidArgument);
+        }
+
+        var reqId = Interlocked.Increment(ref _nextNpRequestId);
+        lock (_npRequestGate)
+        {
+            _npRequests[reqId] = new NpRequest { Async = true };
+        }
+
+        TraceNpManager($"create-async-request param=0x{paramAddress:X16} req={reqId}");
+        return ctx.SetReturn(reqId);
+    }
+
+    [SysAbiExport(
+        Nid = "KfGZg2y73oM",
+        ExportName = "sceNpCheckNpReachability",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpCheckNpReachability(CpuContext ctx)
+    {
+        var reqId = unchecked((int)ctx[CpuRegister.Rdi]);
+        if (reqId <= 0)
+        {
+            return ctx.SetReturn(NpErrorInvalidArgument);
+        }
+
+        lock (_npRequestGate)
+        {
+            if (!_npRequests.TryGetValue(reqId, out var request))
+            {
+                return ctx.SetReturn(NpErrorRequestNotFound);
+            }
+
+            if (request.State == 0)
+            {
+                // Complete the async request as signed out; the caller polls
+                // via sceNpPollAsync for the result.
+                request.State = 1;
+                request.Result = NpErrorSignedOut;
+            }
+        }
+
+        TraceNpManager($"check-np-reachability req={reqId} (async, signed out)");
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
+        Nid = "uqcPJLWL08M",
+        ExportName = "sceNpPollAsync",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpPollAsync(CpuContext ctx)
+    {
+        var reqId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var resultAddress = ctx[CpuRegister.Rsi];
+        if (resultAddress == 0)
+        {
+            return ctx.SetReturn(NpErrorInvalidArgument);
+        }
+
+        int result;
+        lock (_npRequestGate)
+        {
+            if (!_npRequests.TryGetValue(reqId, out var request))
+            {
+                return ctx.SetReturn(NpErrorRequestNotFound);
+            }
+
+            result = request.Result;
+        }
+
+        Span<byte> buffer = stackalloc byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(buffer, result);
+        if (!ctx.Memory.TryWrite(resultAddress, buffer))
+        {
+            return ctx.SetReturn(NpErrorInvalidArgument);
+        }
+
+        TraceNpManager($"poll-async req={reqId} result=0x{result:X8}");
+        return ctx.SetReturn(0);
+    }
+
+    private static void TraceNpManager(string message)
+    {
+        if (!string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_LOG_NP_MANAGER"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"[LOADER][TRACE] npmanager.{message}");
+    }
+
     [SysAbiExport(
         Nid = "JELHf4xPufo",
         ExportName = "sceNpCheckCallbackForLib",

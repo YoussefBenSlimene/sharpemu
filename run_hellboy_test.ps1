@@ -13,6 +13,10 @@ if (-not (Test-Path $gamePath)) { Write-Host "ERROR: game missing"; exit 1 }
 
 $env:SHARPEMU_WRITABLE_APP0 = "1"
 $env:SHARPEMU_LOG_SEMA = "1"
+$env:SHARPEMU_LOG_AUDIO_QUEUE = "1"
+$env:SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS = "1"
+$env:SHARPEMU_PERIODIC_SNAPSHOT_SECONDS = "20"
+$env:SHARPEMU_STALL_WATCHDOG_SECONDS = "30"
 
 $process = Start-Process -FilePath $exePath `
     -ArgumentList ('"' + $gamePath + '"') `

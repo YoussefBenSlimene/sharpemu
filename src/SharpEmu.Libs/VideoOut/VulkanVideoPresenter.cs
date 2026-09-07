@@ -3816,8 +3816,11 @@ internal static unsafe class VulkanVideoPresenter
             CreateCommandResources();
             CreateGuestDrawResources();
             _vulkanReady = true;
+            var bootProcess = System.Diagnostics.Process.GetCurrentProcess();
+            var bootSeconds = (DateTime.UtcNow - bootProcess.StartTime.ToUniversalTime()).TotalSeconds;
             Console.Error.WriteLine(
-                $"[LOADER][INFO] Vulkan VideoOut ready: {_extent.Width}x{_extent.Height}, format={_swapchainFormat}");
+                $"[LOADER][INFO] Vulkan VideoOut ready: {_extent.Width}x{_extent.Height}, format={_swapchainFormat} " +
+                $"[BOOT] window up at {bootSeconds:F1}s after process start");
         }
 
         private static void WaitForRenderDocAttachIfRequested()

@@ -264,6 +264,11 @@ internal static partial class Program
             return 3;
         }
 
+        // KytyPS5 parity: open the host window immediately (splash/black) so
+        // the title's window is visible during ELF load + HLE JIT warmup
+        // instead of only after the guest's first flip, minutes into boot.
+        HostVideoHost.EnsureWindowStarted(videoOptions.Width, videoOptions.Height);
+
         Log.Info(BuildInfo.Banner);
         Log.Info(HostSystemInfo.Summary);
 

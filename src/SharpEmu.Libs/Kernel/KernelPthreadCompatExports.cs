@@ -163,8 +163,25 @@ public static class KernelPthreadCompatExports
     // Loading.PreloadManager AV right after scePthreadSelf).
     private static void EnsureGuestThreadObjectAllocator(CpuContext ctx)
     {
-        if (KernelPthreadState.GuestThreadObjectAllocator is not null ||
-            ctx.Memory is not IGuestMemoryAllocator allocator)
+        if (KernelPthreadState.GuestThreadObjectAllocator is not null)
+        {
+            return;
+        }
+
+        // ctx.Memory may be a wrapper (TrackedCpuMemory, write-watch, ...) over
+        // the real address space. Unwrap the chain like GpuWaitRegistry does —
+        // matching the wrapper check with `is not IGuestMemoryAllocator`
+        // silently skipped the install for titles whose first pthread_create
+        // ran through a wrapper, stranding every guest thread on a host-heap
+        // fallback handle that guest code cannot safely dereference (Mortal
+        // Shell: all 59 threads, dead audio, stuck texture streaming).
+        var memoryObject = ctx.Memory;
+        while (memoryObject is ICpuMemoryWrapper wrapper)
+        {
+            memoryObject = wrapper.Inner;
+        }
+
+        if (memoryObject is not IGuestMemoryAllocator allocator)
         {
             return;
         }
@@ -172,45 +189,78 @@ public static class KernelPthreadCompatExports
         var memory = ctx.Memory;
         KernelPthreadState.GuestThreadObjectAllocator = size => AllocateZeroedGuestObject(allocator, memory, size);
         GuestAllocationBridge.RequestZeroed = size => AllocateZeroedGuestObject(allocator, memory, size);
+        GuestAllocationBridge.RequestSelfReferential = size =>
+            AllocateSelfReferentialGuestObject(allocator, memory, size);
         KernelPthreadState.GuestThreadObjectInitializer = objectAddress =>
         {
-            // ScePthread+0x58 -> secondary thread block (cancel-state etc.).
-            // Hellboy's pthread wrappers do `mov r15,[self+0x58]` and then
-            // dereference r15; leave it non-NULL and zeroed.
+            // ScePthread chain fields the guest dereferences unconditionally:
+            //   [obj+0x58] -> secondary block (cancel-state walk
+            //                `mov r15,[x+0x58]; cmp word [r15+0x11C],0`)
+            //   [obj+0x68] -> stats block (scheduler walk
+            //                `mov rax,[x+0x68]; mov eax,[rax+0x24]`)
+            //   [obj+0x00] -> stats block (stats chain walk
+            //                `mov rax,[r14]; mov rax,[rax+0x38];
+            //                 mov rax,[rax+0x10]; mov rax,[rax+rcx*8]`)
+            // Every pointer must be non-NULL even when the extra allocations
+            // fail: the previous early-return left all three NULL whenever the
+            // 0x200 allocation failed, and the first walk then killed the
+            // process (Hellboy Loading.PreloadManager AV at 0x38). Fallbacks
+            // point at the 0x1000 thread object itself, which is large enough
+            // to host the cancel-state word and every chain hop.
             var secondary = AllocateZeroedGuestObject(allocator, memory, 0x200);
             if (secondary == 0)
             {
-                return;
+                secondary = objectAddress;
             }
 
             Span<byte> pointerBytes = stackalloc byte[8];
             BinaryPrimitives.WriteUInt64LittleEndian(pointerBytes, secondary);
             _ = memory.TryWrite(objectAddress + 0x58, pointerBytes);
+            // Keep a reload from the secondary's own +0x58 self-cache non-NULL:
+            // the wrapper loop re-loads r15 through it, and a NULL there cycles
+            // the walk back to the cancel-state check with r15=0 forever.
+            _ = memory.TryWrite(secondary + 0x58, pointerBytes);
 
-            // Mark the secondary block's cancel-state word (0x11C) nonzero so
-            // Hellboy's TCB-walk loop (`mov r15,[x+0x58]; cmp word [r15+11Ch],0
-            // jne done`) terminates on the first hop instead of walking into
-            // the zeroed tail and dereferencing NULL.
+            // Mark the cancel-state word (0x11C) nonzero so the TCB-walk loop
+            // (`mov r15,[x+0x58]; cmp word [r15+11Ch],0; jne done`) terminates
+            // on the first hop. The flag is written on BOTH blocks: the walk
+            // may arrive holding either pointer, and the VEH cancel-state
+            // recovery substitutes the thread object itself, so its cmp reads
+            // the object's +0x11C. Leaving the object's word zero made that
+            // loop run 100k+ substitutions and then kill the process
+            // (Hellboy Loading.PreloadManager).
             Span<byte> flagBytes = stackalloc byte[2];
             BinaryPrimitives.WriteUInt16LittleEndian(flagBytes, 1);
             _ = memory.TryWrite(secondary + 0x11C, flagBytes);
+            _ = memory.TryWrite(objectAddress + 0x11C, flagBytes);
 
-            // Per-thread stats sub-structure: the scheduler walk does
-            // `mov rax,[thread+0x68]; mov eax,[rax+0x24]; movsxd esi,[rax+0x30]`
-            // for every thread object. Point it at a zeroed block; reuse the
-            // secondary block if the extra allocation fails.
             var stats = AllocateZeroedGuestObject(allocator, memory, 0x100);
             if (stats == 0)
             {
                 stats = secondary;
             }
 
-            Span<byte> statsBytes = stackalloc byte[8];
-            BinaryPrimitives.WriteUInt64LittleEndian(statsBytes, stats);
-            _ = memory.TryWrite(objectAddress + 0x68, statsBytes);
+            BinaryPrimitives.WriteUInt64LittleEndian(pointerBytes, stats);
+            _ = memory.TryWrite(objectAddress + 0x68, pointerBytes);
             // The scheduler walk may address the secondary block directly
             // (0x58-stride entries), so give it the same stats pointer.
-            _ = memory.TryWrite(secondary + 0x68, statsBytes);
+            _ = memory.TryWrite(secondary + 0x68, pointerBytes);
+
+            if (stats == objectAddress)
+            {
+                // No dedicated stats block: make the object itself
+                // self-referential so every chain hop lands back inside the
+                // zeroed 0x1000 object. This also refreshes +0x58/+0x68 to the
+                // object (consistent with the fallbacks chosen above).
+                BinaryPrimitives.WriteUInt64LittleEndian(pointerBytes, objectAddress);
+                for (var offset = 0; offset < 0x100; offset += 8)
+                {
+                    _ = memory.TryWrite(objectAddress + (ulong)offset, pointerBytes);
+                }
+
+                _ = memory.TryWrite(secondary + 0x11C, flagBytes);
+                return;
+            }
 
             // Make the stats block self-referential: every pointer field points
             // back at the block, so the guest's chained reads (e.g. [obj+0x00]
@@ -219,12 +269,17 @@ public static class KernelPthreadCompatExports
             // kernel would have filled.
             for (var offset = 0; offset < 0x100; offset += 8)
             {
-                _ = memory.TryWrite(stats + (ulong)offset, statsBytes);
+                _ = memory.TryWrite(stats + (ulong)offset, pointerBytes);
             }
 
             // [thread+0x00] is the first pointer the wrapper dereferences
-            // (`mov rax,[r14]; mov rax,[rax+0x38]; ...`).
-            _ = memory.TryWrite(objectAddress, statsBytes);
+            // (`mov rax,[r14]; mov rax,[rax+0x38]; ...`). The secondary block
+            // gets the same root in case the walk starts there.
+            _ = memory.TryWrite(objectAddress, pointerBytes);
+            if (secondary != stats)
+            {
+                _ = memory.TryWrite(secondary, pointerBytes);
+            }
         };
 
         // Retrofit thread objects created before the allocator was installed
@@ -263,6 +318,37 @@ public static class KernelPthreadCompatExports
         // stale alias here would defeat the entire purpose of the object.
         var zeros = new byte[size];
         return memory.TryWrite(address, zeros) ? address : 0UL;
+    }
+
+    /// <summary>
+    /// Allocates a guest block whose every 8-byte field points at the block
+    /// itself (see <see cref="GuestAllocationBridge.RequestSelfReferential"/>).
+    /// Serves the VEH stats-chain recovery when a guest walk hits a NULL
+    /// kernel-object pointer: substituting a self-referential block keeps the
+    /// whole chain ([x+0x38] → [x+0x10] → [x+idx*8]) in defined memory.
+    /// </summary>
+    private static ulong AllocateSelfReferentialGuestObject(
+        IGuestMemoryAllocator allocator,
+        ICpuMemory memory,
+        int size)
+    {
+        if (size <= 0 || (size & 0x7) != 0 ||
+            !allocator.TryAllocateGuestMemory((ulong)size, alignment: 0x10, out var address))
+        {
+            return 0;
+        }
+
+        Span<byte> selfBytes = stackalloc byte[8];
+        BinaryPrimitives.WriteUInt64LittleEndian(selfBytes, address);
+        for (var offset = 0; offset < size; offset += 8)
+        {
+            if (!memory.TryWrite(address + (ulong)offset, selfBytes))
+            {
+                return 0;
+            }
+        }
+
+        return address;
     }
 
     /// <summary>

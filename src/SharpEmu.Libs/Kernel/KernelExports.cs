@@ -373,7 +373,17 @@ public static class KernelExports
         ExportName = "sceKernelOpen",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelOpen(CpuContext ctx) => KernelMemoryCompatExports.KernelOpenUnderscore(ctx);
+    public static int KernelOpen(CpuContext ctx)
+    {
+        // Real hardware returns -1 with errno on failure (BSD syscall
+        // convention). Leaking the raw 0x8002xxxx sentinel makes callers that
+        // check `fd == -1` store it as a "valid" handle and later close/read
+        // through it (Quake II: close(0x80020002) spam -> fatal abort).
+        var result = KernelMemoryCompatExports.KernelOpenUnderscore(ctx);
+        return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
+            ? 0
+            : KernelMemoryCompatExports.KernelSyscallFailure(ctx, result);
+    }
 
     [SysAbiExport(
         Nid = "mqQMh1zPPT8",

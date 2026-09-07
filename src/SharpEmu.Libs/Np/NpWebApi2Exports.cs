@@ -101,6 +101,23 @@ public static class NpWebApi2Exports
     }
 
     [SysAbiExport(
+        Nid = "QafxeZM3WK4",
+        ExportName = "sceNpWebApi2PushEventDeletePushContext",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpWebApi2")]
+    public static int NpWebApi2PushEventDeletePushContext(CpuContext ctx)
+    {
+        // Offline stub (KytyPS5 parity): the push-event context bookkeeping is
+        // a no-op and the delete reports success. Quake II calls this during
+        // NP social teardown with user_context_id=-1; leaving it unresolved
+        // returned an error that fed the game's fatal path.
+        var userContextId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var pushContextId = ctx[CpuRegister.Rsi];
+        TraceNpWebApi2("push-event-delete-push-context", userContextId, pushContextId);
+        return ctx.SetReturn(0);
+    }
+
+    [SysAbiExport(
         Nid = "bEvXpcEk200",
         ExportName = "sceNpWebApi2Terminate",
         Target = Generation.Gen4 | Generation.Gen5,

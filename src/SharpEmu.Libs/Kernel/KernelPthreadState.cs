@@ -20,6 +20,15 @@ public static class GuestAllocationBridge
 {
     /// <summary>Allocates a zeroed guest-memory block of <paramref name="size"/> bytes, or 0.</summary>
     public static Func<int, ulong>? RequestZeroed { get; set; }
+
+    /// <summary>
+    /// Allocates a guest-memory block whose every 8-byte field points at the
+    /// block itself, or 0. Guest chain walks (ScePthread stats:
+    /// [obj+0] → [x+0x38] → [x+0x10] → [x+idx*8]) stay inside defined memory
+    /// when the real kernel object they expected is missing, instead of
+    /// dereferencing NULL.
+    /// </summary>
+    public static Func<int, ulong>? RequestSelfReferential { get; set; }
 }
 
 internal static class KernelPthreadState

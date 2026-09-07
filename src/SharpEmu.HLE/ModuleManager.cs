@@ -48,6 +48,8 @@ public sealed class ModuleManager : IModuleManager
         }
     }
 
+    private Task? _warmupTask;
+
     public void Freeze()
     {
         lock (_registrationGate)
@@ -55,7 +57,33 @@ public sealed class ModuleManager : IModuleManager
             _isFrozen = true;
         }
 
-        WarmHleTypeInitializers();
+        // The warm sweep takes tens of seconds (23k+ methods across 11 HLE
+        // assemblies). KytyPS5 opens its window before the game loads; do the
+        // same by running the sweep on a background thread so window creation
+        // and ELF loading proceed immediately. Guest execution still waits for
+        // it via WaitForWarmup() — a .cctor or first JIT running on a guest
+        // thread's hijacked stack fail-fasts the CLR, so the sweep must finish
+        // before the first guest instruction dispatches.
+        var warmStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        _warmupTask = Task.Run(() =>
+        {
+            WarmHleTypeInitializers();
+            Console.Error.WriteLine(
+                $"[BOOT] hle-warm completed in {System.Diagnostics.Stopwatch.GetElapsedTime(warmStarted).TotalSeconds:F1}s");
+        });
+    }
+
+    public void WaitForWarmup()
+    {
+        var task = _warmupTask;
+        if (task is null || task.IsCompleted)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine("[BOOT] waiting for hle-warm to finish before guest execution");
+        task.Wait();
+        Console.Error.Flush();
     }
 
     // A .cctor or first JIT running on a guest thread's hijacked stack fail-fasts the CLR.

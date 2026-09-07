@@ -70,4 +70,23 @@ public static class HostVideoHost
         return VulkanVideoPresenter.TryConfigureVideo(normalized) &
                MetalVideoPresenter.TryConfigureVideo(normalized);
     }
+
+    /// <summary>
+    /// Opens the host window immediately (splash/black) instead of waiting for
+    /// the guest's first flip. KytyPS5 launches titles this way: the window is
+    /// visible while the game still boots, so startup no longer looks like a
+    /// multi-minute hang. Each backend no-ops when unsupported or already
+    /// running; whichever backend the title's VideoOut later drives simply
+    /// attaches to the window that is already up.
+    /// </summary>
+    public static void EnsureWindowStarted(int width, int height)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        VulkanVideoPresenter.EnsureStarted((uint)width, (uint)height);
+        MetalVideoPresenter.EnsureStarted((uint)width, (uint)height);
+    }
 }

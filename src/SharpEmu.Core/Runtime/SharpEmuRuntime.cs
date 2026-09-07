@@ -131,6 +131,8 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
 
     public OrbisGen2Result Run(string ebootPath)
     {
+        var bootStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        Console.Error.WriteLine("[BOOT] runtime.Run starting");
         var normalizedEbootPath = Path.GetFullPath(ebootPath);
         using var app0Binding = BindApp0Root(normalizedEbootPath);
         Console.Error.WriteLine($"[RUNTIME] Loading: {ebootPath}");
@@ -142,6 +144,8 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         FiberExports.ResetRuntimeState();
         KernelModuleRegistry.Reset();
         var image = LoadImage(normalizedEbootPath);
+        Console.Error.WriteLine(
+            $"[BOOT] main image loaded in {System.Diagnostics.Stopwatch.GetElapsedTime(bootStarted).TotalSeconds:F1}s");
         VideoOutExports.ConfigureApplicationInfo(image.Title, image.TitleId, image.Version);
         KernelMemoryCompatExports.ConfigureApplicationInfo(image.TitleId);
         SaveDataExports.ConfigureApplicationInfo(image.TitleId);
@@ -160,8 +164,19 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
 
         HleDataSymbols.ConfigureProcessImageName(processImageName);
         MergeKnownHleDataSymbols(activeRuntimeSymbols);
+        var moduleLoadStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         var loadedModuleImages = LoadAdjacentSceModules(ebootPath, activeImportStubs, activeRuntimeSymbols);
         RebindImportedDataSymbols(image, loadedModuleImages, activeRuntimeSymbols);
+        Console.Error.WriteLine(
+            $"[BOOT] adjacent modules loaded in {System.Diagnostics.Stopwatch.GetElapsedTime(moduleLoadStarted).TotalSeconds:F1}s");
+
+        // Guest execution (the initializers run guest code) must not start
+        // before the HLE JIT warm sweep completed: a first JIT or .cctor on a
+        // guest thread's hijacked stack fail-fasts the CLR. The sweep already
+        // ran in parallel with the ELF load (see ModuleManager.Freeze), so
+        // this usually returns immediately.
+        _moduleManager.WaitForWarmup();
+        var initializerStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         var initializerResult = RunAllInitializers(
             image,
             loadedModuleImages,
@@ -179,6 +194,10 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             return failedInitializerResult;
         }
 
+        Console.Error.WriteLine(
+            $"[BOOT] module initializers (dt_init) in {System.Diagnostics.Stopwatch.GetElapsedTime(initializerStarted).TotalSeconds:F1}s");
+        Console.Error.WriteLine(
+            $"[BOOT] elf loaded + modules + initializers in {System.Diagnostics.Stopwatch.GetElapsedTime(bootStarted).TotalSeconds:F1}s");
         Console.Error.WriteLine($"[RUNTIME] Dispatching, gen: {generation}");
         Console.Error.WriteLine($"[RUNTIME] About to call DispatchEntry with entryPoint=0x{image.EntryPoint:X16}");
 
@@ -532,6 +551,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             Console.Error.WriteLine(
                 $"[RUNTIME] Starting module {moduleName}: dt_init=0x{initEntryPoint:X16}");
 
+            var moduleInitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             var result = _cpuDispatcher.DispatchModuleInitializer(
                 initEntryPoint,
                 generation,
@@ -539,6 +559,8 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
                 activeRuntimeSymbols,
                 moduleName,
                 _cpuExecutionOptions);
+            Console.Error.WriteLine(
+                $"[BOOT] module init {moduleName}: {System.Diagnostics.Stopwatch.GetElapsedTime(moduleInitStarted).TotalSeconds:F1}s");
             KernelModuleRegistry.CompleteModuleStart(
                 loadedModule.Handle,
                 result == OrbisGen2Result.ORBIS_GEN2_OK);

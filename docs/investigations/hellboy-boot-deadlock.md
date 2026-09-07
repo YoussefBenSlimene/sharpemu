@@ -1,4 +1,193 @@
-# Hellboy session addendum — 2026-09-06 (dirty-page zeroing + pthread object layout + VEH adapters)
+# KytyPS5 Reference Research — ScePthread / TLS / Guest Memory (2026-09-06)
+
+Reference: local checkout `C:\ps5-emulator\KytyPS5`
+(branch `main`, HEAD `5b8e3b51` "cross-vendor TLS fix", GPL-2.0).
+KytyPS5 boots Hellboy (its home-compat list shows Hellboy screenshots).
+
+---
+
+## Session results — 2026-09-06 late (fast boot + crash fix VERIFIED)
+
+### Fix: fast boot — window opens immediately (KytyPS5 parity)
+
+The HLE JIT warm sweep (`ModuleManager.Freeze` → 23k+ methods across 11
+assemblies) blocked everything for tens of seconds before the ELF even
+loaded, and the SDL window only opened at the guest's first flip — minutes
+into boot. KytyPS5 creates its window before loading the game.
+
+- `ModuleManager.Freeze()` now runs the warm sweep on a background task;
+  the new `IModuleManager.WaitForWarmup()` is awaited in
+  `SharpEmuRuntime.Run()` right before guest initializers execute (a first
+  JIT/.cctor on a guest thread's hijacked stack fail-fasts the CLR, so the
+  wait point is mandatory — it just no longer blocks window creation/ELF load).
+- `HostVideoHost.EnsureWindowStarted(w, h)` (new) eagerly starts the
+  Vulkan/Metal presenter with the splash; `Program.RunEmulator` calls it
+  right after `TryConfigureVideo`.
+
+**Verified:** `[BOOT] window up at 0.9s` (Hellboy) / `1.1s` (Mortal Shell),
+`hle-warm completed in 1.7-1.8s` fully parallel.
+
+### Fix: Hellboy Loading.PreloadManager crash (cancel-state loop)
+
+The new crash dump (`RIP=libScePosix+0x22550`, read AV at 0x11C, R15=0)
+plus the substitution counter told the whole story: the VEH cancel-state
+recovery substituted R15 → thread object, but the object's own
+`+0x11C` cancel word was **zero** (the flag only lived on the secondary
+block), so `cmp word [r15+0x11C],0` read 0, the walk looped, re-loaded
+R15=NULL through `[secondary+0x58]` (also zero), and faulted again —
+**100k+ substitutions until the cap, then the process died**.
+
+`EnsureGuestThreadObjectAllocator` initializer changes (fail-safe now):
+
+- every chain root (`+0x58`, `+0x68`, `+0x00`) is populated even when the
+  secondary/stats allocations fail — fallbacks point at the 0x1000 thread
+  object itself (previously a failed 0x200 allocation early-returned and
+  left all three NULL);
+- the cancel-state word (`+0x11C`) is written on **both** the secondary
+  block **and** the thread object, so the substituted cmp terminates the
+  walk immediately;
+- `[secondary+0x58]` points back at the secondary block, so a reload
+  through the secondary's self-cache never yields NULL;
+- the allocator install unwraps `ICpuMemoryWrapper` chains
+  (`is not IGuestMemoryAllocator` silently skipped the install whenever
+  `ctx.Memory` was wrapped — this is what stranded **all 59** Mortal Shell
+  threads on host-heap fallback handles: dead audio, broken TaskGraph);
+- new `GuestAllocationBridge.RequestSelfReferential` + VEH
+  stats-chain recovery for `mov rax,[rax+0x38]` / `[rax+0x10]` with a NULL
+  base (the `[obj+0] → [x+0x38] → [x+0x10] → [x+idx*8]` walk), capped at
+  100k, disable via `SHARPEMU_DISABLE_STATS_CHAIN_RECOVERY=1`.
+
+**Verified:** Hellboy processes **277M+ imports with zero native
+exceptions** (the crash previously killed the process at ~1.44M);
+cancel-state substitutions collapsed from 100k+ per run to **1**.
+
+### Notes
+
+- The repeated `scePthreadMutexLock → ORBIS_GEN2_ERROR_DEADLOCK` lines in
+  the steady state match PS5/FreeBSD semantics
+  (`PTHREAD_MUTEX_DEFAULT == PTHREAD_MUTEX_ERRORCHECK` on the BSD-based
+  kernel: self-locking a default/errorcheck mutex returns EDEADLK, and the
+  game handles it) — left unchanged.
+- Audio queue perf (`[PERF][AUDIO] stream#1 submits/s=180 fill=96%`) shows
+  the Mortal Shell AudioOut2 pipeline streaming after the handle fix.
+
+---
+
+## 1. `ScePthread` guest-visible object = a **host pointer**, not guest memory
+
+`src/kernel/pthread.cpp`:
+
+```cpp
+struct PthreadPrivate {          // line 384
+    PthreadGuestData      guest; // 4096-byte block, embedded on the HOST heap
+    std::string           name;
+    pthread_t             p;     // host pthread_t
+    PthreadAttr           attr;
+    pthread_entry_func_t  entry;
+    void*                 arg;
+    int                   unique_id;
+    std::atomic_bool      detached, almost_done, free;
+    uint64_t              host_thread_id;
+    uintptr_t             guest_host_rbx, guest_host_rsp, guest_host_rbp;
+    uint64_t              cond_sequence = 0;
+    PthreadCondPrivate*   waiting_cond  = nullptr;
+    std::atomic<uint64_t> pending_signal_mask {0};
+#if WINDOWS
+    uintptr_t guest_host_gs8, guest_host_gs10;
+#endif
+};
+
+struct PthreadGuestData {        // line 377  — the ONLY guest-visible bytes
+    int32_t thread_id;
+    uint8_t reserved[4092];
+};
+static_assert(sizeof(PthreadGuestData) == 4096);
+```
+
+- Guest-visible struct lives **on the host heap** (`new PthreadPrivate {}`).
+- Only field guest code reads: `thread_id` at offset 0 (value `++g_pthread_thread_id`).
+- **No `+0x58`, `+0x68`, `+0x11C`, `+0x12E` fields exist in the guest view.**
+  The whole rest of the 4096 bytes is `reserved` (zero-initialized).
+
+### What pthread_create / pthread_self return
+
+```cpp
+// PthreadCreate (line 3421)
+auto* created_thread = pthread_pool->Create();
+*thread = created_thread;                 // HOST pointer written to guest *thread
+created_thread->guest.thread_id = ++g_pthread_thread_id;
+
+// PthreadSelf (line 3259)
+thread_local Pthread g_pthread_self = nullptr;   // host PthreadPrivate*
+return g_pthread_self;
+```
+
+So `pthread_self()` returns a **host `PthreadPrivate*`** to the guest. Every
+kernel export (`PthreadJoin`, `PthreadDetach`, `PthreadCancel`,
+`GetPthreadAttrValue`, `PthreadGetUniqueId`, ...) dereferences that host
+pointer directly. `GetPthreadAttrValue` even validates
+`reinterpret_cast<uint64_t>(attr_value) < 0x10000u` (i.e. a low value means
+"null attr").
+
+### TLS self-slot: **does not exist**
+
+Kyty stores the self in a **C++ `thread_local`** (`g_pthread_self`), which maps
+to the **host** TLS, not guest memory. There is no guest-visible
+`fs:.../gs:...` pthread_self slot, no per-thread guest "TLS area".
+
+## 2. Main thread init
+
+```cpp
+void PthreadInitSelfForMainThread() {
+    g_pthread_self = new PthreadPrivate {};
+    g_pthread_self->guest.thread_id = ++g_pthread_thread_id; // "MainThread"
+    g_pthread_self->unique_id       = Common::Thread::GetThreadIdUnique();
+    ...
+}
+```
+(Guest self of main thread is likewise the host pointer allocated at startup.)
+
+## 3. Guest thread stacks
+
+`CreateGuestStack` (line 716): stacks are carved **downward** from
+`PTHREAD_STACK_TOP = 0x7efff8000` (i.e. near top of the 0x7f00000000 guest
+region), default size `0x200000` (main) / `0x100000` (threads), with
+allocator via `Memory::AllocateGuestStackMemory(addr, map_size, ReadWrite)`.
+Stack top = `(stack_addr + stack_size) & ~0xF`, then `rsp = top - 16`.
+Nothing about TLS/self is placed near the stack.
+
+## 4. Memory: maps are **zero-initialized**
+
+`Memory::Map`/`AllocateGuestStackMemory` uses the guest allocator with a
+zeroed `std::vector<uint8_t>` backing — the guest always sees clean pages
+for fresh mappings (no recycled / dirty host page content). This is the
+"fresh guest memory must be zero" invariant; Kyty never hands out dirty
+pages.
+
+## 5. Implication for SharpEmu (Hellboy crash chain)
+
+Hellboy's libScePosix wrappers do `mov r15,[x+0x58]; cmp word [r15+11Ch],0`
+and the scheduler-like walk `mov rax,[x+0x68]; mov eax,[rax+0x24];...`.
+That is **NOT** the Kyty ScePthread layout. In Kyty the guest pthread handle
+is a host pointer; a guest wrapper iterating host-side ScePthread objects
+would never do a `[x+0x58]` guest-memory walk there. Our divergence was
+returning **guest-memory** pthread objects whose zeroed sub-fields create
+those NULL-dereference walks.
+
+Kyty-parity recommendation: keep the guest-visible 4096-byte object for
+titles that treat pthread_t as a guest pointer, but **do not** model a
+`+0x58`/`+0x68` ScePthread layout — that chain is not kernel-owned. The
+`mov [x+0x58]`/`[x+0x68]` walk is a libScePosix-internal linked queue
+(thread list) that should be backed by real allocations, not kernel-managed
+pthread fields.
+
+## 6. Open questions / next steps for SharpEmu
+
+- Whether `scePthreadSelf` guest code later feeds the returned handle into
+  kernel exports (`scePthreadJoin` etc.) or into libc (dl/have wrappers).
+- Whether Hellboy's `[x+0x58]` chain is a **libScePosix thread-list** (heap
+  allocation) and can be serviced by keeping the node allocations alive and
+  non-NULL.
 
 ## What changed since the 2026-09-05 addendum
 

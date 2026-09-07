@@ -295,6 +295,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private ImportStubEntry[] _importEntries = Array.Empty<ImportStubEntry>();
 
+	// Signature of the stub set the last successful SetupImportStubs built.
+	// Full re-setup patches every stub and rebuilds all handler trampolines,
+	// which costs multiple seconds on big titles (Mortal Shell: ~8s); the stub
+	// set is identical between module dt_init dispatches and process entry.
+	private ulong? _importStubSetupSignature;
+
+	// Address ranges already byte-scanned by PatchTlsPatterns. The pattern
+	// patches are idempotent, so rescanning a covered range on each module
+	// dt_init / process-entry dispatch wastes seconds (two ~128 MiB windows
+	// at 4 match probes per byte). Pages committed later still get rescanned
+	// through the lazy-commit path, which calls PatchTlsPatternsInRange
+	// directly.
+	private readonly List<(ulong Start, ulong End)> _tlsScanCoveredRanges = new();
+
 	private readonly List<nint> _importHandlerTrampolines = new List<nint>();
 
 	private const int GuestContextTransferFrameQwords = 20;
@@ -1220,6 +1234,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		GuestThreadExecution.Scheduler = this;
 		try
 		{
+			var setupStarted = Stopwatch.GetTimestamp();
 			if (!SetupImportStubs(importStubs))
 			{
 				if (string.IsNullOrEmpty(LastError))
@@ -1230,8 +1245,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return false;
 			}
 			CreateTlsHandler();
+			Console.Error.WriteLine(
+				$"[BOOT] SetupImportStubs for 0x{entryPoint:X16}: {Stopwatch.GetElapsedTime(setupStarted).TotalSeconds:F2}s");
+			var tlsPatchStarted = Stopwatch.GetTimestamp();
 			PatchTlsPatterns();
-			return ExecuteEntry(context, entryPoint, out result);
+			Console.Error.WriteLine(
+				$"[BOOT] PatchTlsPatterns for 0x{entryPoint:X16}: {Stopwatch.GetElapsedTime(tlsPatchStarted).TotalSeconds:F2}s");
+			var guestStarted = Stopwatch.GetTimestamp();
+			var executed = ExecuteEntry(context, entryPoint, out result);
+			Console.Error.WriteLine(
+				$"[BOOT] guest ExecuteEntry for 0x{entryPoint:X16}: {Stopwatch.GetElapsedTime(guestStarted).TotalSeconds:F2}s");
+			return executed;
 		}
 		catch (Exception ex)
 		{
@@ -1261,6 +1285,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private bool SetupImportStubs(IReadOnlyDictionary<ulong, string> importStubs)
 	{
 		Console.Error.WriteLine($"[LOADER][INFO] Setting up {importStubs.Count} import stubs...");
+		var setupSignature = ComputeImportStubSignature(importStubs);
+		if (_importStubSetupSignature == setupSignature)
+		{
+			return true;
+		}
 		ClearImportHandlerTrampolines();
 		_importEntries = new ImportStubEntry[importStubs.Count];
 		HashSet<ulong> hashSet = new HashSet<ulong>(importStubs.Keys);
@@ -1341,7 +1370,27 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			num++;
 		}
 		Console.Error.WriteLine($"[LOADER][INFO] Setup {num2}/{importStubs.Count} import stubs (direct bridge, lle_redirects={num3})");
-		return num2 == importStubs.Count;
+		if (num2 != importStubs.Count)
+		{
+			return false;
+		}
+		_importStubSetupSignature = setupSignature;
+		return true;
+	}
+
+	private static ulong ComputeImportStubSignature(IReadOnlyDictionary<ulong, string> importStubs)
+	{
+		// Order-independent so dictionary enumeration order never forces a re-setup.
+		ulong hash = 14695981039346656037UL;
+		ulong xor = (ulong)importStubs.Count;
+		foreach (var (address, nid) in importStubs)
+		{
+			ulong entryHash = address ^ unchecked((ulong)(nid is null ? 0 : StringComparer.Ordinal.GetHashCode(nid)));
+			xor ^= entryHash;
+			// FNV-1a fold keeps position-insensitive ADD mixing weaker than XOR alone.
+			hash = (hash ^ (byte)(entryHash & 0xFF)) * 1099511628211UL;
+		}
+		return hash ^ (xor * 1099511628211UL);
 	}
 
 	private unsafe bool TryCreateNativeImportIntrinsic(string nid, out nint address)
@@ -3174,13 +3223,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			scanStart = entryRegion.AllocationBase;
 		}
 
-		PatchTlsPatternsInRange(scanStart, scanStart + MaxScanBytes, announce: true);
+		PatchTlsPatternsRangeOnce(scanStart, scanStart + MaxScanBytes, announce: true);
 
 		// Scan both windows unconditionally; overlap is safe, patched bytes just stop matching.
 		var mainImageBase = _entryPoint >= Ps5MainImageBase ? Ps5MainImageBase : Ps4MainImageBase;
 		if (mainImageBase < scanStart)
 		{
-			PatchTlsPatternsInRange(mainImageBase, mainImageBase + MaxScanBytes, announce: false);
+			PatchTlsPatternsRangeOnce(mainImageBase, mainImageBase + MaxScanBytes, announce: false);
+		}
+	}
+
+	private void PatchTlsPatternsRangeOnce(ulong rangeStart, ulong rangeEnd, bool announce)
+	{
+		lock (_tlsScanCoveredRanges)
+		{
+			foreach (var (coveredStart, coveredEnd) in _tlsScanCoveredRanges)
+			{
+				if (coveredStart <= rangeStart && rangeEnd <= coveredEnd)
+				{
+					return;
+				}
+			}
+
+			PatchTlsPatternsInRange(rangeStart, rangeEnd, announce);
+			_tlsScanCoveredRanges.Add((rangeStart, rangeEnd));
 		}
 	}
 
@@ -6761,6 +6827,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 								$"wake={thread.BlockWakeKey ?? "none"} " +
 								$"host_managed={thread.HostThread?.ManagedThreadId ?? 0} " +
 								$"host_tid={Volatile.Read(ref thread.HostThreadId)}");
+							TryDumpSpinLoopCodeWindow(thread);
+							TryDumpSpinLoopRegisters(thread);
 						}
 					}
 					nextSnapshotTimestamp = Stopwatch.GetTimestamp() + Stopwatch.Frequency;
@@ -6773,6 +6841,131 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		};
 		_readyDispatchThread.Start();
 	}
+
+	// A guest thread spinning at millions of imports per second (e.g. the
+	// Hellboy libScePosix pthread-self cache loop) pins a CPU core and stalls
+	// the whole title while telling us nothing beyond a NID + return address.
+	// Dump the spin loop's code window once per return address so the loop can
+	// be analyzed and the missing guest-visible state fixed.
+	private void TryDumpSpinLoopRegisters(GuestThreadState thread)
+	{
+		// Only for the hot spinners: a Running thread past ten million imports
+		// is a livelock (Hellboy PreloadManager self-cache loop). Print the
+		// live registers plus the compare operands the loop uses so the exact
+		// divergence point can be identified from one snapshot.
+		if (Interlocked.Read(ref thread.ImportCount) < 1_000_000 ||
+			!_dumpedSpinLoopRegisters.Add(thread.ThreadHandle))
+		{
+			return;
+		}
+
+		try
+		{
+			var context = thread.Context;
+			var memory = context.Memory;
+			ulong Read(ulong address)
+			{
+				Span<byte> buffer = stackalloc byte[8];
+				return memory.TryRead(address, buffer)
+					? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(buffer)
+					: 0;
+			}
+
+			// libScePosix self-cache loop operands (Il2CppUserAssemblies):
+			// global current-thread block at r13, cached pointer + refcount
+			// next to it, compare target [self+0x60], walk fields on self.
+			var self = context[CpuRegister.Rbx];
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] spin-regs thread='{thread.Name}' " +
+				$"rip=0x{context.Rip:X16} rbx=0x{self:X16} r15=0x{context[CpuRegister.R15]:X16} " +
+				$"r13=0x{context[CpuRegister.R13]:X16} rdi=0x{context[CpuRegister.Rdi]:X16} " +
+				$"rbp=0x{context[CpuRegister.Rbp]:X16} rsp=0x{context[CpuRegister.Rsp]:X16}");
+			Console.Error.WriteLine(
+				$"[LOADER][WARN]   [self+0x50]=0x{Read(self + 0x50):X16} " +
+				$"[self+0x58]=0x{Read(self + 0x58):X16} [self+0x60]=0x{Read(self + 0x60):X16} " +
+				$"[self+0x98]=0x{Read(self + 0x98):X16} " +
+				$"[self+0x11C]=0x{Read(self + 0x11C):X8} [self+0x12E]=0x{Read(self + 0x12E):X4}");
+			var globalBlock = context[CpuRegister.R13];
+			if (globalBlock >= 0x10000)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN]   [global+0x00]=0x{Read(globalBlock):X16} " +
+					$"[global+0x08]=0x{Read(globalBlock + 8):X16} " +
+					$"[global+0x10]=0x{Read(globalBlock + 0x10):X16} " +
+					$"[global+0x18]=0x{Read(globalBlock + 0x18):X16}");
+				var globalB = Read(globalBlock + 0x18);
+				if (globalB >= 0x10000)
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][WARN]   [*globalB]=0x{Read(globalB):X16} " +
+						$"[*globalB+8]=0x{Read(globalB + 8):X16}");
+				}
+			}
+
+			Console.Error.Flush();
+		}
+		catch
+		{
+			// Diagnostics only — never let the snapshot path throw.
+		}
+	}
+
+	private static readonly HashSet<ulong> _dumpedSpinLoopReturnAddresses = new();
+	private static readonly HashSet<ulong> _dumpedSpinLoopRegisters = new();
+
+	private void TryDumpSpinLoopCodeWindow(GuestThreadState thread)
+	{
+		var returnAddress = Volatile.Read(ref thread.LastReturnRip);
+		if (returnAddress < 0x10000 ||
+			Interlocked.Read(ref thread.ImportCount) < 5_000_000 ||
+			!_dumpedSpinLoopReturnAddresses.Add(returnAddress))
+		{
+			return;
+		}
+
+		try
+		{
+			var memory = thread.Context.Memory;
+			// Wide pre-window: the spin loop's back-edge usually lives in the
+			// caller above the import call site (Hellboy: the pthread-once /
+			// self-cache loop at ret-0x200).
+			var start = returnAddress - 0x600;
+			var window = new byte[0x800];
+			if (!memory.TryRead(start, window))
+			{
+				return;
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] spin-loop code window thread='{thread.Name}' " +
+				$"ret=0x{returnAddress:X16} imports={Interlocked.Read(ref thread.ImportCount)} " +
+				$"nid={thread.LastImportNid ?? "none"}");
+			for (var offset = 0; offset < window.Length; offset += 16)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN]   0x{start + (ulong)offset:X16}: " +
+					Convert.ToHexString(window, offset, 16));
+			}
+
+			Console.Error.Flush();
+		}
+		catch (Exception exception)
+		{
+			// Never let the snapshot path throw, but surface the failure once —
+			// a silently missing register dump is undiagnosable.
+			if (_spinRegisterDumpExceptionLogged)
+			{
+				return;
+			}
+
+			_spinRegisterDumpExceptionLogged = true;
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] spin-regs dump failed: {exception.GetType().Name}: {exception.Message}");
+			Console.Error.Flush();
+		}
+	}
+
+	private static bool _spinRegisterDumpExceptionLogged;
 
 	private void StopReadyThreadDispatcher()
 	{
@@ -7357,6 +7550,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_posixSignalBackend = null;
 		}
 		ClearImportHandlerTrampolines();
+		_importStubSetupSignature = null;
+		lock (_tlsScanCoveredRanges)
+		{
+			_tlsScanCoveredRanges.Clear();
+		}
 		_importEntries = Array.Empty<ImportStubEntry>();
 		_runtimeSymbolsByName.Clear();
 		StopReadyThreadDispatcher();
