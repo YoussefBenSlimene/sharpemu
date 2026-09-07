@@ -342,6 +342,7 @@ public sealed partial class DirectExecutionBackend
 
 			DumpPointerWindow("fault-register-rbx", rbx, 0x60);
 			DumpPointerWindow("fault-register-rsi", rsi, 0x60);
+			DumpPointerWindow("fault-register-rcx", rcx, 0x80);
 			DumpPointerWindow("fault-register-rdi", rdi, 0x60);
 			DumpPointerWindow("fault-register-r13", r13, 0x60);
 			DumpPointerWindow("fault-register-r14", r14, 0x60);
