@@ -441,6 +441,82 @@ public static class KernelExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    private static int _abortTraceCount;
+
+    // One-shot: dump the abort call site — return address, registers and the
+    // strings the game's Com_Error machinery has staged — so the empty-message
+    // fatal (Quake II "Installation") can be traced to its source.
+    private static void TraceAbortCallSite(CpuContext ctx)
+    {
+        if (Interlocked.Increment(ref _abortTraceCount) != 1)
+        {
+            return;
+        }
+
+        try
+        {
+            var rsp = ctx[CpuRegister.Rsp];
+            var pointer = new byte[8];
+            ulong ReadU64(ulong address) =>
+                ctx.Memory.TryRead(address, pointer)
+                    ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(pointer)
+                    : 0;
+
+            string ReadStr(ulong address)
+            {
+                if (address == 0)
+                {
+                    return "<null>";
+                }
+
+                Span<byte> buf = stackalloc byte[96];
+                if (!ctx.Memory.TryRead(address, buf))
+                {
+                    return $"<unreadable 0x{address:X16}>";
+                }
+
+                var len = buf.IndexOf((byte)0);
+                if (len < 0)
+                {
+                    len = buf.Length;
+                }
+
+                return System.Text.Encoding.UTF8.GetString(buf[..len]);
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] abort call-site: ret=0x{ReadU64(rsp):X16} " +
+                $"rdi=0x{ctx[CpuRegister.Rdi]:X16} rsi=0x{ctx[CpuRegister.Rsi]:X16} " +
+                $"rdx=0x{ctx[CpuRegister.Rdx]:X16} rcx=0x{ctx[CpuRegister.Rcx]:X16} " +
+                $"r8=0x{ctx[CpuRegister.R8]:X16} r9=0x{ctx[CpuRegister.R9]:X16} " +
+                $"rbx=0x{ctx[CpuRegister.Rbx]:X16} r12=0x{ctx[CpuRegister.R12]:X16} " +
+                $"r13=0x{ctx[CpuRegister.R13]:X16} r14=0x{ctx[CpuRegister.R14]:X16} " +
+                $"r15=0x{ctx[CpuRegister.R15]:X16} rbp=0x{ctx[CpuRegister.Rbp]:X16}");
+            for (var slot = 0; slot < 6; slot++)
+            {
+                var value = ReadU64(rsp + (ulong)(8 * slot));
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO]   abort stack[{slot}] @0x{rsp + (ulong)(8 * slot):X16} = 0x{value:X16} \"{ReadStr(value)}\"");
+            }
+
+            // The known Com_Error staging globals from earlier runs.
+            foreach (var global in new ulong[] { 0x80230E0F0, 0x802AB1650, 0x8019B0DD0 })
+            {
+                var staged = ReadU64(global);
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO]   err-global 0x{global:X16} -> 0x{staged:X16} \"{ReadStr(staged)}\"");
+            }
+
+            Console.Error.Flush();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] abort trace failed: {exception.GetType().Name}: {exception.Message}");
+            Console.Error.Flush();
+        }
+    }
+
     private static string ReadCString(CpuContext ctx, ulong address, int maxLen)
     {
         Span<byte> buf = stackalloc byte[maxLen];
@@ -476,6 +552,7 @@ public static class KernelExports
         // Route through the same graceful guest-entry-exit path as exit(): letting the call
         // fall through to the host's native abort() does not unwind the guest thread cleanly.
         Console.Error.WriteLine("[LOADER][INFO] abort() called by guest - terminating");
+        TraceAbortCallSite(ctx);
         GuestThreadExecution.RequestCurrentEntryExit("abort", -1);
         ctx[CpuRegister.Rax] = unchecked((ulong)(-1L));
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
