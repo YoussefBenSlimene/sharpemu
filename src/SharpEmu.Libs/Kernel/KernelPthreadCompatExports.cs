@@ -483,6 +483,7 @@ public static class KernelPthreadCompatExports
         public ulong ReturnAddress;
         public ulong ThreadHandle;
         public int Count;
+        public bool Reported;
     }
 
     private static readonly List<SpinKey> _pthreadSelfSpinCounters = new();
@@ -495,14 +496,10 @@ public static class KernelPthreadCompatExports
             return;
         }
 
-        Span<byte> pointer = stackalloc byte[8];
-        if (!ctx.Memory.TryRead(ctx[CpuRegister.Rsp], pointer))
-        {
-            return;
-        }
-
-        var returnAddress = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(pointer);
-        if (returnAddress < 0x10000)
+        // Read the return address from the host stack via the context — the
+        // same API FormatCallSite uses (guest-memory TryRead handles both).
+        if (!ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var returnAddress) ||
+            returnAddress < 0x10000)
         {
             return;
         }
@@ -515,9 +512,9 @@ public static class KernelPthreadCompatExports
                 if (key.ReturnAddress == returnAddress && key.ThreadHandle == threadHandle)
                 {
                     key.Count++;
-                    if (key.Count is 1_000_000 or 10_000_000 or 100_000_000 ||
-                        (key.Count > 100_000_000 && key.Count % 100_000_000 == 0))
+                    if (key.Count >= 1_000_000 && !key.Reported)
                     {
+                        key.Reported = true;
                         hot = key;
                     }
 
@@ -543,7 +540,7 @@ public static class KernelPthreadCompatExports
 
         Console.Error.WriteLine(
             $"[LOADER][WARN] scePthreadSelf hot spin: ret=0x{returnAddress:X16} " +
-            $"thread=0x{threadHandle:X16} calls={hot.Count:N0} — the caller loop is " +
+            $"thread=0x{threadHandle:X16} calls>={hot.Count:N0} — the caller loop is " +
             "re-reading the self cache; dump the wrapper code to find the missing field");
         Console.Error.Flush();
     }
