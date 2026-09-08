@@ -470,7 +470,82 @@ public static class KernelPthreadCompatExports
         }
         ctx[CpuRegister.Rax] = currentThreadHandle;
         TracePthreadSelf(ctx, currentThreadHandle);
+        TracePthreadSelfHotSpin(ctx, currentThreadHandle);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Hellboy: the Loading.PreloadManager thread spins here millions of times
+    // (libScePosix self-cache refresh loop) while the whole title waits. Count
+    // per call site and report a hot loop once with the caller chain so the
+    // spin's origin is visible in any log without special env vars.
+    private sealed class SpinKey
+    {
+        public ulong ReturnAddress;
+        public ulong ThreadHandle;
+        public int Count;
+    }
+
+    private static readonly List<SpinKey> _pthreadSelfSpinCounters = new();
+    private static readonly object _pthreadSelfSpinGate = new();
+
+    private static void TracePthreadSelfHotSpin(CpuContext ctx, ulong threadHandle)
+    {
+        if (!SharpEmu.Libs.Diagnostics.GameDebug.Enabled)
+        {
+            return;
+        }
+
+        Span<byte> pointer = stackalloc byte[8];
+        if (!ctx.Memory.TryRead(ctx[CpuRegister.Rsp], pointer))
+        {
+            return;
+        }
+
+        var returnAddress = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(pointer);
+        if (returnAddress < 0x10000)
+        {
+            return;
+        }
+
+        SpinKey? hot = null;
+        lock (_pthreadSelfSpinGate)
+        {
+            foreach (var key in _pthreadSelfSpinCounters)
+            {
+                if (key.ReturnAddress == returnAddress && key.ThreadHandle == threadHandle)
+                {
+                    key.Count++;
+                    if (key.Count is 1_000_000 or 10_000_000 or 100_000_000 ||
+                        (key.Count > 100_000_000 && key.Count % 100_000_000 == 0))
+                    {
+                        hot = key;
+                    }
+
+                    break;
+                }
+            }
+
+            if (hot is null && _pthreadSelfSpinCounters.Count < 64)
+            {
+                _pthreadSelfSpinCounters.Add(new SpinKey
+                {
+                    ReturnAddress = returnAddress,
+                    ThreadHandle = threadHandle,
+                    Count = 1,
+                });
+            }
+        }
+
+        if (hot is null)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] scePthreadSelf hot spin: ret=0x{returnAddress:X16} " +
+            $"thread=0x{threadHandle:X16} calls={hot.Count:N0} — the caller loop is " +
+            "re-reading the self cache; dump the wrapper code to find the missing field");
+        Console.Error.Flush();
     }
 
     [SysAbiExport(

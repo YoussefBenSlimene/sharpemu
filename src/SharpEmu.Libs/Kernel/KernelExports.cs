@@ -507,6 +507,36 @@ public static class KernelExports
                     $"[LOADER][INFO]   err-global 0x{global:X16} -> 0x{staged:X16} \"{ReadStr(staged)}\"");
             }
 
+            // Guest code at the abort return address: lets us disassemble which
+            // cvar/string the caller passed as the (empty) error message.
+            var ret = ReadU64(rsp);
+            if (ret >= 0x10000)
+            {
+                Span<byte> code = stackalloc byte[64];
+                if (ctx.Memory.TryRead(ret - 16, code))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][INFO]   abort-ret code window @0x{ret - 16:X16}: " +
+                        $"{SharpEmu.Libs.Diagnostics.GameDebug.HexPreview(code, 64)}");
+                }
+
+                // The frame above: caller return + its stack args.
+                var rbp = ctx[CpuRegister.Rbp];
+                for (var frame = 0; frame < 3; frame++)
+                {
+                    var nextRbp = ReadU64(rbp);
+                    var callerRet = ReadU64(rbp + 8);
+                    if (nextRbp == 0 || callerRet < 0x10000)
+                    {
+                        break;
+                    }
+
+                    Console.Error.WriteLine(
+                        $"[LOADER][INFO]   abort frame#{frame}: rbp=0x{rbp:X16} ret=0x{callerRet:X16}");
+                    rbp = nextRbp;
+                }
+            }
+
             Console.Error.Flush();
         }
         catch (Exception exception)

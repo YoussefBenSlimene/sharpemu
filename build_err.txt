@@ -7,14 +7,12 @@
   SharpEmu.ShaderCompiler -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.ShaderCompiler.dll
   SharpEmu.ShaderCompiler.Vulkan -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.ShaderCompiler.Vulkan.dll
   SharpEmu.ShaderCompiler.Metal -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.ShaderCompiler.Metal.dll
-  SharpEmu.Libs -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.Libs.dll
-  SharpEmu.Core -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.Core.dll
-  SharpEmu.Debugger -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.Debugger.dll
-  SharpEmu.GUI -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.GUI.dll
-  SharpEmu.CLI -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\win-x64\SharpEmu.dll
+C:\ps5-emulator\sharpemu\src\SharpEmu.Libs\Diagnostics\GameDebug.cs(84,24): error CS0102: The type 'GameDebug' already contains a definition for '_rateBucket' [C:\ps5-emulator\sharpemu\src\SharpEmu.Libs\SharpEmu.Libs.csproj]
 
-Build succeeded.
+Build FAILED.
+
+C:\ps5-emulator\sharpemu\src\SharpEmu.Libs\Diagnostics\GameDebug.cs(84,24): error CS0102: The type 'GameDebug' already contains a definition for '_rateBucket' [C:\ps5-emulator\sharpemu\src\SharpEmu.Libs\SharpEmu.Libs.csproj]
     0 Warning(s)
-    0 Error(s)
+    1 Error(s)
 
-Time Elapsed 00:00:02.70
+Time Elapsed 00:00:03.11
