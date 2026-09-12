@@ -233,6 +233,16 @@ public static class KernelPthreadCompatExports
             BinaryPrimitives.WriteUInt16LittleEndian(flagBytes, 1);
             _ = memory.TryWrite(secondary + 0x11C, flagBytes);
             _ = memory.TryWrite(objectAddress + 0x11C, flagBytes);
+            // Hellboy theory T2: the libScePosix thread-list walk also checks
+            // [self+0x12E] (cancel-type, 1 byte). Writing 1 here breaks the
+            // cycle on a second path: the walk exits when cancel-state != 0
+            // OR cancel-type != 0, so setting both guarantees termination
+            // regardless of which field the walk reads first on a path where
+            // +0x11C was not yet visible (e.g. a torn read across hops).
+            Span<byte> cancelType = stackalloc byte[1];
+            cancelType[0] = 1;
+            _ = memory.TryWrite(secondary + 0x12E, cancelType);
+            _ = memory.TryWrite(objectAddress + 0x12E, cancelType);
 
             var stats = AllocateZeroedGuestObject(allocator, memory, 0x100);
             if (stats == 0)
