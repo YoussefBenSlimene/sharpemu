@@ -8393,12 +8393,15 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
             // modelling DCC block state.
             if (translatedDraw.IsDccFastClear)
             {
-                foreach (var target in translatedDraw.GuestTargets)
+                // Still create host GPU images (zero clear). RequestGuestColorClear
+                // alone never publishes _availableGuestImages, so later composites
+                // sample empty CPU tiles (Mortal Shell / Astro gray/black).
+                if (translatedDraw.GuestTargets.Count > 0)
                 {
-                    if (target.Address != 0)
-                    {
-                        VulkanVideoPresenter.RequestGuestColorClear(target.Address);
-                    }
+                    VulkanVideoPresenter.SubmitOffscreenColorClear(
+                        translatedDraw.GuestTargets,
+                        0f, 0f, 0f, 0f,
+                        translatedDraw.PixelShaderAddress);
                 }
 
                 ReturnPooledDrawArrays(
@@ -11848,6 +11851,10 @@ private static long _indirectDrawProbeCount;
                 out var writeGeneration);
         if (!_textureCopySkipDisabled &&
             descriptor.Address != 0 &&
+            GuestGpu.Current.IsGpuGuestImageAvailable(
+                descriptor.Address,
+                descriptor.Format,
+                descriptor.NumberType) &&
             !SharpEmu.HLE.GuestImageWriteTracker.PeekDirty(descriptor.Address) &&
             GuestGpu.Current.IsTextureContentCached(
                 new TextureContentIdentity(

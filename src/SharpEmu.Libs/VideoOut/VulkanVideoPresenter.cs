@@ -11206,7 +11206,7 @@ internal static unsafe class VulkanVideoPresenter
                 (13, 7) => Format.R32G32B32Sfloat,
                 (14, 4) => Format.R32G32B32A32Uint,
                 (14, 5) => Format.R32G32B32A32Sint,
-                (14, 7) => Format.R32G32B32A32Sfloat,
+                (14, _) => Format.R32G32B32A32Sfloat,
                 // Prospero VertexAttribFormat quirks also seen as buffer formats.
                 (113, _) => Format.R32G32B32A32Sfloat,
                 (121, _) => Format.R16G16Sfloat,
