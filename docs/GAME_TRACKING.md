@@ -68,7 +68,8 @@ real streamed ones.
 | M3 | Texture upload skip could reuse a GPU texture that was never uploaded | **FIXED** | skip gate now requires `IsGpuGuestImageAvailable` | `2a75ad4` (upstream #853) |
 | M4 | Format-14 textures with number type ≠ 4/5/7 decoded as R8G8B8A8Unorm (wrong bpp/layout) | **FIXED** | `(14,7)` case should be `(14,_)` (upstream #860) | `2a75ad4` |
 | M5 | All 59 guest threads received **host-heap** pthread handles (allocator silently skipped install when `ctx.Memory` was an `ICpuMemoryWrapper`) → Unity TaskGraph/Boehm/FMOD aliased garbage | **FIXED** | allocator install now unwraps wrapper chains | `c25f851` |
-| M6 | One remaining 1×1 placeholder at `addr=0x…56F60000 pc=0x50 tile=1 fmt=10` — still-uncovered descriptor binding path | **OPEN** | suspected: a CPU-side upload path writes texels but never registers a GPU image (needs write-watch on that address) | — |
+| M6 | One remaining 1×1 placeholder at `addr=0x2004550000 pc=0x50 tile=1 fmt=10` — still-uncovered descriptor binding path (the PREVIOUS placeholder at `0x…56F60000` was fixed by the DCC publish + GPU-residency gate) | **OPEN** | suspected: the game's streaming upload writes texels via CPU memcpy into the descriptor's backing memory, but the guest write-tracker is disabled on Windows by default → the GPU image is never refreshed (stale-black). Confirm with write-watch on `0x2004550000` or enable the tracker via env | — |
+| M8 | Draw throughput improved after the AGC fixes: 87k work items per 90 s (was ~60k), 50 presents, 198 draws sampled — double-buffer chain verified correct | **IMPROVED** | DCC fast-clear publishing + texture GPU-residency gate + format-14 wildcard | `2a75ad4` |
 | M7 | Repeated `scePthreadMutexLock → EDEADLK` in steady state | **RULED OUT** | matches PS5/FreeBSD semantics (DEFAULT == ERRORCHECK); game handles it | — |
 
 **Theories (unconfirmed — do not re-derive blindly):**
@@ -137,7 +138,7 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 | H3 | Guest threads on **host-heap** pthread handles (allocator skipped through memory wrappers) | **FIXED** | allocator install unwraps `ICpuMemoryWrapper` chains | `c25f851` |
 | H4 | Unmapped-target guest reads killed the process mid-dump (no VEH case) | **FIXED** | last-resort garbage-read recovery (skip + zero dest, capped 1M) | `c25f851` |
 | H5 | Unpatched `mov reg, fs:[0]` loads (TLS load-time patcher scans host memory; 0 loads patched in every submitted log — upstream #789) | **FIXED (backstop)** | fault-time recovery writes the calling thread's guest TLS base (upstream #791) | `51fc8f7` |
-| H6 | **PreloadManager livelock**: 135M+ `scePthreadSelf` calls from `libScePosix` self-cache refresh at `0Z2sdqi9LGg+0x2256E`; loop walks `[r15+0x58]` chain, `cmp word [r15+0x11C],0` never satisfied, reloads r15=NULL via `[secondary+0x58]` | **ROOT-CAUSE** | the game's thread-list/TLS cache never validates against synthetic zeroed pthread objects; loop needs one thread with cancel-state ≠ 0 **or** cancel-type ≠ 0; the JobWorkers it waits for are all blocked on event_flag 0x4 | — |
+| H6 | **PreloadManager livelock**: 1.4M+ `scePthreadSelf` calls from `libScePosix` self-cache refresh wrapper; the wrapper calls `scePthreadSelf`, compares the result with a game-managed global self-cache, and loops when they differ | **ROOT-CAUSE** | the game's TLS/global self-cache slot is never populated with the real pthread handle by SharpEmu; the wrapper refreshes it every iteration but the comparison target also changes (or is read via FS which has no guest base). Theory T1 (populate the TLS self-cache at thread creation) is the fix path. Theory T2 (cancel-type byte) applied but **insufficient alone** — the spin is in the wrapper-level global-cache comparison, not the thread-list walk | `b855a81` (T2 applied, insufficient alone) |
 | H7 | All 16 JobWorkers blocked on `sceKernelWaitEventFlag` wake=`event_flag:0x4` | **OPEN** | whatever should set flag 4 never does — likely the preload work the spinner should dispatch; fixing H6 fixes this | — |
 | H8 | FMOD mixer/AudioOut semaphore ping-pong runs forever (count 43k+ with waiters=0) | **SYMPTOM** | mixer alive but game never submits audio work because main thread spins; H6 fix resolves | — |
 
@@ -191,7 +192,11 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 2. **Mortal Shell M6** — write-watch the last placeholder address
    (`0x…56F60000`); if the guest never rewrites it, instrument the CPU upload
    path that should bind the real texture.
-3. **Hellboy H6** — cheapest untested change: also write the cancel-type byte
-   (`+0x12E`) on every synthesized thread object (theory T2), re-run, check
-   whether the spin terminates; if not, use the spin-loop register dump to
-   find the guard global (theory T3).
+3. **Hellboy H6** — implement theory T1: hook `scePthreadCreate` /
+   `scePthreadSelf` to write the thread handle into the game's own TLS
+   self-cache slot (the wrapper's `[tls+0x58]`). This requires identifying
+   the exact TLS offset the game's wrapper reads — the spin-loop register
+   dump shows the wrapper loads the cached value from `[rip+offset]`, which
+   is a process-global, not TLS. Next: use the spin-loop register dump
+   (already in place) to find the global address, then write the correct
+   handle there from `scePthreadSelf`.

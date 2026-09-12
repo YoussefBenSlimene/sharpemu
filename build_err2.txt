@@ -1,0 +1,20 @@
+﻿  Determining projects to restore...
+  All projects are up-to-date for restore.
+  SharpEmu.Logging -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.Logging.dll
+  SharpEmu.LibAtrac9 -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.LibAtrac9.dll
+  SharpEmu.SourceGenerators -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\netstandard2.0\SharpEmu.SourceGenerators.dll
+  SharpEmu.HLE -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.HLE.dll
+  SharpEmu.ShaderCompiler -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.ShaderCompiler.dll
+  SharpEmu.ShaderCompiler.Vulkan -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.ShaderCompiler.Vulkan.dll
+  SharpEmu.ShaderCompiler.Metal -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.ShaderCompiler.Metal.dll
+  SharpEmu.Libs -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.Libs.dll
+  SharpEmu.Core -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.Core.dll
+  SharpEmu.Debugger -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.Debugger.dll
+  SharpEmu.GUI -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\SharpEmu.GUI.dll
+  SharpEmu.CLI -> C:\ps5-emulator\sharpemu\artifacts\bin\Debug\net10.0\win-x64\SharpEmu.dll
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:15.17
