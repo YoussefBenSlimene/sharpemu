@@ -87,9 +87,15 @@ public static unsafe class GuestImageWriteTracker
 
     private static RangeSnapshot _rangeSnapshot = RangeSnapshot.Empty;
 
+    // Enabled by default (was opt-in via SHARPEMU_GUEST_IMAGE_CPU_SYNC=1).
+    // UE4 titles (Mortal Shell) stream textures via CPU writes that must be
+    // detected for the GPU image to refresh. Without the tracker, streamed
+    // textures stay as 1×1 black placeholders. Disable with
+    // SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC=1 if the VirtualProtect overhead
+    // is problematic for a specific title.
     private static readonly bool _enabled =
-        string.Equals(
-            Environment.GetEnvironmentVariable("SHARPEMU_GUEST_IMAGE_CPU_SYNC"),
+        !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC"),
             "1",
             StringComparison.Ordinal);
     private static readonly (bool Wildcard, ulong[] Addresses) _lifetimeTraceFilter =
