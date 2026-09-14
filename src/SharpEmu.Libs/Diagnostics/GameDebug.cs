@@ -81,5 +81,53 @@ public static class GameDebug
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Reads the raw texel data at a texture address and reports whether it's
+    /// all zeros (uninitialized) or has content. Called for 1×1 placeholder
+    /// textures to distinguish "never uploaded" from "uploaded black".
+    /// </summary>
+    public static void CheckTextureContent(SharpEmu.HLE.ICpuMemory memory, ulong texelAddress, uint format, uint width, uint height)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        try
+        {
+            var bytesPerPixel = format switch { 10 => 4, 14 => 16, _ => 4 };
+            var totalBytes = (int)(width * height * bytesPerPixel);
+            if (totalBytes <= 0 || totalBytes > 65536)
+            {
+                totalBytes = 64;
+            }
+
+            var data = new byte[totalBytes];
+            if (!memory.TryRead(texelAddress, data))
+            {
+                Once($"texel-{texelAddress:X16}", $"texel read FAILED at 0x{texelAddress:X16} ({totalBytes} bytes)");
+                return;
+            }
+
+            var nonzero = 0;
+            foreach (var b in data)
+            {
+                if (b != 0)
+                {
+                    nonzero++;
+                }
+            }
+
+            Once(
+                $"texel-{texelAddress:X16}",
+                $"texel content at 0x{texelAddress:X16}: {nonzero}/{totalBytes} nonzero bytes " +
+                $"fmt={format} {width}x{height} hex={HexPreview(data, 16)}");
+        }
+        catch
+        {
+            // Diagnostics only.
+        }
+    }
+
     private static readonly HashSet<string> _onceKeys = new();
 }
