@@ -71,7 +71,8 @@ real streamed ones.
 | M6 | One remaining 1×1 placeholder at `addr=0x2004550000 pc=0x50 tile=1 fmt=10` — still-uncovered descriptor binding path (the PREVIOUS placeholder at `0x…56F60000` was fixed by the DCC publish + GPU-residency gate) | **OPEN** | suspected: the game's streaming upload writes texels via CPU memcpy into the descriptor's backing memory, but the guest write-tracker is disabled on Windows by default → the GPU image is never refreshed (stale-black). Confirm with write-watch on `0x2004550000` or enable the tracker via env | — |
 | M8 | Draw throughput improved after the AGC fixes: 87k work items per 90 s (was ~60k), 50 presents, 198 draws sampled — double-buffer chain verified correct | **IMPROVED** | DCC fast-clear publishing + texture GPU-residency gate + format-14 wildcard | `2a75ad4` |
 | M9 | **RenderThread 1 blocked** on `pthread_cond_wait` (wake=`pthread_cond_waiter:243619`); AgcSubmissionThread also blocked; RenderThread 0 **exited** with 434k imports; PoolThread 13-18 all blocked; meanwhile RHIThread is Running (543k imports) and FAsyncLoadingThread is Running (1.2M imports) — the render coordination thread is stuck, so no new frames are dispatched to the GPU | **ROOT-CAUSE** | UE4's game thread should signal RenderThread 1 to start the next frame; that signal never fires because the main/entry thread (not in snapshots — runs on the host entry stack) is blocked or waiting for an async operation that never completes. Same pattern as Hellboy H7: a coordination thread blocks on a cond-var that nobody signals | — |
-| M10 | `FAsyncLoadingThread` Running with 1.2M imports (NID `EgmLo6EWgso` = `sceKernelWaitSema` or similar) — the async loader is actively loading but never finishes, keeping the render thread blocked | **OPEN** | the loader may be waiting for a file I/O that SharpEmu's IFS doesn't resolve, or a dependency graph that never completes | — |
+| M10 | `FAsyncLoadingThread` Running with 1.2M imports (NID `EgmLo6EWgso` = `scePthreadRwlockUnlock`) — the async loader is actively loading but never finishes, keeping the render thread blocked | **OPEN** | the loader may be waiting for a file I/O that SharpEmu's IFS doesn't resolve, or a dependency graph that never completes | — |
+| M11 | **GPU compute queue deadlock**: `acb.compute[32]` WAIT_REG_MEM suspends with `producer=none-observed` — no graphics-queue RELEASE_MEM ever wrote the awaited label. Correlates with FPS dropping to 2-4 before crash. Upstream #770 tried to fix and was reverted | **ROOT-CAUSE** | the compute queue's fence waits are registered in `GpuWaitRegistry` but no matching producer (RELEASE_MEM from the graphics queue) is ever registered for the same label address. The graphics queue's releases either target different addresses or are processed after the compute wait times out. The DCC publishing fix (M2) added more GPU images but didn't fix the fence-matching | — |
 
 **Theories (unconfirmed — do not re-derive blindly):**
 
@@ -80,10 +81,18 @@ real streamed ones.
   descriptor `0x…56F60000` is the one blocked in `sceKernelWaitSema`.
 - T2: the composite pixel shader may sample mip LOD ≠ 0; the placeholder has
   `maxMip=0`, and sampling a LOD ≠ 0 on a 1×1 returns black regardless.
-- T3: guest write-tracker is **disabled** on Windows by default; if the real
-  streamed texture is uploaded via CPU memcpy into the same address, the GPU
-  image is never refreshed (stale-black). Confirm with write-watch on the
-  placeholder address.
+- T3: ~~guest write-tracker is disabled on Windows by default~~ **RULED OUT** —
+  the write tracker was enabled by default in commit `56bad5f`
+  (`SHARPEMU_GUEST_IMAGE_CPU_SYNC` inverted to
+  `SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC`), and the 1×1 placeholders
+  persist even with tracking on. The real cause is M9/M11: the render
+  coordination thread is blocked, so the streaming upload never gets
+  dispatched, regardless of whether the tracker can detect it.
+
+**Ruled out:**
+
+- Write-tracker disabled (T3): tracker is now default-on, placeholders persist → the issue is the blocked render thread, not the tracker
+- EDEADLK from scePthreadMutexLock (M7): matches PS5/FreeBSD semantics, game handles it
 
 **Repro:** `run_mortal_shell_dbg.ps1` (90 s, GAME-DBG draw/present on).
 
@@ -186,18 +195,20 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 
 ## Next-session priorities (expected-value order)
 
-1. **Quake II Q4** — disassemble the `Com_Error` caller (`frame#0
-   ret=0x80053BE5D`); the message global's address falls out of that
-   disassembly, then trace which subsystem failed to set it. Q5 (loose asset
-   dirs) is a zero-code test if a fuller game dump is available.
-2. **Mortal Shell M6** — write-watch the last placeholder address
-   (`0x…56F60000`); if the guest never rewrites it, instrument the CPU upload
-   path that should bind the real texture.
-3. **Hellboy H6** — implement theory T1: hook `scePthreadCreate` /
-   `scePthreadSelf` to write the thread handle into the game's own TLS
-   self-cache slot (the wrapper's `[tls+0x58]`). This requires identifying
-   the exact TLS offset the game's wrapper reads — the spin-loop register
-   dump shows the wrapper loads the cached value from `[rip+offset]`, which
-   is a process-global, not TLS. Next: use the spin-loop register dump
-   (already in place) to find the global address, then write the correct
+1. **Mortal Shell M11 (compute queue deadlock)** — the compute queue's
+   WAIT_REG_MEM never sees a producer. Read the #770 revert diff to understand
+   the fence tracking mechanism, then add producer-lookup logging at wait
+   registration to determine if the graphics queue's RELEASE_MEM is targeting
+   a different address or if the fence matching is broken. Must re-test
+   against Dreaming Sarah.
+2. **Mortal Shell M9/M6** — the render coordination blockage (RenderThread 1
+   blocked, RenderThread 0 exited) is the umbrella cause of the black screen:
+   the streaming upload thread can't run because the render pipeline is
+   stalled. Fixing M11 (compute queue deadlock) may unblock the render
+   pipeline and allow the streaming upload to proceed, which would fix both
+   M6 and M9 simultaneously.
+3. **Hellboy H6** — implement theory T1: use the spin-loop register dump to
+   find the game's TLS self-cache global address, then write the correct
    handle there from `scePthreadSelf`.
+4. **Quake II Q4** — disassemble the `Com_Error` caller (`frame#0
+   ret=0x80053BE5D`) to find the unset message global.
