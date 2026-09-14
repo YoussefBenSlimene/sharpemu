@@ -1,7 +1,7 @@
 # Run Mortal Shell with GAME-DBG diagnostics for a fixed time, then kill.
 $ErrorActionPreference = "Stop"
 
-$timerSeconds = 90
+$timerSeconds = 300
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFile = "ms_dbg_$stamp.txt"
 $exePath = (Resolve-Path "artifacts\bin\Debug\net10.0\win-x64\SharpEmu.exe").Path
