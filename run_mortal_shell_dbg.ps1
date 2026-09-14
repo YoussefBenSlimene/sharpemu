@@ -11,6 +11,8 @@ if (-not (Test-Path $exePath)) { Write-Host "ERROR: exe missing"; exit 1 }
 if (-not (Test-Path $gamePath)) { Write-Host "ERROR: game missing"; exit 1 }
 
 $env:SHARPEMU_WRITABLE_APP0 = "1"
+$env:SHARPEMU_GUEST_IMAGE_CPU_SYNC = "1"
+$env:SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS = "1"
 
 Write-Host "Starting Mortal Shell with $timerSeconds second timer..."
 Write-Host "Log: $logFile"
