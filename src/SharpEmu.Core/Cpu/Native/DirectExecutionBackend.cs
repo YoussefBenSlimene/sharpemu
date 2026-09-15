@@ -263,6 +263,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	[ThreadStatic]
 	private static DirectExecutionBackend? _activeExecutionBackend;
 
+	// True on GuestExecutionRunner CLR threads: guest stubs must not run above
+	// this thread's managed frames (CLR FailFast — see GuestExecutionRunner).
+	[ThreadStatic]
+	private static bool _onGuestExecutionRunnerThread;
+
 	[ThreadStatic]
 	private static CpuContext? _activeCpuContext;
 
@@ -578,6 +583,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		private void ThreadMain()
 		{
+			// Marks this CLR thread for the continuation executor (see
+			// GuestExecutionRunner.ThreadMain): guest stubs must never run above
+			// this thread's managed frames.
+			_onGuestExecutionRunnerThread = true;
 			var previousGuestThreadHandle = GuestThreadExecution.EnterGuestThread(_guestThreadHandle);
 			try
 			{
@@ -660,6 +669,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		private void ThreadMain(ulong guestThreadHandle)
 		{
+			// Marks this CLR thread for the continuation executor: a guest stub
+			// must never run above this thread's CLR-managed frames (the CLR
+			// FailFasts with "UnmanagedCallersOnly method from managed code"
+			// under GC/stack-walk pressure — Mortal Shell's UE4 task graph hits
+			// this within minutes). Continuations scheduled here are routed
+			// through the pooled native workers instead.
+			_onGuestExecutionRunnerThread = true;
 			var previousGuestThreadHandle = GuestThreadExecution.EnterGuestThread(guestThreadHandle);
 			try
 			{
@@ -682,6 +698,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			finally
 			{
+				_onGuestExecutionRunnerThread = false;
 				GuestThreadExecution.RestoreGuestThread(previousGuestThreadHandle);
 			}
 		}
@@ -5246,6 +5263,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		var continuationThread = new Thread(() =>
 		{
+			// Marks this CLR thread for the continuation executor (see
+			// GuestExecutionRunner.ThreadMain): guest stubs must never run above
+			// this thread's managed frames.
+			_onGuestExecutionRunnerThread = true;
 			var previousGuestThreadHandle = GuestThreadExecution.EnterGuestThread(guestThreadHandle);
 			try
 			{
@@ -5253,6 +5274,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			finally
 			{
+				_onGuestExecutionRunnerThread = false;
 				GuestThreadExecution.RestoreGuestThread(previousGuestThreadHandle);
 			}
 		})
@@ -6035,23 +6057,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				// TBB execute-AV recover needs native-worker TLS (eligible/done).
-				// Other guests stay on CallNativeEntry — full native-worker migration
-				// increased splash hangs / UnmanagedCallersOnly (tLTN/tLTO).
 				int nativeReturn;
-				if (name == "tbb_thead")
-				{
-					nativeReturn = RunGuestEntryStub(ptr, hostRspSlot, requireNativeWorker: true);
-				}
-				else
-				{
-					if (!TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot))
-					{
-						reason = "failed to bind host-RSP storage for guest thread stub";
-						return GuestNativeCallExitReason.Exception;
-					}
-					nativeReturn = CallNativeEntry(ptr);
-				}
+				// All guest thread starts from managed HLE (TryCallGuestFunction
+				// callbacks) must run on a pooled native worker: the stub is
+				// entered from managed code here, so an inline calli would place
+				// guest code above managed frames on this thread. The CLR
+				// FailFasts that stack under GC/stack-walk pressure. tbb_thead
+				// additionally needs native-worker TLS for its execute-AV
+				// recovery.
+				nativeReturn = RunGuestEntryStub(ptr, hostRspSlot, requireNativeWorker: true);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -6202,19 +6216,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			try
 			{
 				int nativeReturn;
-				if (name == "tbb_thead")
-				{
-					nativeReturn = RunGuestEntryStub(ptr, hostRspSlot, requireNativeWorker: true);
-				}
-				else
-				{
-					if (!TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot))
-					{
-						reason = "failed to bind host-RSP storage for guest continuation stub";
-						return GuestNativeCallExitReason.Exception;
-					}
-					nativeReturn = CallNativeEntry(ptr);
-				}
+				// All guest continuations must run on a pooled native worker: the
+				// stub is entered from managed code here (an HLE export resumed a
+				// blocked thread), so an inline calli would place guest code above
+				// managed frames on this thread. The CLR FailFasts that stack under
+				// GC/stack-walk pressure ("UnmanagedCallersOnly method from managed
+				// code" — Mortal Shell's UE4 task graph dies within minutes).
+				// tbb_thead additionally needs native-worker TLS for its execute-AV
+				// recovery.
+				nativeReturn = RunGuestEntryStub(ptr, hostRspSlot, requireNativeWorker: true);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";

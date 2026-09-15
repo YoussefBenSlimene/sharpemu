@@ -7139,20 +7139,57 @@ public static partial class AgcExports
             return false; // cannot evaluate the label — do not stall the DCB
         }
 
-        GpuWaitRegistry.Register(waitAddress, waiter);
-        var gpuState = _submittedGpuStates.GetValue(
+        var waitGpuState = _submittedGpuStates.GetValue(
             CanonicalMemory(ctx.Memory),
             static _ => new SubmittedGpuState());
-        EnsureGpuWaitMonitor(ctx, gpuState);
-        TryForceSubmitOrphanPreamble(ctx, gpuState, waitAddress);
-        
+
+        // A compute-queue WAIT_REG_MEM whose label no parsed packet ever wrote
+        // is a CP-firmware completion fence: on hardware the firmware writes the
+        // completion value when the dispatches preceding the wait in this same
+        // submission finish. SharpEmu observes those dispatches instantaneously
+        // (ObserveComputeDispatch) and never models the firmware label write, so
+        // every such fence would park the serial parser for the producerless
+        // deadline — UE4 async-compute fences otherwise throttle the render
+        // pipeline to one submission per deadline period. Write the completion
+        // value the firmware would have written and keep parsing. The write
+        // deliberately bypasses RecordProduced so recycled fence labels (the
+        // game resets the label to 0 and waits for 1 again every frame) keep
+        // autocompleting; a genuine in-stream producer (write_data or
+        // release_mem parsed earlier) would have already set the label, so this
+        // path only runs while the fence is genuinely unsignalled.
+        if (!ReferenceEquals(state, waitGpuState.Graphics) &&
+            compareFunction == 3 &&
+            (reference & mask) != 0 &&
+            !GpuWaitRegistry.Compare(waiter, currentValue))
+        {
+            TraceAgc(
+                $"agc.compute_fence_autocomplete label=0x{waitAddress:X16} " +
+                $"queue={state.QueueName} submission={state.ActiveSubmissionId} " +
+                $"ref=0x{reference:X16} dispatches={state.FrameDispatchCount}");
+            var completionValue = reference & mask;
+            if (is64Bit)
+            {
+                ctx.TryWriteUInt64(waitAddress, completionValue);
+            }
+            else
+            {
+                TryWriteUInt32(ctx, waitAddress, unchecked((uint)completionValue));
+            }
+
+            return false;
+        }
+
+        GpuWaitRegistry.Register(waitAddress, waiter);
+        EnsureGpuWaitMonitor(ctx, waitGpuState);
+        TryForceSubmitOrphanPreamble(ctx, waitGpuState, waitAddress);
+
         // Cross-queue submission pumping: when a compute queue suspends on a wait,
         // pump the graphics queue to process pending submissions that might produce
         // the awaited label. This addresses the cross-queue synchronization gap where
         // the compute queue waits on a label written by the graphics queue.
-        if (state != gpuState.Graphics && !gpuState.Graphics.IsSuspended)
+        if (state != waitGpuState.Graphics && !waitGpuState.Graphics.IsSuspended)
         {
-            PumpSubmittedQueue(ctx, gpuState, gpuState.Graphics);
+            PumpSubmittedQueue(ctx, waitGpuState, waitGpuState.Graphics);
         }
         
         TraceWaitProducerState(
