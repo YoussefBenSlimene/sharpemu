@@ -34,9 +34,9 @@ title installed under `C:\ps5-emulator\ps5-games`. For each game it tracks:
 | Title ID | Name | Engine | Last status |
 |---|---|---|---|
 | PPSA02929 | Dreaming Sarah | custom | **PLAYABLE** — reference title |
-| PPSA02868 | Mortal Shell: Enhanced Edition | Unreal Engine 4 | **BOOTS** — full init, audio, ~68k draws, black screen |
-| PPSA09477 | Quake II (2023) | KEX Engine | **BOOTS** — renders, reaches "Installation" menu, then abort |
-| PPSA11264 | Hellboy: Web of Wyrd | Unity (IL2CPP + FMOD) | **BOOTS** — no crash, 135M+ imports, audio; main thread spins |
+| PPSA02868 | Mortal Shell: Enhanced Edition | Unreal Engine 4 | **BOOTS** — full init, 100M+ imports, texture streaming active, FailFast largely fixed; black screen persists |
+| PPSA09477 | Quake II (2023) | KEX Engine | **BOOTS** — renders, **NO abort** (CheckAvailability OK), alive 120s+ |
+| PPSA11264 | Hellboy: Web of Wyrd | Unity (IL2CPP + FMOD) | **BOOTS** — no crash, FailFast 0; import throughput needs 16-worker env (default 2) |
 
 ---
 
@@ -72,7 +72,8 @@ real streamed ones.
 | M8 | Draw throughput improved after the AGC fixes: 87k work items per 90 s (was ~60k), 50 presents, 198 draws sampled — double-buffer chain verified correct | **IMPROVED** | DCC fast-clear publishing + texture GPU-residency gate + format-14 wildcard | `2a75ad4` |
 | M9 | **RenderThread 1 blocked** on `pthread_cond_wait` (wake=`pthread_cond_waiter:243619`); AgcSubmissionThread also blocked; RenderThread 0 **exited** with 434k imports; PoolThread 13-18 all blocked; meanwhile RHIThread is Running (543k imports) and FAsyncLoadingThread is Running (1.2M imports) — the render coordination thread is stuck, so no new frames are dispatched to the GPU | **ROOT-CAUSE** | UE4's game thread should signal RenderThread 1 to start the next frame; that signal never fires because the main/entry thread (not in snapshots — runs on the host entry stack) is blocked or waiting for an async operation that never completes. Same pattern as Hellboy H7: a coordination thread blocks on a cond-var that nobody signals | — |
 | M10 | `FAsyncLoadingThread` Running with 1.2M imports (NID `EgmLo6EWgso` = `scePthreadRwlockUnlock`) — the async loader is actively loading but never finishes, keeping the render thread blocked | **OPEN** | the loader may be waiting for a file I/O that SharpEmu's IFS doesn't resolve, or a dependency graph that never completes | — |
-| M11 | **GPU compute queue deadlock**: `acb.compute[32]` WAIT_REG_MEM suspends with `producer=none-observed` — no graphics-queue RELEASE_MEM ever wrote the awaited label. Correlates with FPS dropping to 2-4 before crash. Upstream #770 tried to fix and was reverted | **ROOT-CAUSE** | the compute queue's fence waits are registered in `GpuWaitRegistry` but no matching producer (RELEASE_MEM from the graphics queue) is ever registered for the same label address. The graphics queue's releases either target different addresses or are processed after the compute wait times out. The DCC publishing fix (M2) added more GPU images but didn't fix the fence-matching | — |
+| M11 | **GPU compute queue deadlock**: `acb.compute[32]` WAIT_REG_MEM suspends with `producer=none-observed` — no graphics-queue RELEASE_MEM ever wrote the awaited label. Correlates with FPS dropping to 2-4 before crash. Upstream #770 tried to fix and was reverted | **FIX (landed, unverified in-game)** | compute-queue WAIT_REG_MEM fences are CP-firmware completion fences: the parser now writes the completion value the firmware would have written and keeps parsing (scoped to compute queues; bypasses `RecordProduced` so recycled labels keep autocompleting). Armed but not yet observed firing — game stalls before reaching compute fences in test runs | `0872285` |
+| M12 | **CLR FailFast**: "UnmanagedCallersOnly method from managed code" killed the process within minutes of the first present (UE4 task-graph threads entered guest stubs via inline calli from managed frames — guest code above managed frames on that thread) | **PARTLY FIXED** | all guest continuations (`ExecuteGuestContinuationEntry`) and managed-HLE thread starts (`ExecuteGuestThreadEntry`) now route through pooled native workers + `[ThreadStatic]` runner-thread markers. 0 FailFast in most runs; 1 per ~100M imports still fires intermittently with no stack trace | `0872285` |
 
 **Theories (unconfirmed — do not re-derive blindly):**
 
@@ -100,10 +101,11 @@ real streamed ones.
 
 ## PPSA09477 — Quake II (KEX Engine)
 
-**Status: BOOTS, renders, reaches "Installation" menu, then aborts.** Fast
-boot, full KEX init (RHI, 40+ shader programs, audio 48 kHz/8ch, mapdb with
-232 maps loaded from pak0.pak), frames submitted to the display buffers. The
-run ends with the game's own `Com_Error` → `abort()`.
+**Status: BOOTS, renders, alive 120s+ — no abort.** Fast boot, full KEX init
+(RHI, 40+ shader programs, audio 48 kHz/8ch, mapdb with 232 maps loaded from
+pak0.pak), frames submitted to the display buffers. `kexSocialManagerPSN::
+CheckAvailability: result 0x00000000` (was `0x80550006` signed-out →
+`Com_Error` → `abort()` immediately after "Running game session").
 
 | # | Problem | Status | Root cause | Fix commit |
 |---|---|---|---|---|
@@ -152,7 +154,7 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 | H7 | All 16 JobWorkers blocked on `sceKernelWaitEventFlag` wake=`event_flag:0x4` | **OPEN** | whatever should set flag 4 never does — likely the preload work the spinner should dispatch; fixing H6 fixes this | — |
 | H8 | FMOD mixer/AudioOut semaphore ping-pong runs forever (count 43k+ with waiters=0) | **SYMPTOM** | mixer alive but game never submits audio work because main thread spins; H6 fix resolves | — |
 
-**Theories:**
+**Theories (unconfirmed — do not re-derive blindly):**
 
 - T1: hook the game's pthread-create wrapper so the **self-cache slot**
   (`[tls+0x58]` in the wrapper's TLS) is pre-populated with the handle at
@@ -165,6 +167,18 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 - T3: the spin may be an infinite `pthread_once`-style init: the guard at the
   loop head tests a global our HLE never sets. The spin-loop register dump
   (in place) will show the exact global address.
+- T4: with native-worker routing (commit `0872285`) the import throughput
+  dropped (242k in 150 s vs 135M+ before) under the default
+  `SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT=2` — continuations serialize. Retry
+  with `SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT=16` (or raise the default in
+  `DirectExecutionBackend.NativeWorker.cs`) before concluding the routing
+  regressed throughput.
+- T5: the render loop spams `[DEBUG][PRINF] Wanted to force a call to
+  sce::Agc::suspendPoint but not safe` — our `agc.flip_wait_safe` /
+  `GuestGpu.Current.SubmitOrderedGuestFlipWait` gate rejects the forced
+  suspendPoint. Check the `RWaitFlipDone` handling in `AgcExports.cs`
+  (~line 5265): the flip-wait sequence may never advance because guest GPU
+  flip accounting is stuck.
 
 **Repro:** `run_hellboy_test.ps1` (detached; snapshots + GAME-DBG on).
 
@@ -180,6 +194,7 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 | TLS thread-pointer load fault-time recovery (upstream #791) | `51fc8f7` | all (safety net) |
 | DCC fast-clear publishes GPU images; texture skip needs GPU residency; format-14 wildcard (upstream #853 #860) | `2a75ad4` | Mortal Shell, any UE4 title |
 | GAME-DBG draw/present/compute traces, hot-spin detector, abort call-site dump | `57f9a8d` `cb9dc9b` | all |
+| Guest continuations/thread-starts route through pooled native workers (CLR FailFast fix) + compute-fence autocomplete | `0872285` | Mortal Shell, Hellboy, Quake II, all titles with managed-HLE thread resume |
 
 ## Diagnostic tooling index
 
@@ -195,20 +210,23 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 
 ## Next-session priorities (expected-value order)
 
-1. **Mortal Shell M11 (compute queue deadlock)** — the compute queue's
-   WAIT_REG_MEM never sees a producer. Read the #770 revert diff to understand
-   the fence tracking mechanism, then add producer-lookup logging at wait
-   registration to determine if the graphics queue's RELEASE_MEM is targeting
-   a different address or if the fence matching is broken. Must re-test
-   against Dreaming Sarah.
-2. **Mortal Shell M9/M6** — the render coordination blockage (RenderThread 1
-   blocked, RenderThread 0 exited) is the umbrella cause of the black screen:
-   the streaming upload thread can't run because the render pipeline is
-   stalled. Fixing M11 (compute queue deadlock) may unblock the render
-   pipeline and allow the streaming upload to proceed, which would fix both
-   M6 and M9 simultaneously.
-3. **Hellboy H6** — implement theory T1: use the spin-loop register dump to
-   find the game's TLS self-cache global address, then write the correct
-   handle there from `scePthreadSelf`.
-4. **Quake II Q4** — disassemble the `Com_Error` caller (`frame#0
+1. **Verify M11 in-game** — the compute-fence autocomplete (commit `0872285`)
+   is armed but was never observed firing (`compute_fence_autocomplete` trace
+   absent — the game stalls before reaching compute fences). Re-run Mortal
+   Shell with `SHARPEMU_LOG_AGC=1` and grep for the trace; if absent, the
+   M9/M12 mutex coordination is still blocking compute submissions.
+2. **Mortal Shell M12 remainder** — the intermittent FailFast (1 per ~100M
+   imports, no stack trace) still fires with the native-worker routing in
+   place. Instrument `CallNativeEntry` call sites to find which managed
+   context still enters guest stubs (candidates: the main `ExecuteEntry`
+   path on the emulation thread, `TryCallGuestFunction` nested case).
+3. **Hellboy T4** — retry with `SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT=16`
+   (default is 2, continuations serialize); if throughput recovers, raise the
+   default in `DirectExecutionBackend.NativeWorker.cs` after a Sarah
+   regression check.
+4. **Hellboy T5** — the "suspendPoint but not safe" spam points at the
+   `agc.flip_wait_safe` gate (~line 5265 in `AgcExports.cs`): the forced
+   suspendPoint is rejected, so Unity's render loop never advances. Check
+   whether the `RWaitFlipDone` flip-wait sequence ever completes.
+5. **Quake II Q4** — disassemble the `Com_Error` caller (`frame#0
    ret=0x80053BE5D`) to find the unset message global.
