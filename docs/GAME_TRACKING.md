@@ -184,15 +184,32 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
   internal check fails. With the H6 livelock gone (16-worker default) the
   watchdog now prints "Forcing call to sce::Agc::suspendPoint to avoid TRC
   R5089 breach" — the check passes. No emulator-side fix needed.
-- T6: **new failure point after the livelock**: guest AV inside a
-  vectorized memcpy at `rad1Hdelgh8+0x2B5D9` (`0x805B79FB9`, RIP code
-  `vmovdqu [rdi],ymm0` — an AVX copy loop) with register `+0x30 =
-  0x00000006FFFFFFFF` (non-canonical), after
-  `sceKernelWaitSema TIMED_OUT` storms (`rdx=0x7FFFF01FB80C` — a stack
-  address passed as the timeout arg) and Unity printing
-  "cannot allocate system memory!". Same libScePosix pthread-path family
-  as the old remaining crash; needs the same kernel-managed
-  ScePthread-field root fix.
+- T6: **new failure point after the livelock (RACE, not deterministic —
+  disassembled 2026-09-15)**: guest AVs with a bad pointer in the
+  libScePosix-family pthread code inside `Il2CppUserAssemblies.prx`
+  (module `0Z2sdqi9LGg`, sub-mapping base `0x805B7D710`, il2cpp base
+  `0x805918000`). Site varies per run:
+  - run 1: AV inside a vectorized copy loop (`vmovdqu [rdi],ymm0` — a
+    realloc's old→new copy) called from a 32-byte-aligned growing
+    allocator at il2cpp `0x261FB9` (bounds-check, `call 0x30b200` alloc,
+    `and r14,~0x1f`, raw ptr at `[r14-8]`);
+  - run 2: `movzx edx, word [rdi+0x132]` in the pthread **cancel path**
+    (caller `0x274200` tests `[rdi+0x132] & 2` — cancel-type — then calls
+    `0x27b890` which reads `[rdi+0x132]` and `[rdi+0xd8]`), reached from
+    a pthread fn (frame#1 ret = il2cpp `0x27ECC3`) and eboot (frame#2).
+  The crashed rdi is a pthread object pointer that was never allocated or
+  already freed — the objects' `+0x58` self-cache IS populated (H1/H2
+  fixes verified working), so the gap is object **lifetime**/chain, not
+  the self-cache. Common precondition: `sceKernelWaitSema TIMED_OUT`
+  storms (consumer waits on a guest-memory semaphore `0x60000056D00`,
+  need=1, timeout pointer at the same stack slot `0x7FFFF01FB80C` across
+  runs; producer `4czppHBiriw` interleaved) — the game's cond-wait path
+  runs for the first time with the 16-worker default and handles
+  spurious timeouts, after which some pthread chain dereferences a stale
+  handle. Next: disassemble the frame#1 pthread fn (il2cpp `0x27ECC3`)
+  to find where the bad handle comes from (likely the create-path
+  self-cache — H6 theory T1: populate the TLS self-cache at thread
+  creation).
 
 **Repro:** `run_hellboy_test.ps1` (detached; snapshots + GAME-DBG on).
 
