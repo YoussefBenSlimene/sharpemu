@@ -898,6 +898,68 @@ public sealed partial class DirectExecutionBackend
 			}
 		}
 
+		// Hellboy T6: the pthread cancel path reads the game wrapper's
+		// +0x132 flag word with a pthread-t handle that was never allocated
+		// or already freed (crash rip inside Il2CppUserAssemblies.prx
+		// GnmChainedSubmissionContext-adjacent cancel code):
+		//   0F B7 97 32 01 00 00   movzx edx, word [rdi+0x132]
+		//   F6 87 32 01 00 00 02   test byte [rdi+0x132], 2
+		// with an invalid rdi. Repoint rdi at the current guest thread object
+		// (zeroed, 0x1000 bytes) and re-execute: +0x132 reads as 0, the
+		// cancel-type test falls through, and the subsequent +0xd8/+0x60
+		// reads stay in defined memory so the walk terminates normally.
+		if (rip >= 0x10000 &&
+			!string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_CANCEL_FLAG_RECOVERY"),
+				"1",
+				StringComparison.Ordinal))
+		{
+			var b = (byte*)rip;
+			var isCancelFlagWord = b[0] == 0x0F && b[1] == 0xB7 && b[2] == 0x97 &&
+				b[3] == 0x32 && b[4] == 0x01 && b[5] == 0x00 && b[6] == 0x00;
+			var isCancelFlagTest = b[0] == 0xF6 && b[1] == 0x87 &&
+				b[2] == 0x32 && b[3] == 0x01 && b[4] == 0x00 && b[5] == 0x00;
+			// Downstream link: the pthread-kind checker reads the object's
+			// +0xa kind byte (called with [node+0x40]+0x20; the node's +0x40
+			// comes from the per-type singleton dispatch, which returns 0 for
+			// an uninitialized table type):
+			//   0F B6 47 0A 83 F8 1D   movzx eax, byte [rdi+0xa]; cmp eax,0x1d
+			var isKindByteCheck = b[0] == 0x0F && b[1] == 0xB6 && b[2] == 0x47 &&
+				b[3] == 0x0A && b[4] == 0x83 && b[5] == 0xF8 && b[6] == 0x1D;
+			if (isCancelFlagWord || isCancelFlagTest || isKindByteCheck)
+			{
+				var objectBase = ReadCtxU64(contextRecord, 176); // RDI
+				var baseHigh = objectBase >> 47;
+				var invalidBase = objectBase < 0x1000 ||
+					(baseHigh != 0 && baseHigh != 0x1FFFF);
+				if (invalidBase && _guestSelfSubstitutions < 100_000)
+				{
+					// Self-referential block sized past the largest offset the
+					// cancel path dereferences (+0x132 flag, +0xd8, +0x60,
+					// +0x40): [x+0x40] == x so the +0x20-offset chains
+					// (rbx+0x20 -> checker reads [rbx+0x2a]) stay in-bounds,
+					// and all flags read as 0 so the walk terminates. The
+					// plain zeroed thread object faulted downstream at
+					// [0+0x40]+0x20 == 0x20 (its +0x40 is not a self-pointer).
+					var block = SharpEmu.Libs.Kernel.GuestAllocationBridge.RequestSelfReferential?.Invoke(0x140) ?? 0;
+					if (block != 0)
+					{
+						WriteCtxU64(contextRecord, 176, block);
+						var count = Interlocked.Increment(ref _guestSelfSubstitutions);
+						if (count <= 16 || (count & (count - 1)) == 0)
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][WARN] Guest cancel-flag rdi substitution #{count}: " +
+								$"rip=0x{rip:X16} rdi=0x{objectBase:X16} -> 0x{block:X16} (re-executing)");
+							Console.Error.Flush();
+						}
+
+						return true;
+					}
+				}
+			}
+		}
+
 		if (rip >= 0x10000)
 		{
 			// Hellboy: libScePosix allocates a list node whose backing call

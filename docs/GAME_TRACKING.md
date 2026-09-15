@@ -210,6 +210,26 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
   to find where the bad handle comes from (likely the create-path
   self-cache — H6 theory T1: populate the TLS self-cache at thread
   creation).
+- T7: **adapter progress (2026-09-16)**: the cancel-flag recovery
+  (`SHARPEMU_DISABLE_CANCEL_FLAG_RECOVERY=1` to disable) substitutes a
+  **self-referential 0x140 guest block** for the bad rdi at the
+  `+0x132` flag word / `+0xa` kind-byte reads and re-executes — the game
+  now survives both fault classes (3-4 substitutions per run; the plain
+  zeroed thread object faulted downstream at `[0+0x40]+0x20 == 0x20`
+  because its `+0x40` is not a self-pointer). Remaining root (disassembled
+  through 3 chain levels): the game's node objects (`0x138+` bytes,
+  layout `+0x40/+0x48` = self-or-cond, `+0x50` = sem, `+0x68` = attr,
+  `+0x70` = pthread obj, `+0x78` = self, `+0x132` = flags) get
+  `+0x40` from the per-type **singleton dispatch** `0x2779b0` — which
+  returns the per-type `.bss` global, and **0 for an uninitialized table
+  type** (`0x2778a0(table_entry,1)`: type = `[entry+8]>>0x10`; type 0 →
+  `xor eax,eax; ret`). The uninitialized type → `[node+0x40] = 0` →
+  downstream AVs at `[rbx+0x48]`/`[rax+0x2a]` that no register
+  substitution can cover (r14/rbx are computed earlier from the zero).
+  Root: the game's sync-object descriptor table type bytes are 0 — its
+  sync-object initialization never completes. Next: instrument the
+  singleton dispatch (il2cpp `0x2779b0`) to trace which table entries are
+  uninitialized and find the failed init that precedes it.
 
 **Repro:** `run_hellboy_test.ps1` (detached; snapshots + GAME-DBG on).
 
