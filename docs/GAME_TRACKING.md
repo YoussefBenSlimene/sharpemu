@@ -36,7 +36,7 @@ title installed under `C:\ps5-emulator\ps5-games`. For each game it tracks:
 | PPSA02929 | Dreaming Sarah | custom | **PLAYABLE** — reference title |
 | PPSA02868 | Mortal Shell: Enhanced Edition | Unreal Engine 4 | **BOOTS** — full init, 100M+ imports, texture streaming active, FailFast largely fixed; black screen persists |
 | PPSA09477 | Quake II (2023) | KEX Engine | **BOOTS** — renders, **NO abort** (CheckAvailability OK), alive 120s+ |
-| PPSA11264 | Hellboy: Web of Wyrd | Unity (IL2CPP + FMOD) | **BOOTS** — no crash, FailFast 0; import throughput needs 16-worker env (default 2) |
+| PPSA11264 | Hellboy: Web of Wyrd | Unity (IL2CPP + FMOD) | **BOOTS** — H6 livelock GONE (TRC watchdog forces suspendPoint); fails later in guest memcpy AV |
 
 ---
 
@@ -167,18 +167,32 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 - T3: the spin may be an infinite `pthread_once`-style init: the guard at the
   loop head tests a global our HLE never sets. The spin-loop register dump
   (in place) will show the exact global address.
-- T4: with native-worker routing (commit `0872285`) the import throughput
+- T4: ~~with native-worker routing (commit `0872285`) the import throughput
   dropped (242k in 150 s vs 135M+ before) under the default
-  `SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT=2` — continuations serialize. Retry
-  with `SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT=16` (or raise the default in
-  `DirectExecutionBackend.NativeWorker.cs`) before concluding the routing
-  regressed throughput.
-- T5: the render loop spams `[DEBUG][PRINF] Wanted to force a call to
+  `SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT=2` — continuations serialize~~
+  **FIXED** — the default is now 16 (verified: Sarah clean, Hellboy passes
+  the old H6 livelock entirely). Root cause of the drop: all guest
+  continuations route through the pooled native workers, and 2 in-flight
+  Runs serialized the UE4/Unity task graphs.
+- T5: ~~the render loop spams `[DEBUG][PRINF] Wanted to force a call to
   sce::Agc::suspendPoint but not safe` — our `agc.flip_wait_safe` /
   `GuestGpu.Current.SubmitOrderedGuestFlipWait` gate rejects the forced
-  suspendPoint. Check the `RWaitFlipDone` handling in `AgcExports.cs`
-  (~line 5265): the flip-wait sequence may never advance because guest GPU
-  flip accounting is stuck.
+  suspendPoint~~ **RESOLVED (downstream of H6)** — the message is Unity's
+  **TRC R5089 watchdog** in `GfxDevicePS5Core.cpp` (string pool at eboot
+  `0x1B1ED14`): Unity must periodically force `sce::Agc::suspendPoint`
+  (Sony TRC requirement) and prints "not safe...(%d seconds)" while its
+  internal check fails. With the H6 livelock gone (16-worker default) the
+  watchdog now prints "Forcing call to sce::Agc::suspendPoint to avoid TRC
+  R5089 breach" — the check passes. No emulator-side fix needed.
+- T6: **new failure point after the livelock**: guest AV inside a
+  vectorized memcpy at `rad1Hdelgh8+0x2B5D9` (`0x805B79FB9`, RIP code
+  `vmovdqu [rdi],ymm0` — an AVX copy loop) with register `+0x30 =
+  0x00000006FFFFFFFF` (non-canonical), after
+  `sceKernelWaitSema TIMED_OUT` storms (`rdx=0x7FFFF01FB80C` — a stack
+  address passed as the timeout arg) and Unity printing
+  "cannot allocate system memory!". Same libScePosix pthread-path family
+  as the old remaining crash; needs the same kernel-managed
+  ScePthread-field root fix.
 
 **Repro:** `run_hellboy_test.ps1` (detached; snapshots + GAME-DBG on).
 
@@ -210,23 +224,19 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 
 ## Next-session priorities (expected-value order)
 
-1. **Verify M11 in-game** — the compute-fence autocomplete (commit `0872285`)
+1. **Hellboy T6** — the new failure point after the H6 livelock: guest AV in
+   a vectorized memcpy (`0x805B79FB9`) with non-canonical `+0x30` after
+   `sceKernelWaitSema` TIMED_OUT storms. Same root fix family as the
+   remaining kernel-managed ScePthread fields (see investigation doc).
+2. **Verify M11 in-game** — the compute-fence autocomplete (commit `0872285`)
    is armed but was never observed firing (`compute_fence_autocomplete` trace
    absent — the game stalls before reaching compute fences). Re-run Mortal
    Shell with `SHARPEMU_LOG_AGC=1` and grep for the trace; if absent, the
    M9/M12 mutex coordination is still blocking compute submissions.
-2. **Mortal Shell M12 remainder** — the intermittent FailFast (1 per ~100M
+3. **Mortal Shell M12 remainder** — the intermittent FailFast (1 per ~100M
    imports, no stack trace) still fires with the native-worker routing in
    place. Instrument `CallNativeEntry` call sites to find which managed
    context still enters guest stubs (candidates: the main `ExecuteEntry`
    path on the emulation thread, `TryCallGuestFunction` nested case).
-3. **Hellboy T4** — retry with `SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT=16`
-   (default is 2, continuations serialize); if throughput recovers, raise the
-   default in `DirectExecutionBackend.NativeWorker.cs` after a Sarah
-   regression check.
-4. **Hellboy T5** — the "suspendPoint but not safe" spam points at the
-   `agc.flip_wait_safe` gate (~line 5265 in `AgcExports.cs`): the forced
-   suspendPoint is rejected, so Unity's render loop never advances. Check
-   whether the `RWaitFlipDone` flip-wait sequence ever completes.
-5. **Quake II Q4** — disassemble the `Com_Error` caller (`frame#0
+4. **Quake II Q4** — disassemble the `Com_Error` caller (`frame#0
    ret=0x80053BE5D`) to find the unset message global.

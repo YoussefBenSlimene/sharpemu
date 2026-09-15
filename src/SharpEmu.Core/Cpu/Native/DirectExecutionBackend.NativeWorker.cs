@@ -45,7 +45,12 @@ public sealed partial class DirectExecutionBackend
 			return Math.Clamp(parsed, 1, 64);
 		}
 
-		return 2;
+		// Default verified across the GAME_TRACKING M12 runs: Mortal Shell
+		// 6 min alive with FailFast 0, Hellboy/Quake II unaffected. The old
+		// default of 2 serialized every guest continuation through the pool
+		// (UE4 task graphs and the Hellboy PreloadManager collapsed from
+		// 135M+ to ~242k imports per run).
+		return 16;
 	}
 
 	private readonly object _nativeWorkerGate = new();
