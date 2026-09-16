@@ -243,6 +243,22 @@ public static class KernelPthreadCompatExports
             cancelType[0] = 1;
             _ = memory.TryWrite(secondary + 0x12E, cancelType);
             _ = memory.TryWrite(objectAddress + 0x12E, cancelType);
+            // Hellboy T7: the game's pthread wrapper objects (node-alloc
+            // layout: +0x40/+0x48 = self-or-cond, +0x50 = sem, +0x68 = attr,
+            // +0x78 = self, +0x132 = flags) are walked with
+            // `mov rbx,[x+0x40]; lea r14,[rbx+0x20]; call kind-checker`
+            // and the per-type singleton dispatch fills +0x40 only when the
+            // game's sync-object table type is initialized. On a zeroed
+            // kernel thread object that reaches this walk, +0x40 = 0 faults
+            // downstream at [0+0x40]+0x20 == 0x20. Write the self-pointer
+            // (the normal path when the attr has no cond) so the walk stays
+            // in-bounds and every flag reads as 0.
+            BinaryPrimitives.WriteUInt64LittleEndian(pointerBytes, objectAddress);
+            _ = memory.TryWrite(objectAddress + 0x40, pointerBytes);
+            _ = memory.TryWrite(objectAddress + 0x48, pointerBytes);
+            BinaryPrimitives.WriteUInt64LittleEndian(pointerBytes, secondary);
+            _ = memory.TryWrite(secondary + 0x40, pointerBytes);
+            _ = memory.TryWrite(secondary + 0x48, pointerBytes);
 
             var stats = AllocateZeroedGuestObject(allocator, memory, 0x100);
             if (stats == 0)

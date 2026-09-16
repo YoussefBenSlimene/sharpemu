@@ -230,6 +230,16 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
   sync-object initialization never completes. Next: instrument the
   singleton dispatch (il2cpp `0x2779b0`) to trace which table entries are
   uninitialized and find the failed init that precedes it.
+- T8: **+0x40/+0x48 self-pointer fix (2026-09-16)**: kernel thread
+  objects now also get `+0x40`/`+0x48` = self (the game's node-alloc
+  normal-path layout, matching `+0x58`/`+0x68`/`+0x00`). When the game's
+  wrapper walk reaches a zeroed kernel thread object (rdi=0 at the cancel
+  checker — the walk reads `mov rbx,[x+0x40]` first), the self-pointer
+  keeps every downstream chain hop in-bounds. Verified: Hellboy
+  substitutions 3-4 → **1** per run, AVs 1 → **0**; the crash moved to a
+  hardware-level fault (CET/CFG mitigation restart, no log entry —
+  needs child-process crash diagnostics). Sarah unaffected (39 presents,
+  FailFast 0).
 
 **Repro:** `run_hellboy_test.ps1` (detached; snapshots + GAME-DBG on).
 
