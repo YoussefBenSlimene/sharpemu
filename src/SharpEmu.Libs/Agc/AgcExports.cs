@@ -9487,6 +9487,33 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
                     $"op={binding.Opcode} storage={Gen5ShaderTranslator.RequiresStorageImage(binding, stageBindings)} " +
                     $"raw={FormatShaderDwords(binding.ResourceDescriptor)} — " +
                     "draw samples a 1x1 placeholder descriptor (streaming upload never re-bound?)");
+
+                // The shader address of the pass that samples the placeholder
+                // changes from boot to boot, so an operator cannot pre-set a
+                // shader-address trace for it. Dump this stage's whole binding
+                // set right here instead (once per placeholder address, same
+                // guard as above): the question that matters is whether the
+                // pass that samples a zero dummy also binds the real-sized
+                // texture whose content decides the frame.
+                foreach (var sibling in bindings)
+                {
+                    var siblingSummary =
+                        TryDecodeTextureDescriptor(
+                            sibling.ResourceDescriptor,
+                            out var siblingTexture)
+                            ? $"addr=0x{siblingTexture.Address:X16} " +
+                              $"{siblingTexture.Width}x{siblingTexture.Height} " +
+                              $"fmt={siblingTexture.Format} num={siblingTexture.NumberType} " +
+                              $"tile={siblingTexture.TileMode} type={siblingTexture.Type} " +
+                              $"mip={siblingTexture.BaseLevel}-{siblingTexture.LastLevel}/{siblingTexture.MaxMip}"
+                            : "undecodable";
+                    Console.Error.WriteLine(
+                        $"[LOADER][INFO] agc.texture_binding_sibling " +
+                        $"ps=0x{pixelShaderAddress:X16} pc=0x{sibling.Pc:X} " +
+                        $"op={sibling.Opcode} " +
+                        $"storage={Gen5ShaderTranslator.RequiresStorageImage(sibling, stageBindings)} " +
+                        siblingSummary);
+                }
             }
             else if (texture.Width > 1 && texture.Height > 1 &&
                      texture.Address != 0 &&

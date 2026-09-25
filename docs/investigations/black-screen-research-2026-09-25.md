@@ -241,6 +241,62 @@ never the *content the guest stored at it*.
 - Unity Texture Streaming: https://docs.unity3d.com/2019.1/Documentation/Manual/TextureStreaming.html
 - xemu zero-sized surfaces: https://github.com/xemu-project/xemu/issues/2516
 
+## 7. Measured bisect (2026-09-25) — what is actually wrong
+
+Three env-only experiments, all reading the presented image back, moved this
+from "some texture is a placeholder" to a single statement of the bug. All are
+reproducible with `run_ms_forcebisect.ps1`.
+
+| # | Experiment | Result | Meaning |
+|---|---|---|---|
+| 1 | `-Targets 0x8FC0000000,0x8FC2000000` (magenta fullscreen fragment + fullscreen vertex + default raster state, scoped to the flip buffers) | still `nonblack=0/2073600`, same hash | **inconclusive** — see M24: `AnyTargetAddressMatches` is only consulted in `CreateTranslatedDrawResources`, and the scoped path did not visibly fire. Verify with `SHARPEMU_DUMP_FIXED_SOLID_FRAGMENT=<path>`, which the presenter writes **iff** `forceSolidFragment` was true (source: `VulkanVideoPresenter:7438`) |
+| 2 | `-WhiteTextureTargets "*"` (every uploaded texture filled with `0xFF`; 765 uploads, incl. `3200x1800`, `1024x1024`, `64x64`) | one frame read back **`nonblack=2073600/2073600` — a fully white screen** | **the render/target/blit path works.** The composite executes and the present blit shows its output. The black frame is a *content* problem |
+| 3 | sibling dump on the pass that samples the placeholder | `ps=0x… pc=0x50 op=ImageSample storage=False addr=0x2004550000 1x1 fmt=10 num=0 tile=1 type=9 mip=0-0/0` — **the only image binding of that pass** | **the whole frame equals that single 1×1 texel.** Zero ⇒ flat black; `0xFF` ⇒ flat white. Nothing else enters the image |
+
+Consequences:
+
+- The five 1×1 placeholders reported by `agc.texture_1x1_linear_binding` are not
+  a harmless warning and not one input among many: for the pass that fills the
+  flip buffer, the 1×1 dummy **is the entire input**, so the frame is a flat
+  fill of its texel.
+- "Flat black" and "flat white" are the only two outputs observed, which rules
+  out any scene-content explanation for the current image: whatever the game
+  renders elsewhere never reaches the flip buffer through this pass.
+- The remaining question is therefore narrow and answerable: **what should that
+  1×1 image contain, and who should have written it?** Either
+  (i) the descriptor is a placeholder for a texture the guest never streamed
+  (M19/M20 — then the guest would also show a flat fill on hardware), or
+  (ii) we sample the wrong image for that descriptor (e.g. the address-0
+  fallback / a shared degenerate 1×1 image, which is why whitening *all*
+  textures changed the output even though this descriptor's own address was
+  never whitened).
+
+Discriminating experiment for (i) vs (ii): `run_ms_forcebisect.ps1
+-WhiteTextureTargets 0` whitens **only** address-0 fallbacks.
+
+| # | Follow-up | Result | Meaning |
+|---|---|---|---|
+| 4 | `-WhiteTextureTargets 0` (address-0 fallbacks only) | `texture_force_white` = **0 lines** (no address-0 fallback upload happened at all) and the frame stayed all-zero | the pass does **not** sample the address-0 fallback image; it samples the descriptor's own 1×1 image. So (ii) as written ("we substitute the fallback") is ruled out for the dumped pass |
+| 5 | `-TraceGuestTextureAddresses "*" -ForceTexelUpload` | 90 s produced only **1** `vk.texture_upload_contents` line (a 1024×1024 `R8Unorm` with `nonzero_bytes=1565/1048576`) | with the upload-known short-cut active, essentially **no texture upload path runs at all** — which is why the guest's texel content for the 1×1 has still not been observed. Re-run needs `SHARPEMU_TRACE_UPLOAD_KNOWN=1` (now forced on by the harness) to prove the force actually applied |
+
+So the open question is now exactly one sentence: **is the guest's 1×1 texel
+zero, or is it non-zero and we fail to sample it?** That is the difference
+between "the guest has not produced the texture yet" (upstream/streaming work)
+and "our texture binding drops the content" (a rendering fix here).
+
+Note the current best explanation for the flat fill being *black* rather than a
+1-pixel scene: the pass writes the single texel across the whole target (that is
+what a fullscreen draw sampling a 1×1 texture does), so the frame is a flat fill
+by construction. The wildcard run whitened 1×1 textures elsewhere in the chain
+and the flat fill turned white, confirming that the frame content is decided by
+1×1 placeholder content rather than by anything scene-shaped.
+
+Related tooling added while doing this: the sibling dump prints a pass' whole
+binding set once, in the same run that triggers the placeholder warning, because
+the composite's shader address changes on every boot (`0x2005B40000`,
+`0x2035DEC0000`, `0x394A140000` observed), which makes a pre-set
+`SHARPEMU_TRACE_PIXEL_SHADER_ADDRESS` useless for this pass.
+
 
 
 

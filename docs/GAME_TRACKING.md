@@ -90,6 +90,10 @@ separate, now-fixed crash (M12).
 | M20 | **Why is the real texture never streamed?** At 300 s the loading threads are still busy (`SlateLoadingThread2` 20.4 M imports, `FAsyncLoadingThread` 19.6 M, `DH_SaveGameThread` Running) | **OPEN (hypothesis)** | check the streaming path rather than the descriptor path: file I/O failures (`SHARPEMU_LOG_IO` / `LOG_OPEN`), async-file completions that never fire, or a GPU copy that never executes; and whether a loading UI ever reaches the flip buffers | — |
 | M21 | **`IsGuestImageUploadKnown` can answer "known" with no evidence.** With the write tracker off it calls `IsUntrackedGuestImageContentUnchanged`, which returns `true` (= *skip the upload*) whenever `byteCount == 0` — exactly the case for an address with no registered extent — so the caller builds the texture with `initialPixels: []` and the composite samples a GPU image nobody filled | **REFUTED as the black-screen cause** (mechanism real, safety valve added) | Forcing the copy with `SHARPEMU_FORCE_GUEST_TEXEL_UPLOAD=1` refused the short-cut **85 times / 83 addresses — including all 5 placeholder addresses** — and the presented image was **still `nonzero_bytes=0/8294400` on all 14 readbacks, identical hash**. So the skip is a genuine defect worth keeping the valve for (`SHARPEMU_TRACE_UPLOAD_KNOWN=1` audits it), but it does not change a single presented pixel. Prior art: shadPS4 Buffer Cache + PRs #4591/#4542 — see `docs/investigations/black-screen-research-2026-09-25.md` | instrumentation this session |
 | M22 | **Compute writes to storage images are never copied to the address' other representations.** `SharpEmu compute cs=… storage=0x…200CC20000 1x1 fmt10 1x1x1` — per `BuildComputeDebugName` the `1x1` is the *descriptor image size* and `1x1x1` the guest's *dispatch group count*; the writes land at 64 KB steps in the same address family as the placeholders | **OPEN (documented fix pattern)** | on the console, unified memory lets a texture at that address read the CS output directly; here each (address, format) is its own `VkImage`, so something must copy across. shadPS4's `storage_image_sync` does exactly that (download → re-tile → notify caches). See F2 in the research doc | — |
+| M23 | **The render/target/blit path works — the black frame comes from a zero-valued *input texture*.** With `SHARPEMU_FORCE_WHITE_TEXTURE_TARGETS=*` (765 texture uploads forced to 0xFF, including `3200x1800`, `1024x1024`, `64x64`) one presented frame read back **`nonblack=2073600/2073600` — a completely white 1920×1080 screen** (`hash=0xD0EEE7805AF4C325`) | **ROOT CAUSE NARROWED (measured)** | the composite that fills the flip image *does* execute and the present blit *does* show its output; the frame is black because a real-sized sampled input is zero at present time. The five 1×1 placeholder addresses were **not** among the forced textures (`force_white=False`) and the frame did not go black because they were zero ⇒ **the 1×1 dummies are a red herring for the final image** (correction to M6/T4/T6). Next: dump `ps=0x2005B40000`'s binding set and find which real address is zero, then why | — |
+| M24 | The target-scoped shader overrides (`SHARPEMU_FORCE_SOLID_FRAGMENT_TARGETS=0x8FC0000000,0x8FC2000000` + fullscreen vertex + default raster state) did **not** change the presented image (still `nonblack=0/2073600`) even though `CreateTranslatedDrawResources` is called with its targets by the offscreen path | **OPEN (debug-switch gap)** | either the address match fails for these draws or the override never reaches the pipeline. Verifiable without a rebuild: `SHARPEMU_DUMP_FIXED_SOLID_FRAGMENT=<path>` is written **iff** `forceSolidFragment` was true for some pipeline (`VulkanVideoPresenter:7438`) — `run_ms_forcebisect.ps1 -Targets …` now sets it | — |
+| M25 | **The pass that fills the flip buffer binds exactly ONE image — the 1×1 dummy.** From the new sibling dump (`agc.texture_binding_sibling`, printed once per placeholder address *in the same run*, which matters because the composite's shader address changes every boot: `0x2005B40000` in three runs, `0x2035DEC0000` in another): `ps=0x2005B40000 pc=0x50 op=ImageSample storage=False addr=0x2004550000 1x1 fmt=10 num=0 tile=1 type=9 mip=0-0/0` — and that is its **only** image binding | **ROOT CAUSE NARROWED (measured)** | the whole frame equals that single texel: flat black while it is zero, flat **white** when the 1×1 textures were forced white (M23). So the black screen reduces to *"what should that 1×1 image contain, and who should have written it"* — either the descriptor is a placeholder for a texture the guest never streamed (M19/M20), or we sample the wrong image for it (address-0 fallback / shared 1×1 path). Discriminating run: `run_ms_forcebisect.ps1 -WhiteTextureTargets 0`, which whitens **only** address-0 fallbacks | — |
+| M26 | Follow-ups to M25: whitening **only** address-0 fallbacks does nothing (`texture_force_white`=0 lines, frame still all-zero) ⇒ the pass samples the descriptor's **own** 1×1 image, not the fallback; and with the upload-known short-cut active a 90 s run emitted only **one** `vk.texture_upload_contents` line ⇒ the texture-upload path barely runs at all | **OPEN — exactly one question left** | *is the guest's 1×1 texel zero, or is it non-zero and we fail to sample it?* **Zero** ⇒ the guest never produced the texture (upstream: CS→texture sync / streaming — F2/M20). **Non-zero** ⇒ our binding discards the content (a rendering fix here). The harness now forces `SHARPEMU_TRACE_UPLOAD_KNOWN=1` so a force-upload arm can prove the force applied | — |
 | M12-old | (superseded) the pre-09-25 analysis attributed the FailFast to guest stubs entering via inline calli from managed frames on UE4 task-graph threads | **FIXED** | that mechanism was real (stale build stack) and was addressed by `0872285`; the *remaining* post-fix FailFast is M12 above (write tracker) | `0872285` |
 | M12-old | (superseded) the pre-09-25 analysis attributed the FailFast to guest stubs entering via inline calli from managed frames on UE4 task-graph threads | **FIXED** | that mechanism was real (stale build stack) and was addressed by `0872285`; the *remaining* post-fix FailFast is M12 above (write tracker) | `0872285` |
 
@@ -368,15 +372,23 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 
 ## Next-session priorities (expected-value order)
 
-1. **M20 — why the real texture is never streamed.** The descriptor question is
-   answered (M19: the guest keeps a 1×1 dummy for 300 s and the composite
-   faithfully renders it). So stop looking at the binding path and check the
-   streaming path: run with `SHARPEMU_LOG_IO=1` + `SHARPEMU_LOG_OPEN=1`
-   (`run_quake2_diag.ps1` shows the pattern) and look for texture reads that
-   fail or never complete, then whether the corresponding GPU upload ever
-   executes. Also confirm whether a loading UI ever reaches the flip buffers —
-   if it does, and it is also zero, the placeholder material is wider than one
-   slot.
+1. **Answer M26 — the single remaining question.** The frame *is* the content of
+   one 1×1 texel (M25), so the fix is decided by its content:
+   - Re-run `run_ms_forcebisect.ps1 -TraceGuestTextureAddresses "*"
+     -ForceTexelUpload` (the harness now forces `SHARPEMU_TRACE_UPLOAD_KNOWN=1`,
+     which the previous attempt lacked, so the force could not be confirmed) and
+     read `vk.texture_upload_contents` for the 1×1 descriptor address:
+     `center=`/`nonzero_bytes=` gives the guest's actual texel.
+   - **Non-zero texel + black frame** ⇒ we discard it: fix the binding path
+     (that is a rendering fix in this repo and the cheapest of all outcomes).
+   - **Zero texel** ⇒ the guest never wrote the texture: go to #2.
+2. **M22/F2 — find who should fill those textures.** The prime suspect is the
+   compute family writing **1×1 storage images** at 64 KB steps
+   (`storage=0x…200CC20000 1x1 fmt10 1x1x1`; 64 KiB = exactly one 128×128×4
+   tile, which is what a tiled copy looks like). Log the guest's raw dispatch
+   dimensions and the storage descriptor's raw words (mirroring the sibling
+   dump) to see whether the guest asked for a real size and we decoded/ran 1×1.
+   If the guest asked for 1×1 too, audit the HLE state it derives that from.
 2. **M11 — verify the compute-fence autocomplete.** The run now performs 60+
    compute dispatches, so re-run with `SHARPEMU_LOG_AGC=1` and grep for
    `compute_fence_autocomplete`.
