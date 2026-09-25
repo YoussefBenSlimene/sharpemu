@@ -95,6 +95,8 @@ separate, now-fixed crash (M12).
 | M25 | **The pass that fills the flip buffer binds exactly ONE image — the 1×1 dummy.** From the new sibling dump (`agc.texture_binding_sibling`, printed once per placeholder address *in the same run*, which matters because the composite's shader address changes every boot: `0x2005B40000` in three runs, `0x2035DEC0000` in another): `ps=0x2005B40000 pc=0x50 op=ImageSample storage=False addr=0x2004550000 1x1 fmt=10 num=0 tile=1 type=9 mip=0-0/0` — and that is its **only** image binding | **ROOT CAUSE NARROWED (measured)** | the whole frame equals that single texel: flat black while it is zero, flat **white** when the 1×1 textures were forced white (M23). So the black screen reduces to *"what should that 1×1 image contain, and who should have written it"* — either the descriptor is a placeholder for a texture the guest never streamed (M19/M20), or we sample the wrong image for it (address-0 fallback / shared 1×1 path). Discriminating run: `run_ms_forcebisect.ps1 -WhiteTextureTargets 0`, which whitens **only** address-0 fallbacks | — |
 | M26 | Follow-ups to M25: whitening **only** address-0 fallbacks does nothing (`texture_force_white`=0 lines, frame still all-zero) ⇒ the pass samples the descriptor's **own** 1×1 image, not the fallback; and with the upload-known short-cut active a 90 s run emitted only **one** `vk.texture_upload_contents` line ⇒ the texture-upload path barely runs at all | **OPEN — exactly one question left** | *is the guest's 1×1 texel zero, or is it non-zero and we fail to sample it?* **Zero** ⇒ the guest never produced the texture (upstream: CS→texture sync / streaming — F2/M20). **Non-zero** ⇒ our binding discards the content (a rendering fix here). The harness now forces `SHARPEMU_TRACE_UPLOAD_KNOWN=1` so a force-upload arm can prove the force applied | — |
 | M27 | **The guest asks for 1×1 everywhere and has written zero content there.** With `SHARPEMU_TRACE_STORAGE_IMAGE_INIT_ADDRESS=*` every compute storage target reports `size=1x1 pitch=1 logical_bytes=4 physical_bytes=65536 read=True nonzero=False initial_bytes=0` — the guest's **own** descriptors say 1×1, the emulator **does** read guest memory for them, and it is all zero. The sampled placeholder (`pc=0x50`, `1x1`, `addr=0x2004550000` this boot) is not even a storage target. Skipped sampled binds measured the same way: `vk.upload_known_skip … guest_bytes=00000000000000000000000000000000` | **EMULATOR SIDE CLOSED — the cause is guest state** | with M23/M25 this means the emulator is faithfully rendering what the guest asked for: one 1×1 zero texel per frame (flat black; flat white only when we inject content). Nothing on the rendering side is broken — raster, offscreen submission, present blit, forced uploads and DCC publish all demonstrably work. The remaining work is upstream of rendering: why the game only ever produces 1×1 with no content. Unity semantics make this concrete: 1×1 is the *smallest mip*, i.e. "nothing streamed yet" | — |
+| M28 | **The title is UE4 (`dungeonhaven`) and it reads its 8.69 GB pak successfully.** `SHARPEMU_LOG_OPEN=1`: `_open dir '…/dungeonhaven/content/paks'` (found), `stat '…/dungeonhaven-ps5.pak' result=found`, `apr_resolve … id=0xA2CB31C4 size=8694639526`. `SHARPEMU_LOG_AMPR=1` (90 s): **2150 `ampr.read_file` calls, every one `result=0`**, full byte counts (`size=0x739174 read=0x739174`, `0xB469DC`, `0x40000`), from the correct host path into guest destinations `0x2001xxxxxx`–`0x2003xxxxxx`. `ampr.get_size` returns the command-buffer size (0x4000); `apr.get_file_size` is never called | **I/O and the AMPR read path are healthy — refutes "the game cannot read its assets"** | so asset bytes do reach guest memory, and the loss happens *after* the read (decompress / copy into the final texture / upload). Next: fingerprint the read destination right after each read, then find the step that should move that data into the sampled texture address | — |
+| M29 | **Three false alarms caught and corrected while chasing this (do not re-report them as bugs)** | **RULED OUT** | 1. `fstat … size=0 dir=0` on the `saved/config/ps5/*.ini` files: those are opened with flags `0x601` (create/truncate), so size 0 at that moment is correct — `engine.ini` is 1061 bytes on disk. 2. `lseek … whence=1 pos=0`: `whence=1` is `SEEK_CUR` (`SeekCur = 1` in `KernelMemoryCompatExports`), not `SEEK_END`, so `pos=0` is just the current offset. 3. `case ReadFileRecordType: break;` in `AmprExports.CompleteCommandBuffer` looks like a skipped read, but the bytes are copied at **submit** time in `AprCommandBufferReadFile` → `TryReadFileToGuestMemory`, so the record case is a no-op by design | — |
 | M12-old | (superseded) the pre-09-25 analysis attributed the FailFast to guest stubs entering via inline calli from managed frames on UE4 task-graph threads | **FIXED** | that mechanism was real (stale build stack) and was addressed by `0872285`; the *remaining* post-fix FailFast is M12 above (write tracker) | `0872285` |
 | M12-old | (superseded) the pre-09-25 analysis attributed the FailFast to guest stubs entering via inline calli from managed frames on UE4 task-graph threads | **FIXED** | that mechanism was real (stale build stack) and was addressed by `0872285`; the *remaining* post-fix FailFast is M12 above (write tracker) | `0872285` |
 
@@ -373,28 +375,34 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 
 ## Next-session priorities (expected-value order)
 
-1. **M20/M27 — why does the game only ever produce 1×1 with no content?**
-   The rendering side is exonerated (M23/M25/M27: the emulator faithfully draws
-   the single 1×1 zero texel the guest supplies). So the next question is
-   guest-state, not pixels:
-   - Run with the I/O traces (`SHARPEMU_LOG_IO=1`, `SHARPEMU_LOG_OPEN=1`) and
-     check whether the game actually reads its texture/streaming archives in
-     large chunks, whether those reads **succeed**, and whether they cover the
-     texture ranges behind the descriptor addresses (compare against the
-     addresses in `agc.texture_1x1_linear_binding` and
-     `agc.storage_initial_data`).
-   - Check async-load completions: at 300 s `FAsyncLoadingThread` (19.6 M
-     imports) and `SlateLoadingThread2` (20.4 M) are still running while no
-     texel ever lands. An async completion that never fires would explain a
-     streaming pipeline that stays at mip 0 = 1×1 forever.
-   - If reads and completions are healthy, audit HLE state the game uses to
-     derive texture dimensions (anything returning 0 there yields exactly the
-     1×1-everywhere pattern).
-2. **Keep the structural fixes regardless** (they are the same bug class and
-   will bite any title with streamed/CPU-updated textures): F2
-   `storage_image_sync` (shadPS4 #4591), F3 readback ordering (shadPS4 #4542),
-   F4 native page-guard write detection so the upload-known short-cut can be
-   replaced by real evidence (M21).
+1. **M28 — the asset bytes land in guest memory; find the step that loses them.**
+   I/O is now proven healthy (2150 successful AMPR reads from the 8.69 GB pak, M28),
+   so the question is what happens *between* the read destination
+   (`0x2001xxxxxx`–`0x2003xxxxxx`) and the sampled texture address:
+   - Add a fingerprint of the destination bytes right after
+     `TryReadFileToGuestMemory` in `AmprExports.AprCommandBufferReadFile`
+     (first 16 bytes hex + non-zero count, once per (fileId, size) pair). If the
+     staging bytes are valid, the loss is in the *decode/copy/upload* step that
+     should move them into the final texture, not in I/O.
+   - Then find which guest path writes the texture addresses the composite
+     samples (`pc=0x50`, currently `1x1`, zero) and trace it with the same
+     technique. Note the read destinations and the sampled textures live in the
+     same guest region, so a staging→texture copy is the expected mechanism.
+2. **Answer why the sampled descriptor is 1×1 at all.** Once the data path is
+   understood: if the game never creates the real texture (dummies by design
+   while a load callback never runs), instrument the callback/state that gates
+   texture creation; the loader threads are still burning imports at 300 s
+   (`FAsyncLoadingThread` 19.6 M, `SlateLoadingThread2` 20.4 M).
+3. **Keep the structural fixes regardless** (the same coherence bug class, and
+   they will matter as soon as content exists): F2 `storage_image_sync`
+   (shadPS4 #4591), F3 readback ordering (shadPS4 #4542), F4 native page-guard
+   write detection so the upload-known short-cut can be replaced by real
+   evidence (M21).
+4. **Tooling notes:** `SHARPEMU_LOG_OPEN=1` is safe; `SHARPEMU_LOG_IO=1` stalled
+   once at import 256 inside `sceKernelReserveVirtualRange` and then ran fine on
+   a retry (treat a stall there as flaky, re-run before believing it).
+   `SHARPEMU_LOG_AMPR=1` is the read-path trace and is cheap enough for a 90 s
+   run (`run_ms_io.ps1 -AmprTrace`).
 2. **M11 — verify the compute-fence autocomplete.** The run now performs 60+
    compute dispatches, so re-run with `SHARPEMU_LOG_AGC=1` and grep for
    `compute_fence_autocomplete`.
