@@ -644,6 +644,27 @@ internal static unsafe class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGE_EVENTS"),
             "1",
             StringComparison.Ordinal);
+
+    // Mortal Shell black screen: the upload-known short-cut can answer "known"
+    // with *no probe basis* (the address has no registered extent, so
+    // probeByteCount is 0 and IsUntrackedGuestImageContentUnchanged returns
+    // true). That silently skips the only texel copy and leaves a zero-filled
+    // GPU image bound for a texture the guest may well have written.
+    // SHARPEMU_FORCE_GUEST_TEXEL_UPLOAD=1 refuses the short-cut so the caller
+    // copies guest texels, which is both the experiment and the fallback fix.
+    private static readonly bool _forceGuestTexelUpload =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_FORCE_GUEST_TEXEL_UPLOAD"),
+            "1",
+            StringComparison.Ordinal);
+    private static readonly bool _traceUploadKnownSkip =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_UPLOAD_KNOWN"),
+            "1",
+            StringComparison.Ordinal);
+    private static readonly ConcurrentDictionary<ulong, byte> _tracedUploadKnownSkips = new();
+    private static readonly ConcurrentDictionary<(ulong Address, uint Format), byte>
+        _tracedForcedUploads = new();
     private static readonly bool _traceGuestWorkCompletion =
         string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_WORK_COMPLETION"),
@@ -2148,6 +2169,26 @@ internal static unsafe class VulkanVideoPresenter
             return false;
         }
 
+        if (_forceGuestTexelUpload)
+        {
+            // Experiment / fallback: never take the availability short-cut, so
+            // the caller copies the guest texels instead of reusing whatever GPU
+            // image happens to sit at this address. shadPS4's buffer-cache
+            // doctrine: guest memory is unified on the console, but each
+            // (address, format) here is its own VkImage, so a texture bind only
+            // sees GPU-written data if something copies it across.
+            if (_traceUploadKnownSkip &&
+                _tracedForcedUploads.TryAdd((address, guestFormat), 0))
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] vk.upload_known_refused addr=0x{address:X16} " +
+                    $"fmt={guestFormat} — copied guest texels instead of reusing the " +
+                    "GPU image at this address");
+            }
+
+            return false;
+        }
+
         ulong probeByteCount = 0;
         lock (_gate)
         {
@@ -2189,7 +2230,21 @@ internal static unsafe class VulkanVideoPresenter
         // guest-memory probe lets static upload-known textures keep skipping
         // (Dead Cells menus) while CPU-rewritten planes (GTA Bink) fall through
         // to a full texel copy when the probe changes.
-        return IsUntrackedGuestImageContentUnchanged(address, probeByteCount);
+        var unchanged = IsUntrackedGuestImageContentUnchanged(address, probeByteCount);
+        if (_traceUploadKnownSkip &&
+            unchanged &&
+            _tracedUploadKnownSkips.TryAdd(address, 0))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] vk.upload_known_skip addr=0x{address:X16} " +
+                $"fmt={guestFormat} probe_bytes={probeByteCount} — the texture bind " +
+                "reuses the GPU image at this address instead of copying guest texels" +
+                (probeByteCount == 0
+                    ? " (no registered extent: the probe had nothing to compare, so the skip was unconditional)"
+                    : string.Empty));
+        }
+
+        return unchanged;
     }
 
     private static bool IsUntrackedGuestImageContentUnchanged(ulong address, ulong byteCount)
