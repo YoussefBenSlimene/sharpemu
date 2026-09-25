@@ -86,6 +86,8 @@ separate, now-fixed crash (M12).
 | M16 | Presenter/pipeline suspects that turned out to be **false alarms** (`pixels=False`; "only one frame presented") | **RULED OUT** | `pixels=` is `presentation.Pixels is not null`, i.e. *CPU*-backed frames; GPU images legitimately log `False` (Quake II logs the same). `presented first frame` / `presented guest frame` are one-shot guards (`_firstFramePresented`, `_firstGuestDrawPresented`), **not** per-frame counters | — |
 | M17 | **Guest-image probe: the guest renders fine — only the flip images are zero.** `SHARPEMU_TRACE_GUEST_IMAGES=every:50@5000` (200 s, `run_ms_guestimg.ps1`): non-flip targets carry real content (`[RB] addr=0x2035040000 mean=71,71,71,A71 sample_unique=38`; `[RB] addr=0x2041AD0000 mean=0,0,220,A247`; `0x2024410000` R8Unorm `nonblack_pixels=2433600/5760000`; `0x2034040000` `nonblack_pixels=608400/1440000`), while `[RB] addr=0x8FC0000000` and `0x8FC2000000` read `mean=0,0,0,A0 sample_unique=1` on **~40 samples each** | **OPEN** | the loss is exactly the composite that fills the flip image — the emulator builds it (`SharpEmu offscreen mrt=1 ps=0x2005B40000 first=0x8FC2000000 3840x2160`), no pipeline/shader error is logged, and the flip images' zero state is the emulator's own initial/DCC-cleared state | — |
 | M18 | Tie-breaker instrumentation: the 1×1 placeholder warning did not say **which pass** sampled it or what the descriptor bytes were, so "composite samples a placeholder" (M6) and "composite draw is dropped" were indistinguishable | **FIXED (instrumentation)** | `agc.texture_1x1_linear_binding` now logs `ps=` (pixel shader), `es=` (export shader), `op=`, `storage=` and `raw=` (the raw resource-descriptor dwords); still printed once per address, so no spam | AgcExports.cs (this session) |
+| M19 | **The 5 placeholders are stable guest state, not a capture race** — `agc.texture_1x1_linear_rebound` never fired in a 300 s run (`rebounds=0`, `placeholders=5`, `failfast=0`), and all 5 descriptors share one shape: plausible base/format/type/tile with the **dimension words literally zero** (`raw=3948B500,03800000,00000000,90100FAC,…`; `raw=397FE500,04D00000,00000000,91B00FAC,…` for fmt=14) | **OPEN** | the guest itself populates `pc=0x50` — the slot the flip-buffer composite samples — with a 1×1 dummy and **never updates it for the whole run**, so the emulator is faithfully rendering placeholder material. The black screen is not a binding/race bug; it is the game still compositing placeholders | — |
+| M20 | **Why is the real texture never streamed?** At 300 s the loading threads are still busy (`SlateLoadingThread2` 20.4 M imports, `FAsyncLoadingThread` 19.6 M, `DH_SaveGameThread` Running) | **OPEN (hypothesis)** | check the streaming path rather than the descriptor path: file I/O failures (`SHARPEMU_LOG_IO` / `LOG_OPEN`), async-file completions that never fire, or a GPU copy that never executes; and whether a loading UI ever reaches the flip buffers | — |
 | M12-old | (superseded) the pre-09-25 analysis attributed the FailFast to guest stubs entering via inline calli from managed frames on UE4 task-graph threads | **FIXED** | that mechanism was real (stale build stack) and was addressed by `0872285`; the *remaining* post-fix FailFast is M12 above (write tracker) | `0872285` |
 | M12-old | (superseded) the pre-09-25 analysis attributed the FailFast to guest stubs entering via inline calli from managed frames on UE4 task-graph threads | **FIXED** | that mechanism was real (stale build stack) and was addressed by `0872285`; the *remaining* post-fix FailFast is M12 above (write tracker) | `0872285` |
 
@@ -109,17 +111,14 @@ separate, now-fixed crash (M12).
 - T5: the composite pass may be sampling mip LOD ≠ 0 while the bound image has
   only one level, or sampling with a swizzle/format the placeholder cannot
   represent — T2 extended to cover the descriptor fields rather than just LOD.
-- T6 (**measured**): the presented frame is all zeros *including alpha* (M15)
-  and the flip images are the only zero images in the frame (M17) — every
-  other render target has content (`mean=71,71,71` grey, `mean=0,0,220` flat
-  blue, `center=FF` white). So the question is no longer "is the renderer
-  broken" but "what does the composite that fills the flip image sample". An
-  all-zero composite is exactly what sampling zero-filled 1×1 placeholders
-  everywhere produces. Deciding test: the placeholder warning now names the
-  sampling pass and the raw descriptor (`ps=`, `raw=`, M18) — if the
-  composite's `ps=0x2005B40000`/`0x2005C00000` is on a placeholder line, then
-  M6/T4 is the root cause; if not, the final blit is failing for another
-  reason and the placeholder hunt is a red herring for the flip itself.
+- T6 (**settled by measurement**): the composite that fills the flip image
+  (`ps=0x2005B40000`) samples descriptor slot `pc=0x50`, whose guest bytes
+  encode a 1×1 R8G8B8A8 image with the dimension words literally zero, and the
+  guest never re-binds that address with a real size (M19: `rebounds=0` in a
+  300 s run). The composite therefore outputs zeros, the flip images stay
+  all-zero (M15), and the window is handed an all-zero image. The remaining
+  question has left the descriptor path: why does the game never stream the
+  real texture (M20)?
 
 **Measured A/B (2026-09-25, identical 300 s runs, only the tracker toggled):**
 
@@ -340,14 +339,23 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 | Tool | What it captures |
 |---|---|
 | `run_game_with_timer.ps1` | Mortal Shell timed run, full log |
-| `run_mortal_shell_dbg.ps1` | Mortal Shell **300 s**, GAME-DBG on, write-tracker explicitly **off** |
+| `run_mortal_shell_dbg.ps1` | Mortal Shell 300 s, GAME-DBG on, write-tracker explicitly **off**; takes `-TimerSeconds`, `-LogPrefix`, `-QuietGameDbg` |
 | `run_ms_notrack.ps1` | Mortal Shell A/B arm with the tracker disabled (isolated M12) |
+| `run_ms_framedump.ps1` | 150 s run that reads the swapchain back after the present blit and dumps every 100th frame (M15) |
+| `run_ms_guestimg.ps1` | 200 s run that fingerprints every 1280×720+ guest render target (M17) |
+| `bgra_to_png.ps1` | decodes `.bgra`/`.rgba` frame dumps to PNG and prints non-black / unique-pixel counts |
 | `run_sarah_regress.ps1` | Dreaming Sarah 60 s regression guard (reference title) |
 | `run_quake2_diag.ps1` | Quake II 60 s, LOG_IO + LOG_OPEN |
 | `run_hellboy_test.ps1` | Hellboy detached, snapshots + GAME-DBG |
 | `SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS=1` | per-second per-thread state table |
 | `SHARPEMU_LOG_SEMA=1` / `SHARPEMU_LOG_AUDIO_QUEUE=1` | semaphore + audio queue traces |
 | `SHARPEMU_DISABLE_GAME_DBG=1` | silence the GAME-DBG layer |
+| `SHARPEMU_TRACE_GUEST_IMAGES=present` | read the swapchain back after each presented frame → `vk.swapchain_image … nonblack_pixels=` |
+| `SHARPEMU_TRACE_GUEST_IMAGES=every:N[@M]` | read every 1280×720+ guest render target back on every Nth draw into it → `vk.guest_image …`, `[RB] … mean=` |
+| `SHARPEMU_TRACE_GUEST_IMAGES=alias` | dump aliased guest images once after the next present |
+| `SHARPEMU_SWAPCHAIN_DUMP_EVERY=<n>` | with `SHARPEMU_GUEST_IMAGE_DUMP_DIR`, dump every Nth presented frame |
+| `SHARPEMU_DUMP_VIDEOOUT=1` | dump the guest display buffer on each flip |
+| `SHARPEMU_DUMP_TEXTURES=1` | write draw textures to `texture-dumps/*.bmp` |
 | `SHARPEMU_GUEST_IMAGE_CPU_SYNC=1` | **opt-in** guest-image CPU write tracker (page guards). Off by default: it kills the process via M12 and does not remove the 1×1 placeholders |
 | `SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC=1` | explicit kill switch for the above (wins over the opt-in) |
 | `SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS=1` | debug-only: restores the historical managed inline `calli` instead of the pooled native workers |
@@ -355,20 +363,19 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 
 ## Next-session priorities (expected-value order)
 
-1. **Mortal Shell M6 / T4 — the actual black screen.** The transport is now
-   healthy (242k draws, 103 presents, no crash), so the remaining work is
-   descriptor-side: for each of the 5 `texture_1x1_linear_binding` addresses
-   dump the full descriptor word (base, dim, tile mode, number type, swizzle,
-   mip count) and diff it against a known-good descriptor from the same frame
-   (the composite's other inputs). The question to answer is *which field* is
-   degenerate and *which* guest code path produced it.
-2. **Mortal Shell M11 — verify the compute-fence autocomplete.** With the
-   crash gone the run now performs 62 compute dispatches, so re-run with
-   `SHARPEMU_LOG_AGC=1` and grep for `compute_fence_autocomplete`; if it still
-   never fires, `acb.compute[32]` waits are being satisfied another way and
-   the trace should be moved to the satisfaction point.
-3. **Hellboy T9 / T6** — the process now runs ~100 s with 0 AVs and then exits
-   itself; stdout ends with Boehm "thread not found in gc_threads". Trace the
-   guest exit path after the last `sceKernelWaitSema TIMED_OUT`.
-4. **Quake II Q4** — disassemble the `Com_Error` caller (`frame#0
+1. **M20 — why the real texture is never streamed.** The descriptor question is
+   answered (M19: the guest keeps a 1×1 dummy for 300 s and the composite
+   faithfully renders it). So stop looking at the binding path and check the
+   streaming path: run with `SHARPEMU_LOG_IO=1` + `SHARPEMU_LOG_OPEN=1`
+   (`run_quake2_diag.ps1` shows the pattern) and look for texture reads that
+   fail or never complete, then whether the corresponding GPU upload ever
+   executes. Also confirm whether a loading UI ever reaches the flip buffers —
+   if it does, and it is also zero, the placeholder material is wider than one
+   slot.
+2. **M11 — verify the compute-fence autocomplete.** The run now performs 60+
+   compute dispatches, so re-run with `SHARPEMU_LOG_AGC=1` and grep for
+   `compute_fence_autocomplete`.
+5. **Hellboy T9 / T6** — the process runs ~100 s with 0 AVs and then exits
+   itself; stdout ends with Boehm "thread not found in gc_threads".
+6. **Quake II Q4** — disassemble the `Com_Error` caller (`frame#0
    ret=0x80053BE5D`) to find the unset message global.

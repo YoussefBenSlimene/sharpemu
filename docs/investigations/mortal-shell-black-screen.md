@@ -152,6 +152,51 @@ SharpEmu compute cs=0x0000002004FF0000 storage=0x000000200CC30000 1x1 fmt4  1x1x
 ---
 
 
+## 7. Rebound result — the placeholder is stable guest state
+
+`agc.texture_1x1_linear_rebound` was added to fire if the guest ever hands back
+a real size for an address previously sampled as a 1×1 placeholder. A 300 s
+run (`ms_rebound_20260925_181551.txt`) reports:
+
+```
+placeholders=5   rebounds=0   failfast=0
+```
+
+with all five descriptors sharing one shape — a plausible base address,
+unifiedFormat, type and tile mode, and **dimension words that are literally
+zero**:
+
+```
+addr=0x0000003948B50000 pc=0x50  tile=1  fmt=10 ps=0x000000394A140000 op=ImageSample
+  raw=3948B500,03800000,00000000,90100FAC,00000000,00700000,00000000,00000000
+addr=0x00000039516A0000 pc=0x64  tile=27 fmt=10 ps=0x000000394B8A0000 op=ImageSampleLz
+  raw=39516A00,03800000,00000000,91B00F2E,00000000,00700000,00000000,00000000
+addr=0x000000397FE50000 pc=0x74  tile=27 fmt=14 ps=0x000000394E670000 op=ImageLoad
+  raw=397FE500,04D00000,00000000,91B00FAC,00000000,00700000,00000000,00000000
+```
+
+(`0x2004550000 pc=0x50 …` in the earlier boot, same roles with different
+absolute addresses; the `raw` fields are structurally identical, only the base
+moved.)
+
+Decoding `pc=0x50` with `TryDecodeTextureDescriptor`: base `0x3948B50000`,
+unifiedFormat `0x38` = 56, type 9 (2D), tile mode 1, `dstSelect` 0xFAC — all
+populated. `fields[2]` is zero, and `fields[2]` is exactly where RDNA2 puts
+WIDTH[15:2] and HEIGHT[29:14], so width and height compute to 1.
+
+**Conclusion:** the per-draw descriptor setup race is refuted, and so is any
+decoder suspicion about these bytes. The guest populates the slot the composite
+samples with a deliberate 1×1 dummy and keeps it that way for the entire run,
+so the emulator renders exactly what the guest asked for; the composite's
+output is zero, the flip images stay zero, and the window gets an all-zero
+image. The open question is no longer on the descriptor path — it is **why the
+game never streams the real texture** (loading/streaming, see M20 in
+`docs/GAME_TRACKING.md`).
+
+---
+
+
+
 # Mortal Shell / Hellboy / Quake II session addendum — 2026-09-07
 
 ## Fixed and verified (commit c25f851)
