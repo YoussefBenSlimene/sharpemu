@@ -57,12 +57,15 @@ breaks Dreaming Sarah, the change is wrong.
 **Status: BOOTS with black screen — crash class removed 2026-09-25.** Fast boot
 (~1s window), full engine init, AudioOut2 streaming, double-buffered presents
 to display buffers `0x8FC0000000` / `0x8FC2000000` (3840×2160, R8G8B8A8Unorm,
-init=True). Current clean run (300 s, tracker off): **242,271 draws**, 464
-sampled draws, 103 presents, 62 computes, `AgcSubmissionThread` Running,
-`FAsyncLoadingThread` at 19.6M imports, 5× 1×1 placeholder textures remaining.
-The screen stays black because the composite pass samples those placeholders.
-The previous "FPS drops to 2 and the process dies" behaviour was a separate,
-now-fixed crash (M12).
+init=True). Current clean run (300 s, tracker off): **250,122 draws**, 477
+sampled draws, **6,015 flips presented**, 64 computes, `AgcSubmissionThread`
+Running, `FAsyncLoadingThread` at 19.6M imports, 5× 1× 1 placeholder textures
+remaining. The black screen is now **measured**: the swapchain image the
+presenter hands to the window is all-zero on 17/17 sampled flips
+(`nonzero_bytes=0/8294400`, identical hash; the raw dumps decode to a single
+unique pixel value), so the loss is at or before the guest image that gets
+blitted. The previous "FPS drops to 2 and the process dies" behaviour was a
+separate, now-fixed crash (M12).
 
 | # | Problem | Status | Root cause | Fix commit |
 |---|---|---|---|---|
@@ -79,6 +82,11 @@ now-fixed crash (M12).
 | M12 | **CLR FailFast** `Invalid Program: attempted to call a UnmanagedCallersOnly method from managed code` — killed the process ~4 min in ("fps dropped to 2 then crash") | **FIXED** | **`GuestImageWriteTracker` page-guard design.** Arming a page turns any *managed* write into it into a CLR-fatal AccessViolation (documented at `GuestImageWriteTracker.NotifyManagedWrite`) instead of a resumable guest fault; the fault then reaches the VEH trampoline, which reverse-P/Invokes the managed `VectoredHandler` (`Exceptions.cs:58-60`, `Marshal.GetFunctionPointerForDelegate`). If the faulting thread is in cooperative GC mode that transition is illegal → CLR kills the process. Intermittent because it needs a managed writer to hit an armed page. **Every** observed FailFast (4/4 logs) was immediately preceded by `[SYNC] cpu-write-drain`. Tracker is opt-in again (`SHARPEMU_GUEST_IMAGE_CPU_SYNC=1`) | `c2d84f9` |
 | M13 | **Stale-binary trap**: every "M11/M12 still broken" conclusion in this doc was drawn from logs produced by a build dated **2026-09-14 20:34**, i.e. *before* `0872285` (09-15, native-worker routing), `39dd33c` (09-15, max_concurrent 2→16), `9216ba7`/`ed220be` (09-16). Rebuilt 2026-09-25 and re-ran: pool is now `prewarmed 16/16 max_concurrent=16` (was `4/4 max_concurrent=2` — the serialization the doc blamed for the throughput drop), and the old `CallNativeEntry ← ExecuteGuestContinuationEntry` stack is **gone** (routing fix works; the remaining FailFast had no stack at all) | **FIXED (process)** | always rebuild before drawing conclusions from a log; check `Get-Item ...SharpEmu.exe \| Select LastWriteTime` against `git log -1 --date=iso`. Runs take 5 min, builds take 2.7 min — the build is the cheaper mistake | — |
 | M14 | `_onGuestExecutionRunnerThread` was **dead code** — set on `GuestExecutionRunner.ThreadMain`, `GuestContinuationRunner.ThreadMain` and `RunContinuationOnTemporaryThread`, but never read (compiler `CS0414`), so the documented invariant "guest stubs must never run above a CLR runner thread's managed frames" was unenforced and `RunGuestEntryStub` would still fall back to a managed inline `calli` if any caller passed `requireNativeWorker: false` | **FIXED** | `RunGuestEntryStub` now computes `mustUseNativeWorker = requireNativeWorker \|\| (_onGuestExecutionRunnerThread && !NativeGuestWorkersDisabled)` and refuses/yields instead of inlining on runner threads; the explicit `SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS=1` opt-out still permits the historical inline path | same commit as M12 |
+| M15 | **The image handed to the window is provably all-zero** — `vk.swapchain_image size=1920x1080 nonzero_bytes=0/8294400 nonblack_pixels=0/2073600 hash=0x97D30483E5DD6325` on **17/17** sampled flips; decoding the 17 raw `.bgra` dumps gives `sample_unique=1`, `nonzero_bytes=0`, so the window has shown pure black the entire run | **OPEN (measured)** | the loss is at or before the guest image that gets blitted, **not** in the presenter: 6,015 flips presented at ~20 Hz, `vk.present_dropped`=0, every present logs `init=True`, and the swapchain was recreated only 3 times (all in the first seconds, `SuboptimalKhr` after the window restore) | — |
+| M16 | Presenter/pipeline suspects that turned out to be **false alarms** (`pixels=False`; "only one frame presented") | **RULED OUT** | `pixels=` is `presentation.Pixels is not null`, i.e. *CPU*-backed frames; GPU images legitimately log `False` (Quake II logs the same). `presented first frame` / `presented guest frame` are one-shot guards (`_firstFramePresented`, `_firstGuestDrawPresented`), **not** per-frame counters | — |
+| M17 | **Guest-image probe: the guest renders fine — only the flip images are zero.** `SHARPEMU_TRACE_GUEST_IMAGES=every:50@5000` (200 s, `run_ms_guestimg.ps1`): non-flip targets carry real content (`[RB] addr=0x2035040000 mean=71,71,71,A71 sample_unique=38`; `[RB] addr=0x2041AD0000 mean=0,0,220,A247`; `0x2024410000` R8Unorm `nonblack_pixels=2433600/5760000`; `0x2034040000` `nonblack_pixels=608400/1440000`), while `[RB] addr=0x8FC0000000` and `0x8FC2000000` read `mean=0,0,0,A0 sample_unique=1` on **~40 samples each** | **OPEN** | the loss is exactly the composite that fills the flip image — the emulator builds it (`SharpEmu offscreen mrt=1 ps=0x2005B40000 first=0x8FC2000000 3840x2160`), no pipeline/shader error is logged, and the flip images' zero state is the emulator's own initial/DCC-cleared state | — |
+| M18 | Tie-breaker instrumentation: the 1×1 placeholder warning did not say **which pass** sampled it or what the descriptor bytes were, so "composite samples a placeholder" (M6) and "composite draw is dropped" were indistinguishable | **FIXED (instrumentation)** | `agc.texture_1x1_linear_binding` now logs `ps=` (pixel shader), `es=` (export shader), `op=`, `storage=` and `raw=` (the raw resource-descriptor dwords); still printed once per address, so no spam | AgcExports.cs (this session) |
+| M12-old | (superseded) the pre-09-25 analysis attributed the FailFast to guest stubs entering via inline calli from managed frames on UE4 task-graph threads | **FIXED** | that mechanism was real (stale build stack) and was addressed by `0872285`; the *remaining* post-fix FailFast is M12 above (write tracker) | `0872285` |
 | M12-old | (superseded) the pre-09-25 analysis attributed the FailFast to guest stubs entering via inline calli from managed frames on UE4 task-graph threads | **FIXED** | that mechanism was real (stale build stack) and was addressed by `0872285`; the *remaining* post-fix FailFast is M12 above (write tracker) | `0872285` |
 
 **Theories (unconfirmed — do not re-derive blindly):**
@@ -101,6 +109,17 @@ now-fixed crash (M12).
 - T5: the composite pass may be sampling mip LOD ≠ 0 while the bound image has
   only one level, or sampling with a swizzle/format the placeholder cannot
   represent — T2 extended to cover the descriptor fields rather than just LOD.
+- T6 (**measured**): the presented frame is all zeros *including alpha* (M15)
+  and the flip images are the only zero images in the frame (M17) — every
+  other render target has content (`mean=71,71,71` grey, `mean=0,0,220` flat
+  blue, `center=FF` white). So the question is no longer "is the renderer
+  broken" but "what does the composite that fills the flip image sample". An
+  all-zero composite is exactly what sampling zero-filled 1×1 placeholders
+  everywhere produces. Deciding test: the placeholder warning now names the
+  sampling pass and the raw descriptor (`ps=`, `raw=`, M18) — if the
+  composite's `ps=0x2005B40000`/`0x2005C00000` is on a placeholder line, then
+  M6/T4 is the root cause; if not, the final blit is failing for another
+  reason and the placeholder hunt is a red herring for the flip itself.
 
 **Measured A/B (2026-09-25, identical 300 s runs, only the tracker toggled):**
 

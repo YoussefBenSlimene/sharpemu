@@ -1320,7 +1320,7 @@ public sealed partial class DirectExecutionBackend
 	/// list and loads each entry's name pointer
 	///   49 8B 76 18   mov rsi, [r14+0x18]   ; name char*
 	///   80 3E 2E     cmp byte [rsi], 0x2E   ; starts with '.'?
-	///   0F 85 ...    jne <next node>
+	///   0F 85 ...    jne next node
 	/// When the node's name field holds garbage (an uninitialized Il2CPP
 	/// heap node; observed target 0x3E8), the load faults. Repoint RSI at
 	/// the faulting instruction's own code bytes — readable and guaranteed

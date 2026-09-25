@@ -1,3 +1,157 @@
+# Mortal Shell black screen — measured addendum 2026-09-25
+
+This section supersedes the earlier addenda below wherever they disagree: all
+of those were written from **logs produced by a binary five days older than
+the source tree** (M13), so several of their "root causes" were artifacts.
+
+## 1. The crash is fixed and the title now runs for minutes
+
+`GuestImageWriteTracker` is the M12 process killer: arming a page turns any
+*managed* write into it into a CLR-fatal `AccessViolation`, which then reaches
+the VEH trampoline's reverse-P/Invoke and trips
+`InvalidProgramException: attempted to call a UnmanagedCallersOnly method from
+managed code`. It is opt-in again (`SHARPEMU_GUEST_IMAGE_CPU_SYNC=1`), commit
+`c2d84f9`.
+
+Two 300 s runs differing only in that switch:
+
+| | tracker ON | tracker OFF |
+|---|---|---|
+| CLR FailFast | yes, died ~230 s | **no** |
+| draws (total seq) | 193 (sampled) | **250,122** |
+| presents (total seq) | 49 (sampled) | **6,015** |
+| 1×1 placeholders | 5 | **5** |
+
+Verified again after the change with the shipped binary: 0 `FailFast`,
+0 `UnmanagedCallersOnly`, 0 `cpu-write-drain`, 250,122 draws, clean timer exit
+(`block=host shutdown`).
+
+## 2. The black screen is now measured instead of inferred
+
+`SHARPEMU_TRACE_GUEST_IMAGES=present` + `SHARPEMU_SWAPCHAIN_DUMP_EVERY=100`
+reads the swapchain image back after the present blit. Run
+`run_ms_framedump.ps1` (150 s), then `bgra_to_png.ps1`:
+
+```
+[LOADER][TRACE] vk.swapchain_image size=1920x1080 format=B8G8R8A8Unorm
+    nonzero_bytes=0/8294400 nonblack_pixels=0/2073600 hash=0x97D30483E5DD6325
+```
+
+**17 of 17 sampled flips are all-zero and byte-identical**, confirmed
+independently by decoding the 17 raw `.bgra` dumps
+(`sample_unique=1`, `nonzero_bytes=0`). The window is therefore being handed a
+pure-black image — this is no longer a hypothesis.
+
+That also relocates the bug: the presenter is *not* dropping frames and the
+blit *is* running, so the loss is at or before the guest image that was blitted.
+
+## 3. Candidates that are measurably ruled out
+
+| Candidate | Measurement |
+|---|---|
+| Presenter never presents | 6,015 guest flips; `GAME-DBG:present` seq reaches 6015; ~20 Hz |
+| Present dropped for an uninitialized image | `vk.present_dropped` = **0**; every present logs `init=True` |
+| `pixels=False` means no image | that field is `presentation.Pixels is not null`, i.e. a CPU-backed frame; the same value appears in Quake II. Guest images are GPU-backed, so `False` is expected |
+| Only one frame ever reaches the window | `presented first frame` / `presented guest frame` are one-shot guards (`_firstFramePresented`, `_firstGuestDrawPresented`), not per-frame counters |
+| Swapchain thrash | 3 recreations, all in the first seconds (`SuboptimalKhr` after window restore); none afterwards |
+| Render/frame-loop stall (M9), async-loader starvation (M10) | both were stale-binary artifacts; the clean run dispatches 250 k draws with `AgcSubmissionThread` running |
+| Shader translation / CPU-side skip flags | `translated=False` on every present only means the present used the GPU image path, not a translated draw |
+
+## 4. Open question and the next measurement
+
+Black *swapchain* does not yet say black *guest render target*. The probe that
+decides it is `run_ms_guestimg.ps1`
+(`SHARPEMU_TRACE_GUEST_IMAGES=every:50@5000`), which reads back every
+1280×720+ guest image on every 50th draw into it and prints
+`vk.guest_image … nonblack_pixels=<n>/<total> … hash=` plus the coarse
+`[RB] addr=… mean=r,g,b,A` line.
+
+- **all black** → the composite never produces content: shader output is
+  zero, which is what sampling 1×1 (zero-filled) placeholders everywhere
+  would do. Continue on M6/T4: dump each of the 5 placeholder descriptors
+  (base, dim, tile mode, number type, swizzle, mip count) and compare with a
+  known-good descriptor from the same frame.
+- **any colour** → the guest renders fine and the loss is downstream: the
+  present blit's layout handoff (the NVIDIA stale-image note in
+  `RecordGuestImageBlit`), DCC/detile, or the format conversion.
+
+## 5. Tooling added
+
+| Tool | Purpose |
+|---|---|
+| `run_ms_framedump.ps1` | 150 s run that reads back + dumps every 100th presented swapchain image |
+| `run_ms_guestimg.ps1` | 200 s run that fingerprints every 1280×720+ guest render target |
+| `bgra_to_png.ps1` | decodes `.bgra`/`.rgba` dumps to PNG and prints non-black/unique-pixel counts |
+
+## 6. Guest-image probe result (200 s, `run_ms_guestimg.ps1`)
+
+`SHARPEMU_TRACE_GUEST_IMAGES=every:50@5000` fingerprints every 1280×720+ guest
+render target, so this run answers "does the guest render at all?".
+
+**Yes — the guest renders content.** Non-flip render targets came back with
+real pixels:
+
+```
+vk.guest_image addr=0x2034040000 1600x900 R16G16B16A16Sfloat nonblack_pixels=608400/1440000 center=C332C332C332F561
+vk.guest_image addr=0x2024410000 3200x1800 R8Unorm            nonblack_pixels=2433600/5760000 center=FF
+vk.guest_image addr=0x203DAD0000 3200x1800 R16G16B16A16Sfloat nonblack_pixels=5760000/5760000 center=0080000000800000
+[RB] addr=0x2035040000 mean=71,71,71,A71 sample_unique=38
+[RB] addr=0x2041AD0000 mean=0,0,220,A247 sample_unique=1     (flat blue)
+```
+
+**The two flip images are the only ones that are always exactly zero**,
+sampled ~40 times each across the whole run:
+
+```
+[RB] addr=0x8FC0000000 mean=0,0,0,A0 sample_unique=1
+[RB] addr=0x8FC2000000 mean=0,0,0,A0 sample_unique=1
+```
+
+The emulator *is* building the composite submission for them, with no
+pipeline or shader error anywhere in the log:
+
+```
+vk.ordered_action_fence_wait count=512 queue=dcb.graphics
+  submission='SharpEmu offscreen mrt=1 ps=0x0000002005B40000 first=0x0000008FC2000000 3840x2160'
+```
+
+So the mechanism is now pinned to the composite that fills the flip image:
+
+- the flip images are 3840×2160 and created by the emulator, so their all-zero
+  state is the emulator's initial / DCC-cleared state;
+- `mean=…,A0` with `sample_unique=1` means nothing non-zero and nothing opaque
+  ever lands in them;
+- the composite's pixel shaders are `0x2005B40000` / `0x2005C00000`, and draws
+  into the flip images are visible in `GAME-DBG:draw`
+  (`targets=[0x008FC0000000] ps=0x002005B40000`) for the whole run.
+
+Remaining discrimination — **is the composite running and computing zeros, or
+is it dropped?** Sampling a zero-filled 1×1 placeholder produces exactly zero
+output, which matches; a dropped draw would leave the emulator's
+zero-initialized image, which matches equally. The tie-breaker is the
+placeholder warning, now instrumented with the sampling pass' shader address
+and the raw descriptor dwords (`ps=`, `es=`, `op=`, `storage=`, `raw=`):
+
+- if `ps=0x2005B40000` appears on a placeholder line, the composite runs and
+  its inputs are the placeholders → M6/T4 is the root cause;
+- if the composite's shader never appears there, the final blit is failing for
+  another reason and the placeholder hunt is a red herring for the flip itself.
+
+Side observation: compute submissions write **real 1×1 storage images** at the
+placeholder address family, stepping 64 KB apart — the placeholder factory is
+producing bound GPU images, not just a CPU-side fallback:
+
+```
+SharpEmu compute cs=0x0000002004FF0000 storage=0x000000200CC20000 1x1 fmt10 1x1x1
+SharpEmu compute cs=0x0000002004FF0000 storage=0x000000200CC30000 1x1 fmt4  1x1x1
+```
+
+---
+
+
+---
+
+
 # Mortal Shell / Hellboy / Quake II session addendum — 2026-09-07
 
 ## Fixed and verified (commit c25f851)

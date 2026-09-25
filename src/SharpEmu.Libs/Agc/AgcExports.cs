@@ -9482,8 +9482,30 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
                 // so a follow-up run can watch for a later guest rewrite.
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] agc.texture_1x1_linear_binding addr=0x{texture.Address:X16} " +
-                    $"pc=0x{binding.Pc:X} tile={texture.TileMode} fmt={texture.Format} — " +
+                    $"pc=0x{binding.Pc:X} tile={texture.TileMode} fmt={texture.Format} " +
+                    $"ps=0x{pixelShaderAddress:X16} es=0x{exportShaderAddress:X16} " +
+                    $"op={binding.Opcode} storage={Gen5ShaderTranslator.RequiresStorageImage(binding, stageBindings)} " +
+                    $"raw={FormatShaderDwords(binding.ResourceDescriptor)} — " +
                     "draw samples a 1x1 placeholder descriptor (streaming upload never re-bound?)");
+            }
+            else if (texture.Width > 1 && texture.Height > 1 &&
+                     texture.Address != 0 &&
+                     _traced1x1LinearTextures.ContainsKey(texture.Address) &&
+                     _rebound1x1LinearTextures.TryAdd(
+                         (texture.Address, pixelShaderAddress), 0))
+            {
+                // Tie-breaker for the Mortal Shell black screen: this address
+                // was sampled as a 1x1 placeholder earlier. If the guest ever
+                // hands us a real size here, the placeholder was a per-draw
+                // descriptor setup race (the draw captured the slot before the
+                // guest filled it in) rather than a permanent dummy. Silence
+                // for a whole run means the guest itself keeps the 1x1 dummy,
+                // i.e. placeholder material, not an emulator binding bug.
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] agc.texture_1x1_linear_rebound addr=0x{texture.Address:X16} " +
+                    $"ps=0x{pixelShaderAddress:X16} pc=0x{binding.Pc:X} " +
+                    $"{texture.Width}x{texture.Height} tile={texture.TileMode} fmt={texture.Format} " +
+                    $"raw={FormatShaderDwords(binding.ResourceDescriptor)} — 1x1 placeholder rebound to a real size");
             }
 
             var isStorage = Gen5ShaderTranslator.RequiresStorageImage(
@@ -9515,6 +9537,7 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
     private static int _tracedAstroTitlePixelGlobalProbe;
     // One-time report per 1x1 placeholder texture descriptor address.
     private static readonly ConcurrentDictionary<ulong, byte> _traced1x1LinearTextures = new();
+    private static readonly ConcurrentDictionary<(ulong Address, ulong Ps), byte> _rebound1x1LinearTextures = new();
 
     private static void TraceAstroTitlePixelGlobalProbe(Gen5ShaderEvaluation evaluation)
     {

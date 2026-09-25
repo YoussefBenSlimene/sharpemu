@@ -1,9 +1,18 @@
 # Run Mortal Shell with GAME-DBG diagnostics for a fixed time, then kill.
+#
+# Usage:
+#   .\run_mortal_shell_dbg.ps1                    # 300 s, ms_dbg_*.txt
+#   .\run_mortal_shell_dbg.ps1 -TimerSeconds 90 -LogPrefix ms_ps -QuietGameDbg
+param(
+    [int]$TimerSeconds = 300,
+    [string]$LogPrefix = "ms_dbg",
+    [switch]$QuietGameDbg
+)
 $ErrorActionPreference = "Stop"
 
-$timerSeconds = 300
+$timerSeconds = $TimerSeconds
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$logFile = "ms_dbg_$stamp.txt"
+$logFile = "${LogPrefix}_$stamp.txt"
 $exePath = (Resolve-Path "artifacts\bin\Debug\net10.0\win-x64\SharpEmu.exe").Path
 $gamePath = "C:\ps5-emulator\ps5-games\PPSA02868-app0\eboot.bin"
 
@@ -18,6 +27,7 @@ $env:SHARPEMU_WRITABLE_APP0 = "1"
 $env:SHARPEMU_GUEST_IMAGE_CPU_SYNC = "0"
 $env:SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC = "1"
 $env:SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS = "1"
+if ($QuietGameDbg) { $env:SHARPEMU_DISABLE_GAME_DBG = "1" }
 
 Write-Host "Starting Mortal Shell with $timerSeconds second timer..."
 Write-Host "Log: $logFile"
