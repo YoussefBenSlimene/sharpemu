@@ -1,26 +1,20 @@
-# Run Mortal Shell with GAME-DBG diagnostics for a fixed time, then kill.
+# Regression guard required by GAME_TRACKING.md maintenance rules: Dreaming
+# Sarah (PPSA02929) is the PLAYABLE reference title. Any change that breaks it
+# is wrong. Run after every emulator-side change.
 $ErrorActionPreference = "Stop"
 
-$timerSeconds = 300
+$timerSeconds = 60
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$logFile = "ms_dbg_$stamp.txt"
+$logFile = "sarah_regress_$stamp.txt"
 $exePath = (Resolve-Path "artifacts\bin\Debug\net10.0\win-x64\SharpEmu.exe").Path
-$gamePath = "C:\ps5-emulator\ps5-games\PPSA02868-app0\eboot.bin"
+$gamePath = "C:\ps5-emulator\ps5-games\PPSA02929-app0\eboot.bin"
 
 if (-not (Test-Path $exePath)) { Write-Host "ERROR: exe missing"; exit 1 }
 if (-not (Test-Path $gamePath)) { Write-Host "ERROR: game missing"; exit 1 }
 
 $env:SHARPEMU_WRITABLE_APP0 = "1"
-# GuestImageWriteTracker is opt-in again (2026-09-25): the page-guard design
-# killed Mortal Shell with a CLR FailFast ("attempted to call a
-# UnmanagedCallersOnly method from managed code") within ~230 s and did not
-# remove the 1x1 placeholder textures, so the dbg run must not enable it.
-$env:SHARPEMU_GUEST_IMAGE_CPU_SYNC = "0"
-$env:SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC = "1"
-$env:SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS = "1"
 
-Write-Host "Starting Mortal Shell with $timerSeconds second timer..."
-Write-Host "Log: $logFile"
+Write-Host "Starting Dreaming Sarah regression run ($timerSeconds s)..."
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $exePath
@@ -39,7 +33,6 @@ $stderrOutput = $process.StandardError.ReadToEndAsync()
 
 Start-Sleep -Seconds $timerSeconds
 
-Write-Host "Timer expired, stopping..."
 if (!$process.HasExited) {
     $process.Kill()
 }

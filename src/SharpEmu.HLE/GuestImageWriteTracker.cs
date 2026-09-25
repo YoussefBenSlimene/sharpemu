@@ -87,17 +87,45 @@ public static unsafe class GuestImageWriteTracker
 
     private static RangeSnapshot _rangeSnapshot = RangeSnapshot.Empty;
 
-    // Enabled by default (was opt-in via SHARPEMU_GUEST_IMAGE_CPU_SYNC=1).
-    // UE4 titles (Mortal Shell) stream textures via CPU writes that must be
-    // detected for the GPU image to refresh. Without the tracker, streamed
-    // textures stay as 1×1 black placeholders. Disable with
-    // SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC=1 if the VirtualProtect overhead
-    // is problematic for a specific title.
-    private static readonly bool _enabled =
-        !string.Equals(
-            Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC"),
+    // Opt-in (was made default-on by 56bad5f; reverted 2026-09-25 after a
+    // controlled A/B on Mortal Shell proved the page-guard design is fatal
+    // and does not fix the black screen).
+    //
+    // Why fatal: arming a page makes any *managed* write into it raise a
+    // CLR-fatal AccessViolation rather than a resumable guest fault (see
+    // NotifyManagedWrite). The fault reaches the VEH trampoline, which
+    // reverse-P/Invokes the managed VectoredHandler; when the faulting
+    // thread is in cooperative GC mode the CLR kills the process with
+    // "Invalid Program: attempted to call a UnmanagedCallersOnly method from
+    // managed code". Every observed FailFast was immediately preceded by
+    // [SYNC] cpu-write-drain.
+    //
+    // Measured 2026-09-25, Mortal Shell PPSA02868, identical 300 s runs:
+    //   tracker on  -> FailFast, died ~230 s, 193 draws /  49 presents
+    //   tracker off -> clean full run,          464 draws / 103 presents
+    // ...and both runs reported the same 5 one-by-one placeholder textures,
+    // so the tracker was not resolving the black screen either.
+    //
+    // Enable with SHARPEMU_GUEST_IMAGE_CPU_SYNC=1 (the pre-56bad5f opt-in);
+    // SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC=1 remains an explicit kill switch.
+    private static readonly bool _enabled = ReadEnabled();
+
+    private static bool ReadEnabled()
+    {
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_GUEST_IMAGE_CPU_SYNC"),
             "1",
             StringComparison.Ordinal);
+    }
+
     private static readonly (bool Wildcard, ulong[] Addresses) _lifetimeTraceFilter =
         ParseAddressList(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_IMAGE_ADDRS"));
     private static readonly (bool Wildcard, string[] Sources) _lifetimeSourceTraceFilter =

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.HLE;
@@ -208,6 +209,7 @@ public sealed unsafe partial class DirectExecutionBackend
 	}
 
 	[UnmanagedCallersOnly]
+	[MethodImpl(MethodImplOptions.NoInlining)]
 	private static void HandlePosixSignal(int signal, nint siginfo, nint ucontext)
 	{
 		if (_posixSignalHandlerDepth > 0)

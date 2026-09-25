@@ -34,7 +34,7 @@ title installed under `C:\ps5-emulator\ps5-games`. For each game it tracks:
 | Title ID | Name | Engine | Last status |
 |---|---|---|---|
 | PPSA02929 | Dreaming Sarah | custom | **PLAYABLE** — reference title |
-| PPSA02868 | Mortal Shell: Enhanced Edition | Unreal Engine 4 | **BOOTS** — full init, 100M+ imports, texture streaming active, FailFast largely fixed; black screen persists |
+| PPSA02868 | Mortal Shell: Enhanced Edition | Unreal Engine 4 | **BOOTS** — 242k draws / 103 presents, crash class removed (M12); black screen from 5 remaining 1×1 placeholder descriptors |
 | PPSA09477 | Quake II (2023) | KEX Engine | **BOOTS** — renders, **NO abort** (CheckAvailability OK), alive 120s+ |
 | PPSA11264 | Hellboy: Web of Wyrd | Unity (IL2CPP + FMOD) | **BOOTS** — H6 livelock GONE (TRC watchdog forces suspendPoint); fails later in guest memcpy AV |
 
@@ -54,12 +54,15 @@ breaks Dreaming Sarah, the change is wrong.
 
 ## PPSA02868 — Mortal Shell: Enhanced Edition
 
-**Status: BOOTS with black screen.** Fast boot (~1s window), full engine init,
-AudioOut2 streaming (~180 submits/s, 96% fill), 60k+ GPU work items per 90 s
-run, double-buffered presents to display buffers `0x8FC0000000` /
-`0x8FC2000000` (3840×2160, R8G8B8A8Unorm, init=True). The screen stays black
-because the composite pass samples 1×1 placeholder textures instead of the
-real streamed ones.
+**Status: BOOTS with black screen — crash class removed 2026-09-25.** Fast boot
+(~1s window), full engine init, AudioOut2 streaming, double-buffered presents
+to display buffers `0x8FC0000000` / `0x8FC2000000` (3840×2160, R8G8B8A8Unorm,
+init=True). Current clean run (300 s, tracker off): **242,271 draws**, 464
+sampled draws, 103 presents, 62 computes, `AgcSubmissionThread` Running,
+`FAsyncLoadingThread` at 19.6M imports, 5× 1×1 placeholder textures remaining.
+The screen stays black because the composite pass samples those placeholders.
+The previous "FPS drops to 2 and the process dies" behaviour was a separate,
+now-fixed crash (M12).
 
 | # | Problem | Status | Root cause | Fix commit |
 |---|---|---|---|---|
@@ -68,12 +71,15 @@ real streamed ones.
 | M3 | Texture upload skip could reuse a GPU texture that was never uploaded | **FIXED** | skip gate now requires `IsGpuGuestImageAvailable` | `2a75ad4` (upstream #853) |
 | M4 | Format-14 textures with number type ≠ 4/5/7 decoded as R8G8B8A8Unorm (wrong bpp/layout) | **FIXED** | `(14,7)` case should be `(14,_)` (upstream #860) | `2a75ad4` |
 | M5 | All 59 guest threads received **host-heap** pthread handles (allocator silently skipped install when `ctx.Memory` was an `ICpuMemoryWrapper`) → Unity TaskGraph/Boehm/FMOD aliased garbage | **FIXED** | allocator install now unwraps wrapper chains | `c25f851` |
-| M6 | One remaining 1×1 placeholder at `addr=0x2004550000 pc=0x50 tile=1 fmt=10` — still-uncovered descriptor binding path (the PREVIOUS placeholder at `0x…56F60000` was fixed by the DCC publish + GPU-residency gate) | **OPEN** | suspected: the game's streaming upload writes texels via CPU memcpy into the descriptor's backing memory, but the guest write-tracker is disabled on Windows by default → the GPU image is never refreshed (stale-black). Confirm with write-watch on `0x2004550000` or enable the tracker via env | — |
+| M6 | Remaining 1×1 placeholder textures (`pc=0x50 tile=1 fmt=10`, 5 addresses in the 09-25 run) — the descriptor-binding/streaming path | **OPEN** | narrowed 2026-09-25: **identical count (5) with the write tracker ON and OFF**, so a CPU-write-detection gap is not the mechanism. Real candidate is the streaming upload not being *issued* for those descriptors (see M9/M10) — the transport that would bind them is now healthy, so this is descriptor-side, not coordination-side | — |
 | M8 | Draw throughput improved after the AGC fixes: 87k work items per 90 s (was ~60k), 50 presents, 198 draws sampled — double-buffer chain verified correct | **IMPROVED** | DCC fast-clear publishing + texture GPU-residency gate + format-14 wildcard | `2a75ad4` |
-| M9 | **RenderThread 1 blocked** on `pthread_cond_wait` (wake=`pthread_cond_waiter:243619`); AgcSubmissionThread also blocked; RenderThread 0 **exited** with 434k imports; PoolThread 13-18 all blocked; meanwhile RHIThread is Running (543k imports) and FAsyncLoadingThread is Running (1.2M imports) — the render coordination thread is stuck, so no new frames are dispatched to the GPU | **ROOT-CAUSE** | UE4's game thread should signal RenderThread 1 to start the next frame; that signal never fires because the main/entry thread (not in snapshots — runs on the host entry stack) is blocked or waiting for an async operation that never completes. Same pattern as Hellboy H7: a coordination thread blocks on a cond-var that nobody signals | — |
-| M10 | `FAsyncLoadingThread` Running with 1.2M imports (NID `EgmLo6EWgso` = `scePthreadRwlockUnlock`) — the async loader is actively loading but never finishes, keeping the render thread blocked | **OPEN** | the loader may be waiting for a file I/O that SharpEmu's IFS doesn't resolve, or a dependency graph that never completes | — |
+| M9 | ~~RenderThread 1 blocked on `pthread_cond_wait`; AgcSubmissionThread also blocked; no new frames dispatched~~ — **no longer a blocker (2026-09-25, clean 300 s run)**: `AgcSubmissionThread` **Running** (142,048 imports), `RenderThread 1` parked between frames with **892,365** imports (was 12,050), **242,271 draws** and 103 presents dispatched | **RESOLVED** | the earlier "coordination stuck" reading came from the stale 09-14 binary (M13) whose pool was serialized at `max_concurrent=2`. With the 16-worker pool + the M12 crash removed, the frame loop runs normally | (via M12/M13) |
+| M10 | `FAsyncLoadingThread` never finishing (NID `EgmLo6EWgso` = `scePthreadRwlockUnlock`) keeping the render thread blocked | **RESOLVED (not a blocker)** | in the clean 300 s run it is **Running** at **19.6M imports** with `SlateLoadingThread2` at 18.5M and `SlateLoadingThread1`/`RenderThread 0` having **Exited** normally — loading progresses and completes; it simply takes a long time under emulation | (via M12/M13) |
 | M11 | **GPU compute queue deadlock**: `acb.compute[32]` WAIT_REG_MEM suspends with `producer=none-observed` — no graphics-queue RELEASE_MEM ever wrote the awaited label. Correlates with FPS dropping to 2-4 before crash. Upstream #770 tried to fix and was reverted | **FIX (landed, unverified in-game)** | compute-queue WAIT_REG_MEM fences are CP-firmware completion fences: the parser now writes the completion value the firmware would have written and keeps parsing (scoped to compute queues; bypasses `RecordProduced` so recycled labels keep autocompleting). Armed but not yet observed firing — game stalls before reaching compute fences in test runs | `0872285` |
-| M12 | **CLR FailFast**: "UnmanagedCallersOnly method from managed code" killed the process within minutes of the first present (UE4 task-graph threads entered guest stubs via inline calli from managed frames — guest code above managed frames on that thread) | **PARTLY FIXED** | all guest continuations (`ExecuteGuestContinuationEntry`) and managed-HLE thread starts (`ExecuteGuestThreadEntry`) now route through pooled native workers + `[ThreadStatic]` runner-thread markers. 0 FailFast in most runs; 1 per ~100M imports still fires intermittently with no stack trace | `0872285` |
+| M12 | **CLR FailFast** `Invalid Program: attempted to call a UnmanagedCallersOnly method from managed code` — killed the process ~4 min in ("fps dropped to 2 then crash") | **FIXED** | **`GuestImageWriteTracker` page-guard design.** Arming a page turns any *managed* write into it into a CLR-fatal AccessViolation (documented at `GuestImageWriteTracker.NotifyManagedWrite`) instead of a resumable guest fault; the fault then reaches the VEH trampoline, which reverse-P/Invokes the managed `VectoredHandler` (`Exceptions.cs:58-60`, `Marshal.GetFunctionPointerForDelegate`). If the faulting thread is in cooperative GC mode that transition is illegal → CLR kills the process. Intermittent because it needs a managed writer to hit an armed page. **Every** observed FailFast (4/4 logs) was immediately preceded by `[SYNC] cpu-write-drain`. Tracker is opt-in again (`SHARPEMU_GUEST_IMAGE_CPU_SYNC=1`) | `b9f2c1e`-series (see commit for "GuestImageWriteTracker is opt-in again") |
+| M13 | **Stale-binary trap**: every "M11/M12 still broken" conclusion in this doc was drawn from logs produced by a build dated **2026-09-14 20:34**, i.e. *before* `0872285` (09-15, native-worker routing), `39dd33c` (09-15, max_concurrent 2→16), `9216ba7`/`ed220be` (09-16). Rebuilt 2026-09-25 and re-ran: pool is now `prewarmed 16/16 max_concurrent=16` (was `4/4 max_concurrent=2` — the serialization the doc blamed for the throughput drop), and the old `CallNativeEntry ← ExecuteGuestContinuationEntry` stack is **gone** (routing fix works; the remaining FailFast had no stack at all) | **FIXED (process)** | always rebuild before drawing conclusions from a log; check `Get-Item ...SharpEmu.exe \| Select LastWriteTime` against `git log -1 --date=iso`. Runs take 5 min, builds take 2.7 min — the build is the cheaper mistake | — |
+| M14 | `_onGuestExecutionRunnerThread` was **dead code** — set on `GuestExecutionRunner.ThreadMain`, `GuestContinuationRunner.ThreadMain` and `RunContinuationOnTemporaryThread`, but never read (compiler `CS0414`), so the documented invariant "guest stubs must never run above a CLR runner thread's managed frames" was unenforced and `RunGuestEntryStub` would still fall back to a managed inline `calli` if any caller passed `requireNativeWorker: false` | **FIXED** | `RunGuestEntryStub` now computes `mustUseNativeWorker = requireNativeWorker \|\| (_onGuestExecutionRunnerThread && !NativeGuestWorkersDisabled)` and refuses/yields instead of inlining on runner threads; the explicit `SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS=1` opt-out still permits the historical inline path | same commit as M12 |
+| M12-old | (superseded) the pre-09-25 analysis attributed the FailFast to guest stubs entering via inline calli from managed frames on UE4 task-graph threads | **FIXED** | that mechanism was real (stale build stack) and was addressed by `0872285`; the *remaining* post-fix FailFast is M12 above (write tracker) | `0872285` |
 
 **Theories (unconfirmed — do not re-derive blindly):**
 
@@ -82,20 +88,46 @@ real streamed ones.
   descriptor `0x…56F60000` is the one blocked in `sceKernelWaitSema`.
 - T2: the composite pixel shader may sample mip LOD ≠ 0; the placeholder has
   `maxMip=0`, and sampling a LOD ≠ 0 on a 1×1 returns black regardless.
-- T3: ~~guest write-tracker is disabled on Windows by default~~ **RULED OUT** —
-  the write tracker was enabled by default in commit `56bad5f`
-  (`SHARPEMU_GUEST_IMAGE_CPU_SYNC` inverted to
-  `SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC`), and the 1×1 placeholders
-  persist even with tracking on. The real cause is M9/M11: the render
-  coordination thread is blocked, so the streaming upload never gets
-  dispatched, regardless of whether the tracker can detect it.
+- T3: ~~guest write-tracker is disabled on Windows by default~~ **RULED OUT
+  (and actively harmful)** — the tracker was made default-on in `56bad5f` and
+  the placeholders persist with it enabled *and* disabled (5 vs 5). Worse, its
+  page-guard design is the M12 process killer. It is opt-in again as of
+  2026-09-25.
+- T4: the 5 remaining placeholders are **descriptor-side**: the streaming
+  upload path is now healthy (M9/M10 resolved), yet the composite still binds
+  `pc=0x50 tile=1 fmt=10`. Next: log the full descriptor word for each of the
+  5 addresses (base/dim/tile/numType/swizzle) and compare against a *known
+  good* descriptor from the same run, to see which field is degenerate.
+- T5: the composite pass may be sampling mip LOD ≠ 0 while the bound image has
+  only one level, or sampling with a swizzle/format the placeholder cannot
+  represent — T2 extended to cover the descriptor fields rather than just LOD.
+
+**Measured A/B (2026-09-25, identical 300 s runs, only the tracker toggled):**
+
+| | tracker ON (default then) | tracker OFF |
+|---|---|---|
+| CLR FailFast | **yes**, died ~230 s | **no**, survived full run |
+| draws (GAME-DBG sample) | 193 | **464** |
+| presents | 49 | **103** |
+| computes | 16 | **62** |
+| 1×1 placeholders | 5 | **5** |
+| `[SYNC] cpu-write-drain` | ~15-line storm | 0 |
 
 **Ruled out:**
 
-- Write-tracker disabled (T3): tracker is now default-on, placeholders persist → the issue is the blocked render thread, not the tracker
-- EDEADLK from scePthreadMutexLock (M7): matches PS5/FreeBSD semantics, game handles it
+- Write-tracker disabled (T3): placeholders identical with the tracker on and
+  off, and the tracker is the M12 crash cause → it neither fixes the black
+  screen nor is safe to leave on.
+- Render-coordination deadlock (M9) and async-loader starvation (M10): both
+  were artifacts of the stale 09-14 binary; the clean run dispatches 242,271
+  draws with `AgcSubmissionThread` running.
+- EDEADLK from scePthreadMutexLock (M7): matches PS5/FreeBSD semantics, game
+  handles it.
 
-**Repro:** `run_mortal_shell_dbg.ps1` (90 s, GAME-DBG draw/present on).
+**Repro:**
+- `run_mortal_shell_dbg.ps1` — 300 s, GAME-DBG on, tracker explicitly off.
+- `run_ms_notrack.ps1` — the A/B arm that isolated M12 (tracker off).
+- `run_sarah_regress.ps1` — 60 s Dreaming Sarah guard, run after every change.
 
 ---
 
@@ -240,6 +272,23 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
   hardware-level fault (CET/CFG mitigation restart, no log entry —
   needs child-process crash diagnostics). Sarah unaffected (39 presents,
   FailFast 0).
+- T9: **interpretation correction (2026-09-16)**: the trailing
+  "Running in mitigated child process (CET/CFG disabled)" line is the
+  **normal end-of-run marker**, not a crash marker — the parent always
+  relaunches the game in a CET/CFG-disabled child (`Program.cs:509
+  TryRunMitigatedChild`, unconditional unless
+  `SHARPEMU_DISABLE_MITIGATION_RELAUNCH=1`) and logs the line after the
+  child exits (`Program.cs:632`). Current Hellboy state: runs ~100 s,
+  1 cancel-state substitution, **0 AVs** (the pthread fault family is
+  fixed by T7/T8), then the game **exits itself** — stdout ends with
+  Boehm "thread not found in gc_threads" warnings during asset loading
+  and no TRC-forcing this run (the render loop is timing-dependent: an
+  earlier run with the same build reached "Forcing call to suspendPoint"
+  + "cannot allocate system memory!"). Next root: the game's
+  exit path after the `sceKernelWaitSema TIMED_OUT` retry storms —
+  trace what the guest does after the last TIMED_OUT import (the exit is
+  likely the Boehm GC giving up on unregistered threads, or Baselib
+  exiting on the allocation failure).
 
 **Repro:** `run_hellboy_test.ps1` (detached; snapshots + GAME-DBG on).
 
@@ -256,34 +305,51 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 | DCC fast-clear publishes GPU images; texture skip needs GPU residency; format-14 wildcard (upstream #853 #860) | `2a75ad4` | Mortal Shell, any UE4 title |
 | GAME-DBG draw/present/compute traces, hot-spin detector, abort call-site dump | `57f9a8d` `cb9dc9b` | all |
 | Guest continuations/thread-starts route through pooled native workers (CLR FailFast fix) + compute-fence autocomplete | `0872285` | Mortal Shell, Hellboy, Quake II, all titles with managed-HLE thread resume |
+| **`GuestImageWriteTracker` is opt-in again** (`SHARPEMU_GUEST_IMAGE_CPU_SYNC=1`) — its page-guard design converted managed writes into CLR-fatal AVs via the VEH reverse-P/Invoke path (M12) | this session | Mortal Shell (crash removed); any title that would have hit it |
+| Enforce `_onGuestExecutionRunnerThread` in `RunGuestEntryStub` (was dead code, M14) — runner threads can no longer inline a guest stub above their own managed frames | this session | all titles with resumed guest threads |
+
+## Process notes
+
+| Lesson | Detail |
+|---|---|
+| **Rebuild before believing a log** (M13) | The entire "M11/M12 are still broken" state of this document was inferred from logs produced by a binary 5 days older than the source. Always `Get-Item artifacts\bin\Debug\net10.0\win-x64\SharpEmu.exe \| Select LastWriteTime` and compare with `git log -1 --date=iso`; the run scripts resolve that exact path. |
+| **A/B one variable at a time** | M12 was proven by two 300 s runs differing only in `SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC`. Cheap, decisive, and it also produced the counter-evidence for T3 in the same pair. |
+| **Check the reference title** | `run_sarah_regress.ps1` (60 s) after every change; a fix that breaks Dreaming Sarah is wrong. |
 
 ## Diagnostic tooling index
 
 | Tool | What it captures |
 |---|---|
 | `run_game_with_timer.ps1` | Mortal Shell timed run, full log |
-| `run_mortal_shell_dbg.ps1` | Mortal Shell 90 s, GAME-DBG on |
+| `run_mortal_shell_dbg.ps1` | Mortal Shell **300 s**, GAME-DBG on, write-tracker explicitly **off** |
+| `run_ms_notrack.ps1` | Mortal Shell A/B arm with the tracker disabled (isolated M12) |
+| `run_sarah_regress.ps1` | Dreaming Sarah 60 s regression guard (reference title) |
 | `run_quake2_diag.ps1` | Quake II 60 s, LOG_IO + LOG_OPEN |
 | `run_hellboy_test.ps1` | Hellboy detached, snapshots + GAME-DBG |
 | `SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS=1` | per-second per-thread state table |
 | `SHARPEMU_LOG_SEMA=1` / `SHARPEMU_LOG_AUDIO_QUEUE=1` | semaphore + audio queue traces |
 | `SHARPEMU_DISABLE_GAME_DBG=1` | silence the GAME-DBG layer |
+| `SHARPEMU_GUEST_IMAGE_CPU_SYNC=1` | **opt-in** guest-image CPU write tracker (page guards). Off by default: it kills the process via M12 and does not remove the 1×1 placeholders |
+| `SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC=1` | explicit kill switch for the above (wins over the opt-in) |
+| `SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS=1` | debug-only: restores the historical managed inline `calli` instead of the pooled native workers |
+| `SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT=<n>` | native worker concurrency (default 16) |
 
 ## Next-session priorities (expected-value order)
 
-1. **Hellboy T6** — the new failure point after the H6 livelock: guest AV in
-   a vectorized memcpy (`0x805B79FB9`) with non-canonical `+0x30` after
-   `sceKernelWaitSema` TIMED_OUT storms. Same root fix family as the
-   remaining kernel-managed ScePthread fields (see investigation doc).
-2. **Verify M11 in-game** — the compute-fence autocomplete (commit `0872285`)
-   is armed but was never observed firing (`compute_fence_autocomplete` trace
-   absent — the game stalls before reaching compute fences). Re-run Mortal
-   Shell with `SHARPEMU_LOG_AGC=1` and grep for the trace; if absent, the
-   M9/M12 mutex coordination is still blocking compute submissions.
-3. **Mortal Shell M12 remainder** — the intermittent FailFast (1 per ~100M
-   imports, no stack trace) still fires with the native-worker routing in
-   place. Instrument `CallNativeEntry` call sites to find which managed
-   context still enters guest stubs (candidates: the main `ExecuteEntry`
-   path on the emulation thread, `TryCallGuestFunction` nested case).
+1. **Mortal Shell M6 / T4 — the actual black screen.** The transport is now
+   healthy (242k draws, 103 presents, no crash), so the remaining work is
+   descriptor-side: for each of the 5 `texture_1x1_linear_binding` addresses
+   dump the full descriptor word (base, dim, tile mode, number type, swizzle,
+   mip count) and diff it against a known-good descriptor from the same frame
+   (the composite's other inputs). The question to answer is *which field* is
+   degenerate and *which* guest code path produced it.
+2. **Mortal Shell M11 — verify the compute-fence autocomplete.** With the
+   crash gone the run now performs 62 compute dispatches, so re-run with
+   `SHARPEMU_LOG_AGC=1` and grep for `compute_fence_autocomplete`; if it still
+   never fires, `acb.compute[32]` waits are being satisfied another way and
+   the trace should be moved to the satisfaction point.
+3. **Hellboy T9 / T6** — the process now runs ~100 s with 0 AVs and then exits
+   itself; stdout ends with Boehm "thread not found in gc_threads". Trace the
+   guest exit path after the last `sceKernelWaitSema TIMED_OUT`.
 4. **Quake II Q4** — disassemble the `Com_Error` caller (`frame#0
    ret=0x80053BE5D`) to find the unset message global.

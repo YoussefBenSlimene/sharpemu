@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.HLE;
@@ -86,6 +87,18 @@ public sealed partial class DirectExecutionBackend
 	// copied back into this thread's statics before returning.
 	private unsafe int RunGuestEntryStub(void* entryStub, ulong hostRspSlot, bool requireNativeWorker = false)
 	{
+		// A CLR runner thread must never execute a guest stub above its own
+		// managed frames: when the GC or a fault walks the interleaved chain
+		// the CLR FailFasts ("attempted to call a UnmanagedCallersOnly method
+		// from managed code"). GuestExecutionRunner.ThreadMain,
+		// GuestContinuationRunner.ThreadMain and
+		// RunContinuationOnTemporaryThread all raise
+		// _onGuestExecutionRunnerThread for exactly this reason, so honour it
+		// even when a caller does not ask for a worker explicitly. The
+		// explicit SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS=1 opt-out keeps the
+		// historical inline calli (no pool available by definition).
+		var mustUseNativeWorker = requireNativeWorker ||
+			(_onGuestExecutionRunnerThread && !NativeGuestWorkersDisabled);
 		// Limit in-flight native Runs before renting so the idle pool is not
 		// drained by threads blocked on the concurrency gate.
 		_nativeWorkerRunLimiter.Wait();
@@ -96,7 +109,7 @@ public sealed partial class DirectExecutionBackend
 			// TerminateThread+respawn. Wait for a native worker — never fall back
 			// to managed inline (FailFast) and never throw (uncaught throw mid-
 			// storm was a silent process die).
-			var maxAttempts = requireNativeWorker ? 500 : 48;
+			var maxAttempts = mustUseNativeWorker ? 500 : 48;
 			for (var attempt = 0; attempt < maxAttempts; attempt++)
 			{
 				worker = RentNativeGuestExecutor();
@@ -105,7 +118,7 @@ public sealed partial class DirectExecutionBackend
 					break;
 				}
 
-				if (!requireNativeWorker)
+				if (!mustUseNativeWorker)
 				{
 					break;
 				}
@@ -115,7 +128,7 @@ public sealed partial class DirectExecutionBackend
 
 			if (worker is null)
 			{
-				if (requireNativeWorker)
+				if (mustUseNativeWorker)
 				{
 					var n = Interlocked.Increment(ref _tbbNativeWorkerRefuseCount);
 					if (n <= 8 || n % 32 == 0)
@@ -690,6 +703,7 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		[UnmanagedCallersOnly]
+		[MethodImpl(MethodImplOptions.NoInlining)]
 		private static nint RunPrologue(nint executorHandle)
 		{
 			try
@@ -712,6 +726,7 @@ public sealed partial class DirectExecutionBackend
 		}
 
 		[UnmanagedCallersOnly]
+		[MethodImpl(MethodImplOptions.NoInlining)]
 		private static void RunEpilogue(nint executorHandle, int nativeResult)
 		{
 			try
