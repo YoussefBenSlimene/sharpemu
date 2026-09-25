@@ -120,29 +120,12 @@ Start-Sleep -Seconds $TimerSeconds
 
 if (!$process.HasExited) { $process.Kill() }
 
-$combinedOutput = $outputTask.Result + $stderrOutput.Result
-$combinedOutput | Out-File -FilePath $logFile -Encoding UTF8
-Write-Host "Logs saved to: $logFile"
-
-
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $exePath
-$psi.Arguments = "`"$gamePath`""
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError = $true
-$psi.UseShellExecute = $false
-$psi.CreateNoWindow = $true
-
-$process = New-Object System.Diagnostics.Process
-$process.StartInfo = $psi
-$process.Start() | Out-Null
-
-$outputTask = $process.StandardOutput.ReadToEndAsync()
-$stderrOutput = $process.StandardError.ReadToEndAsync()
-
-Start-Sleep -Seconds $TimerSeconds
-
-if (!$process.HasExited) { $process.Kill() }
+# The emulator runs the guest in a "mitigated child process" ([DEBUG] Running in
+# mitigated child process in the log), so killing the parent leaves the child
+# alive holding artifacts\bin — which then breaks the next `dotnet build` with
+# MSB3021/MSB3027 file-lock errors, and leaves a second emulator instance
+# running while the next arm starts. Clean up both.
+Get-Process SharpEmu -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
 $combinedOutput = $outputTask.Result + $stderrOutput.Result
 $combinedOutput | Out-File -FilePath $logFile -Encoding UTF8

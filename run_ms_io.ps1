@@ -33,6 +33,9 @@ if ($AmprTrace) {
     # apr.* / ampr.* traces, including the read-file path:
     # ampr.read_file … fileId=… dest=… size=… offset=… bytesRead=… result=…
     $env:SHARPEMU_LOG_AMPR = "1"
+    # And a fingerprint of the bytes at the read destination, once per
+    # (fileId,size): ampr.read_content … nonzero_head=n/64 head=<hex>.
+    $env:SHARPEMU_TRACE_AMPR_READ_CONTENT = "1"
     # The APR data path is what matters here, not the draw-level noise.
     $env:SHARPEMU_DISABLE_GAME_DBG = "1"
 }
@@ -60,6 +63,11 @@ $stderrOutput = $process.StandardError.ReadToEndAsync()
 Start-Sleep -Seconds $TimerSeconds
 
 if (!$process.HasExited) { $process.Kill() }
+
+# Killing the parent leaves the emulator's "mitigated child process" alive
+# holding artifacts\bin (breaks the next dotnet build) and running alongside the
+# next arm. Clean up both.
+Get-Process SharpEmu -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
 $combinedOutput = $outputTask.Result + $stderrOutput.Result
 $combinedOutput | Out-File -FilePath $logFile -Encoding UTF8

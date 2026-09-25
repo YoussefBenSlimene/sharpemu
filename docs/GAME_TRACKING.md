@@ -97,6 +97,9 @@ separate, now-fixed crash (M12).
 | M27 | **The guest asks for 1×1 everywhere and has written zero content there.** With `SHARPEMU_TRACE_STORAGE_IMAGE_INIT_ADDRESS=*` every compute storage target reports `size=1x1 pitch=1 logical_bytes=4 physical_bytes=65536 read=True nonzero=False initial_bytes=0` — the guest's **own** descriptors say 1×1, the emulator **does** read guest memory for them, and it is all zero. The sampled placeholder (`pc=0x50`, `1x1`, `addr=0x2004550000` this boot) is not even a storage target. Skipped sampled binds measured the same way: `vk.upload_known_skip … guest_bytes=00000000000000000000000000000000` | **EMULATOR SIDE CLOSED — the cause is guest state** | with M23/M25 this means the emulator is faithfully rendering what the guest asked for: one 1×1 zero texel per frame (flat black; flat white only when we inject content). Nothing on the rendering side is broken — raster, offscreen submission, present blit, forced uploads and DCC publish all demonstrably work. The remaining work is upstream of rendering: why the game only ever produces 1×1 with no content. Unity semantics make this concrete: 1×1 is the *smallest mip*, i.e. "nothing streamed yet" | — |
 | M28 | **The title is UE4 (`dungeonhaven`) and it reads its 8.69 GB pak successfully.** `SHARPEMU_LOG_OPEN=1`: `_open dir '…/dungeonhaven/content/paks'` (found), `stat '…/dungeonhaven-ps5.pak' result=found`, `apr_resolve … id=0xA2CB31C4 size=8694639526`. `SHARPEMU_LOG_AMPR=1` (90 s): **2150 `ampr.read_file` calls, every one `result=0`**, full byte counts (`size=0x739174 read=0x739174`, `0xB469DC`, `0x40000`), from the correct host path into guest destinations `0x2001xxxxxx`–`0x2003xxxxxx`. `ampr.get_size` returns the command-buffer size (0x4000); `apr.get_file_size` is never called | **I/O and the AMPR read path are healthy — refutes "the game cannot read its assets"** | so asset bytes do reach guest memory, and the loss happens *after* the read (decompress / copy into the final texture / upload). Next: fingerprint the read destination right after each read, then find the step that should move that data into the sampled texture address | — |
 | M29 | **Three false alarms caught and corrected while chasing this (do not re-report them as bugs)** | **RULED OUT** | 1. `fstat … size=0 dir=0` on the `saved/config/ps5/*.ini` files: those are opened with flags `0x601` (create/truncate), so size 0 at that moment is correct — `engine.ini` is 1061 bytes on disk. 2. `lseek … whence=1 pos=0`: `whence=1` is `SEEK_CUR` (`SeekCur = 1` in `KernelMemoryCompatExports`), not `SEEK_END`, so `pos=0` is just the current offset. 3. `case ReadFileRecordType: break;` in `AmprExports.CompleteCommandBuffer` looks like a skipped read, but the bytes are copied at **submit** time in `AprCommandBufferReadFile` → `TryReadFileToGuestMemory`, so the record case is a no-op by design | — |
+| M30 | **The bytes read from the pak are real asset data.** New `ampr.read_content` trace (first 64 bytes at each read destination, once per `(fileId,size)`): 1036 distinct fingerprints over 2294 reads. Samples: `{\r\n\t"FileVersion": 3,\r\n\t"EngineAssociation": "",…` (a UE4 `.uplugin` JSON), 262144 bytes of plugin JSON text, and archive blocks beginning `2000DA27 14000000 00020043…` | **I/O fully exonerated** | reads succeed, land in guest memory, and contain genuine UE4 content. So neither the file system, the pak discovery, the AMPR read path, nor the read destinations are the problem | `SHARPEMU_TRACE_AMPR_READ_CONTENT=1` (this session) |
+| M31 | **Harness bug found while chasing this:** `run_ms_forcebisect.ps1` contained a **duplicated run block**, so every invocation ran the game **twice** (log overwritten by the second run, wall-clock doubled), and because the emulator runs the guest in a **"mitigated child process"**, killing the parent left the child alive — holding `artifacts\bin` (next `dotnet build` fails with MSB3021/MSB3027: *"file is locked by: SharpEmu"*) and running alongside the next arm. Logs from those runs are still valid (each log is one complete run), but builds failed while a child lingered | **FIXED** | single run block per script + `Get-Process SharpEmu \| Stop-Process -Force` after the timer in `run_ms_forcebisect.ps1` / `run_ms_io.ps1`; audit other harnesses the same way | this session |
+| M32 | **New leading hypothesis: the title may simply still be loading.** 2294 pak reads per 90 s (~25/s, ~a few hundred MB of the 8.69 GB pak), 10 minutes of *byte-identical* black frames, placeholders growing 5 → 14, loaders still churning, no crash | **OPEN — testable** | if the load is merely very slow, a long run should eventually show a non-flat frame; if it stays identical for 30–60 min, the load is stuck on something *after* the successful reads (texture creation/decompression) and that path becomes the target. Test: long-run watch on the presented-image fingerprint (cheap: `run_ms_forcebisect.ps1 -TimerSeconds 1800`) | — |
 | M12-old | (superseded) the pre-09-25 analysis attributed the FailFast to guest stubs entering via inline calli from managed frames on UE4 task-graph threads | **FIXED** | that mechanism was real (stale build stack) and was addressed by `0872285`; the *remaining* post-fix FailFast is M12 above (write tracker) | `0872285` |
 | M12-old | (superseded) the pre-09-25 analysis attributed the FailFast to guest stubs entering via inline calli from managed frames on UE4 task-graph threads | **FIXED** | that mechanism was real (stale build stack) and was addressed by `0872285`; the *remaining* post-fix FailFast is M12 above (write tracker) | `0872285` |
 
@@ -375,34 +378,30 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 
 ## Next-session priorities (expected-value order)
 
-1. **M28 — the asset bytes land in guest memory; find the step that loses them.**
-   I/O is now proven healthy (2150 successful AMPR reads from the 8.69 GB pak, M28),
-   so the question is what happens *between* the read destination
-   (`0x2001xxxxxx`–`0x2003xxxxxx`) and the sampled texture address:
-   - Add a fingerprint of the destination bytes right after
-     `TryReadFileToGuestMemory` in `AmprExports.AprCommandBufferReadFile`
-     (first 16 bytes hex + non-zero count, once per (fileId, size) pair). If the
-     staging bytes are valid, the loss is in the *decode/copy/upload* step that
-     should move them into the final texture, not in I/O.
-   - Then find which guest path writes the texture addresses the composite
-     samples (`pc=0x50`, currently `1x1`, zero) and trace it with the same
-     technique. Note the read destinations and the sampled textures live in the
-     same guest region, so a staging→texture copy is the expected mechanism.
-2. **Answer why the sampled descriptor is 1×1 at all.** Once the data path is
-   understood: if the game never creates the real texture (dummies by design
-   while a load callback never runs), instrument the callback/state that gates
-   texture creation; the loader threads are still burning imports at 300 s
-   (`FAsyncLoadingThread` 19.6 M, `SlateLoadingThread2` 20.4 M).
-3. **Keep the structural fixes regardless** (the same coherence bug class, and
-   they will matter as soon as content exists): F2 `storage_image_sync`
-   (shadPS4 #4591), F3 readback ordering (shadPS4 #4542), F4 native page-guard
-   write detection so the upload-known short-cut can be replaced by real
-   evidence (M21).
+1. **M32 — decide "slow load" vs "stuck load" with a long run.** Launch
+   `.\run_ms_forcebisect.ps1 -TimerSeconds 1800` (30 min) and watch
+   `vk.swapchain_image … nonblack_pixels=`. Any readback that is **not**
+   `0/2073600` / hash `0x97D30483E5DD6325` means the title got past its loading
+   state and the "black screen" was just an extremely slow load under
+   emulation (≈25 pak reads/s against an 8.69 GB pak). Still byte-identical
+   after 30–60 min ⇒ the load is stuck *after* the proven-good reads.
+2. **If it is stuck: instrument texture creation.** The read data is valid
+   (M30) yet the guest's own descriptors are 1×1 (M27), so the target is the
+   path that turns asset bytes into descriptors — log what writes the
+   descriptor words (`raw=…,03800000,00000000,90100FAC,…`) and the HLE state
+   the game derives dimensions from (`ampr`/`apr` get-size style queries, plus
+   any stub that could answer 0).
+3. **Keep the structural fixes** (same coherence bug class, needed as soon as
+   content exists): F2 `storage_image_sync` (shadPS4 #4591), F3 readback
+   ordering (shadPS4 #4542), F4 native page-guard write detection replacing the
+   upload-known short-cut (M21).
 4. **Tooling notes:** `SHARPEMU_LOG_OPEN=1` is safe; `SHARPEMU_LOG_IO=1` stalled
-   once at import 256 inside `sceKernelReserveVirtualRange` and then ran fine on
-   a retry (treat a stall there as flaky, re-run before believing it).
-   `SHARPEMU_LOG_AMPR=1` is the read-path trace and is cheap enough for a 90 s
-   run (`run_ms_io.ps1 -AmprTrace`).
+   once at import 256 inside `sceKernelReserveVirtualRange` and ran clean on a
+   retry (treat a stall there as flaky, re-run before believing it);
+   `SHARPEMU_LOG_AMPR=1` + `SHARPEMU_TRACE_AMPR_READ_CONTENT=1`
+   (`run_ms_io.ps1 -AmprTrace`) is the read-path trace and is cheap for 90 s.
+   **Always check for orphaned `SharpEmu` processes before building** (the
+   mitigated child survives a parent kill, M31).
 2. **M11 — verify the compute-fence autocomplete.** The run now performs 60+
    compute dispatches, so re-run with `SHARPEMU_LOG_AGC=1` and grep for
    `compute_fence_autocomplete`.

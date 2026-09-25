@@ -31,6 +31,16 @@ public static class AmprExports
     private static readonly bool _traceAmprReads =
         _traceAmpr ||
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AMPR_READS"), "1", StringComparison.Ordinal);
+    // Mortal Shell black screen follow-up (M28): I/O is proven healthy, so the
+    // question is whether the bytes that were read actually land, and whether
+    // they look like asset data. This fingerprints the destination once per
+    // (fileId, size) pair, right after the copy.
+    private static readonly bool _traceAmprReadContent =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_AMPR_READ_CONTENT"),
+            "1",
+            StringComparison.Ordinal);
+    private static readonly ConcurrentDictionary<(uint FileId, ulong Size), byte> _tracedReadContents = new();
 
     private sealed class CommandBufferState
     {
@@ -327,6 +337,7 @@ public static class AmprExports
         }
 
         PakDirectoryTracker.OnReadCompleted(ctx, fileId, destination, fileOffset, bytesRead);
+        TraceReadContent(ctx, fileId, destination, bytesRead);
 
         if (!AppendReadFileRecord(ctx, commandBuffer, fileId, destination, size, fileOffset, bytesRead))
         {
@@ -591,6 +602,42 @@ public static class AmprExports
         TraceAmpr(ctx, "write_address", commandBuffer, address, value);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Fingerprints the bytes at an AMPR read destination once per (fileId, size)
+    // pair, so a staging buffer can be checked for real asset data.
+    private static void TraceReadContent(CpuContext ctx, uint fileId, ulong destination, ulong bytesRead)
+    {
+        if (!_traceAmprReadContent ||
+            bytesRead == 0 ||
+            destination == 0 ||
+            !_tracedReadContents.TryAdd((fileId, bytesRead), 0))
+        {
+            return;
+        }
+
+        var probeLength = (int)Math.Min(64UL, bytesRead);
+        var probe = new byte[probeLength];
+        if (!ctx.Memory.TryRead(destination, probe.AsSpan(0, probeLength)))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] ampr.read_content id=0x{fileId:X8} dst=0x{destination:X16} " +
+                $"bytes={bytesRead} read=unavailable");
+            return;
+        }
+
+        var nonZero = 0;
+        foreach (var value in probe)
+        {
+            if (value != 0)
+            {
+                nonZero++;
+            }
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] ampr.read_content id=0x{fileId:X8} dst=0x{destination:X16} " +
+            $"bytes={bytesRead} nonzero_head={nonZero}/{probeLength} head={Convert.ToHexString(probe)}");
     }
 
     public static int CompleteCommandBuffer(CpuContext ctx, ulong commandBuffer)
