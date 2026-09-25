@@ -53,6 +53,8 @@ Consumed in `src/SharpEmu.CLI/Program.cs` and `src/SharpEmu.Core/Runtime/SharpEm
 | `SHARPEMU_TRACE_GUEST_MEMORY_LIFETIME` | unset | `GuestImageWriteTracker` memory lifetime trace. |
 | `SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT` | `2` | Cap on pooled native guest workers (1–64). |
 | `SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS` | unset | Use the inline `calli` fallback instead of the worker pool. |
+| `SHARPEMU_DISABLE_GPU_AWARE_USLEEP` | unset | `1` restores the plain `sceKernelUsleep` intrinsic. By default a short sleep issued repeatedly from one call site while emulated-GPU label writes are pending waits for the GPU instead of yielding (Quake II Q4: `kexRHIStateGnm::StartFrame` "GPU hanged" abort). |
+| `SHARPEMU_GPU_AWARE_USLEEP_MAX_MS` | `8` | Cap (0–100 ms) on one GPU catch-up wait; `0` disables the wait. |
 
 Consumed in `src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend*.cs`.
 

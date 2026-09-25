@@ -35,7 +35,7 @@ title installed under `C:\ps5-emulator\ps5-games`. For each game it tracks:
 |---|---|---|---|
 | PPSA02929 | Dreaming Sarah | custom | **PLAYABLE** — reference title |
 | PPSA02868 | Mortal Shell: Enhanced Edition | Unreal Engine 4 | **BOOTS** — 242k draws / 103 presents, crash class removed (M12); black screen from 5 remaining 1×1 placeholder descriptors |
-| PPSA09477 | Quake II (2023) | KEX Engine | **BOOTS** — renders, **NO abort** (CheckAvailability OK), alive 120s+ |
+| PPSA09477 | Quake II (2023) | KEX Engine | **BOOTS** — the `GPU hanged` StartFrame abort (black screen → freeze → ERROR dialog, Q9) fixed in `66db254`; re-test on Windows |
 | PPSA11264 | Hellboy: Web of Wyrd | Unity (IL2CPP + FMOD) | **BOOTS** — H6 livelock GONE (TRC watchdog forces suspendPoint); fails later in guest memcpy AV |
 
 ---
@@ -174,7 +174,8 @@ CheckAvailability: result 0x00000000` (was `0x80550006` signed-out →
 | Q1 | `sceKernelClose(0x80020002)` spam → fatal: raw kernel file syscalls leaked the ORBIS error sentinel as an fd | **FIXED** | raw `sceKernel*` syscalls must return **-1 + errno** (BSD convention) | `c25f851` |
 | Q2 | NP social init failed with a leaked sentinel request id (unresolved `sceNpCreateAsyncRequest` / `sceNpCheckNpReachability` / `sceNpPollAsync`) | **FIXED** | offline NP async-request manager (Kyty `network.cpp` semantics); requests complete as **reachable** — the signed-out result `0x80550006` is fatal to the game's social manager | `c25f851` |
 | Q3 | `sceNpWebApi2PushEventDeletePushContext` unresolved during NP teardown | **FIXED** | offline stub (Kyty parity) returning OK | `c25f851` |
-| Q4 | **Empty-message fatal**: `Com_Error` receives the border string itself as the message; underlying error text is empty (`stderr.txt`: `Error - ` + border + nothing) | **ROOT-CAUSE (partial)** | KEX `FatalError` called with an unset error-string global; call-site captured at `ret=eboot+0x4B789A`, frame chain `#0 ret=0x80053BE5D`, `#1 ret=0x80053BC68`, `#2 ret=0x8007D5D31` | — |
+| Q9 | **"GPU hanged" abort — the black screen + freeze + crash** (user log 2026-09-25: `sceMsgDialogOpen` with the `ERROR` border, `abort() called by guest`, `abort call-site ret=0x8004B789A`, `frame#0 ret=0x80053BE5D`, `frame#1 ret=0x80053BC68`) | **FIXED (pending in-game confirmation on Windows)** | Disassembled from `decrypted/eboot.bin`: frame#0 is the KEX error formatter (0x80053BDC0) whose string is `kexRHIStateGnm::StartFrame: GPU hanged while waiting for m_pContextLabel to be cleared`; frame#1 is `kexRHIStateGnm::StartFrame` (0x80053ABD0), which polls the previous frame's context label **500 times** (`mov ebx,0x1f4`) with `sceKernelUsleep(1)` between polls and then jumps to the error. On hardware usleep(1) is a real sleep and the GPU finishes well inside that budget. In SharpEmu the label is written later from the Vulkan ordered-action queue, while usleep(1) was one host yield, so all 500 polls finished in microseconds and the first slow frame (pipeline compile) counted as a hang. Fix: `GuestGpuProgress` counts label writes in flight (`SubmitOrderedGpuSideEffect`); the native usleep intrinsic takes the HLE path only while writes are pending, and `KernelUsleep` waits ≤8 ms for the GPU when one call site issues ≥4 short sleeps within 5 ms. Opt-out `SHARPEMU_DISABLE_GPU_AWARE_USLEEP=1` | `66db254` |
+| Q4 | **Empty-message fatal**: `Com_Error` receives the border string itself as the message; underlying error text is empty (`stderr.txt`: `Error - ` + border + nothing) | **ROOT-CAUSE → Q9** | **superseded by Q9**: the message is not unset — the formatter builds `GPU hanged while waiting for m_pContextLabel…` into a separate buffer, and only the border reached the dialog; call-site captured at `ret=eboot+0x4B789A`, frame chain `#0 ret=0x80053BE5D`, `#1 ret=0x80053BC68`, `#2 ret=0x8007D5D31` | — |
 | Q5 | Loose asset directories absent: `/app0/baseq2/players/`, `/app0/baseq2/sound/player/steps` probed with `O_DIRECTORY` return NOT_FOUND (dump has only `pak0.pak`, `music/`, `video/`) | **THEORY** | on real hardware / Kyty these dirs exist; KEX may seed state from them and the empty Com_Error may be downstream | — |
 | Q6 | `sceKernelStat` failures for `/savedata0/...` config files (0xffffffff) — game wants a mounted save | **MITIGATED** | save mount returns NOT_FOUND on first run; game tolerates it; verify `/savedata0` mount semantics against Kyty | — |
 | Q7 | Unresolved `sceNpTrophy2GetTrophyInfo` (0x80020002) for user 268435456 | **OPEN** | trophy context init path; not fatal but feeds the NP error cascade | — |
@@ -194,7 +195,7 @@ CheckAvailability: result 0x00000000` (was `0x80550006` signed-out →
   surface (AudioOut, Pad, IME, NP, SaveData) against Kyty's `libAudio.cpp`,
   `libPad.cpp`, `libNet.cpp` call by call.
 
-**Repro:** `run_quake2_diag.ps1` (60 s, LOG_IO + LOG_OPEN on).
+**Repro:** `run_quake2_diag.ps1` (60 s, LOG_IO + LOG_OPEN on). Q9 check: grep the log for `usleep.gpu_wait` (the fix engaging) and confirm no `GPU hanged` / `abort() called by guest`. A/B: `SHARPEMU_DISABLE_GPU_AWARE_USLEEP=1` should bring the abort back.
 
 ---
 
@@ -358,6 +359,7 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 | `bgra_to_png.ps1` | decodes `.bgra`/`.rgba` frame dumps to PNG and prints non-black / unique-pixel counts |
 | `run_sarah_regress.ps1` | Dreaming Sarah 60 s regression guard (reference title) |
 | `run_quake2_diag.ps1` | Quake II 60 s, LOG_IO + LOG_OPEN |
+| `run_quake2_gpuhang.ps1` | Quake II Q9 check: runs 120 s and prints a verdict (`usleep.gpu_wait`, `GPU hanged`, guest `abort()`); `-DisableFix` is the A/B arm |
 | `run_hellboy_test.ps1` | Hellboy detached, snapshots + GAME-DBG |
 | `SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS=1` | per-second per-thread state table |
 | `SHARPEMU_LOG_SEMA=1` / `SHARPEMU_LOG_AUDIO_QUEUE=1` | semaphore + audio queue traces |
@@ -375,6 +377,7 @@ one frame then black persists. All JobWorkers block on `event_flag:0x4`;
 | `SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC=1` | explicit kill switch for the above (wins over the opt-in) |
 | `SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS=1` | debug-only: restores the historical managed inline `calli` instead of the pooled native workers |
 | `SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT=<n>` | native worker concurrency (default 16) |
+| `SHARPEMU_DISABLE_GPU_AWARE_USLEEP=1` | turn off the Q9 fix (short sleeps in GPU poll loops wait for pending GPU label writes); `SHARPEMU_GPU_AWARE_USLEEP_MAX_MS` caps one wait (default 8) |
 
 ## Next-session priorities (expected-value order)
 

@@ -61,3 +61,6 @@ boot_timing_test.txt
 ms_shaders/
 dump*.bin
 !scripts/*.txt
+
+# Local game dumps (never commit)
+games/
