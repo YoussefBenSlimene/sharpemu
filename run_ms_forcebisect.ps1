@@ -28,6 +28,7 @@ param(
     [string]$WhiteTextureTargets = "",
     [string]$TracePixelShaderAddress = "",
     [string]$TraceGuestTextureAddresses = "",
+    [string]$TraceStorageImageInit = "",
     [switch]$ForceTexelUpload,
     [int]$TimerSeconds = 150
 )
@@ -81,6 +82,13 @@ if ($ForceTexelUpload) {
     # Needed together with the content trace: with the upload-known short-cut
     # active the upload never happens, so there would be nothing to fingerprint.
     $env:SHARPEMU_FORCE_GUEST_TEXEL_UPLOAD = "1"
+}
+if ($TraceStorageImageInit) {
+    # agc.storage_initial_data addr=… op_storage=… upload_known=… read=… nonzero=…
+    #   initial_bytes=… logical_bytes=… size=WxH pitch=… fmt=… num=… tile=… mip=…
+    # "*" reports every storage address once — the addresses change per boot, so
+    # a single pre-set address cannot catch the one that matters.
+    $env:SHARPEMU_TRACE_STORAGE_IMAGE_INIT_ADDRESS = $TraceStorageImageInit
 }
 # Verdict: read the presented image back and dump frames.
 $env:SHARPEMU_TRACE_GUEST_IMAGES = "present"

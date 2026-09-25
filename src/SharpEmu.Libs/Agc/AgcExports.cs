@@ -9564,6 +9564,15 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
     private static int _tracedAstroTitlePixelGlobalProbe;
     // One-time report per 1x1 placeholder texture descriptor address.
     private static readonly ConcurrentDictionary<ulong, byte> _traced1x1LinearTextures = new();
+    // SHARPEMU_TRACE_STORAGE_IMAGE_INIT_ADDRESS accepts one address, or "*" to
+    // report every storage address once. The wildcard mode exists because the
+    // addresses worth watching change on every boot (the Mortal Shell
+    // placeholder chain in docs/GAME_TRACKING.md), so a pre-set address cannot
+    // catch the one that matters.
+    private static readonly string? _storageInitTraceFilter =
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_STORAGE_IMAGE_INIT_ADDRESS");
+    private static readonly bool _storageInitTraceAll = _storageInitTraceFilter == "*";
+    private static readonly ConcurrentDictionary<ulong, byte> _tracedStorageInitAddresses = new();
     private static readonly ConcurrentDictionary<(ulong Address, ulong Ps), byte> _rebound1x1LinearTextures = new();
 
     private static void TraceAstroTitlePixelGlobalProbe(Gen5ShaderEvaluation evaluation)
@@ -11878,10 +11887,9 @@ private static long _indirectDrawProbeCount;
                 }
             }
 
-            if (ParseOptionalHexAddress(
-                    Environment.GetEnvironmentVariable(
-                        "SHARPEMU_TRACE_STORAGE_IMAGE_INIT_ADDRESS")) ==
-                descriptor.Address)
+            if (_storageInitTraceAll
+                    ? _tracedStorageInitAddresses.TryAdd(descriptor.Address, 0)
+                    : ParseOptionalHexAddress(_storageInitTraceFilter) == descriptor.Address)
             {
                 Console.Error.WriteLine(
                     $"[LOADER][TRACE] agc.storage_initial_data " +

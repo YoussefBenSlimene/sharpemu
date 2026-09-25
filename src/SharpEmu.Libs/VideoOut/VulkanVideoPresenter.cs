@@ -2235,10 +2235,26 @@ internal static unsafe class VulkanVideoPresenter
             unchanged &&
             _tracedUploadKnownSkips.TryAdd(address, 0))
         {
+            // The decisive question for the Mortal Shell black screen: does the
+            // guest's memory at this address hold anything at all? The bind is
+            // skipping the copy, so the answer decides whether the game never
+            // produced the texture (nothing to copy) or whether we are dropping
+            // content the guest really wrote.
+            var guestBytes = "unavailable";
+            var memory = _guestMemory;
+            if (memory is not null)
+            {
+                Span<byte> sample = stackalloc byte[16];
+                if (memory.TryRead(address, sample))
+                {
+                    guestBytes = Convert.ToHexString(sample);
+                }
+            }
+
             Console.Error.WriteLine(
                 $"[LOADER][INFO] vk.upload_known_skip addr=0x{address:X16} " +
-                $"fmt={guestFormat} probe_bytes={probeByteCount} — the texture bind " +
-                "reuses the GPU image at this address instead of copying guest texels" +
+                $"fmt={guestFormat} probe_bytes={probeByteCount} guest_bytes={guestBytes} — " +
+                "the texture bind reuses the GPU image at this address instead of copying guest texels" +
                 (probeByteCount == 0
                     ? " (no registered extent: the probe had nothing to compare, so the skip was unconditional)"
                     : string.Empty));

@@ -291,6 +291,49 @@ by construction. The wildcard run whitened 1×1 textures elsewhere in the chain
 and the flat fill turned white, confirming that the frame content is decided by
 1×1 placeholder content rather than by anything scene-shaped.
 
+## 8. Answer to "is the guest's texel zero?" — yes, and it is the guest's own state
+
+`SHARPEMU_TRACE_STORAGE_IMAGE_INIT_ADDRESS=*` (wildcard mode added this session,
+because the addresses change every boot) reports, for every compute **storage**
+target:
+
+```
+agc.storage_initial_data addr=0x000000200D090000 op_storage=True upload_known=False
+  read=True nonzero=False initial_bytes=0 logical_bytes=4 physical_bytes=65536
+  size=1x1 pitch=1 fmt=10 num=0 tile=27 mip=0
+```
+
+and the sampled binds that skip their copy report the same emptiness directly:
+
+```
+vk.upload_known_skip addr=0x0000002BC6450000 fmt=2147486208 probe_bytes=0
+  guest_bytes=00000000000000000000000000000000
+```
+
+So, with the emulator reading guest memory and finding zeros:
+
+- the guest's **own** descriptors are 1×1 (`size=1x1`, `logical_bytes=4`) —
+  including for the compute storage images it writes;
+- guest memory behind those addresses is **all zero**;
+- the 64 KiB `physical_bytes`/address stride is the tiled allocation footprint,
+  not a 128×128 tile copy (my earlier "64 KiB = one tile" reading was wrong);
+- the sampled placeholder whose content fills the whole frame is not even one of
+  the storage targets in the same run.
+
+**Conclusion: the rendering side is exonerated.** The emulator draws exactly what
+the guest asks for — one 1×1 zero texel per frame, i.e. a flat black fill — and
+every mechanism on our side is demonstrably working (raster, offscreen
+submission, present blit, forced texel uploads, DCC publish; M23's flat-white
+frame is the proof). The open work is upstream of rendering: why the game only
+ever produces 1×1 with no content. Unity's streaming model makes that concrete —
+1×1 is the smallest mip, i.e. "nothing streamed yet" — so the next step is the
+streaming/IO path (M20 in `docs/GAME_TRACKING.md`), not the descriptor path.
+
+This is also why the shadPS4 prior art (§2) stays relevant despite the finding:
+their `storage_image_sync` and readback-ordering fixes address the same
+*coherence* class, which will matter as soon as content actually exists to be
+kept coherent.
+
 Related tooling added while doing this: the sibling dump prints a pass' whole
 binding set once, in the same run that triggers the placeholder warning, because
 the composite's shader address changes on every boot (`0x2005B40000`,
