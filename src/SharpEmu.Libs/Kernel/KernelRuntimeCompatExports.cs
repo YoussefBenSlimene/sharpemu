@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.Libs.Fiber;
+using SharpEmu.Libs.Gpu;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -100,6 +101,12 @@ public static class KernelRuntimeCompatExports
 
         GuestThreadExecution.Scheduler?.Pump(ctx, "sceKernelUsleep");
 
+        if (micros < 1000 && TryWaitForGpuInPollLoop())
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
         if (micros < 1000)
         {
             // Guest worker pools use usleep(1) as a polling backoff. Do not turn
@@ -124,6 +131,94 @@ public static class KernelRuntimeCompatExports
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // --- GPU-aware short sleeps (Quake II Q4) --------------------------------
+    //
+    // A guest that polls a GPU label with usleep(1) between polls and gives
+    // up after N polls (KEX kexRHIStateGnm::StartFrame: 500 polls, then
+    // Com_Error "GPU hanged while waiting for m_pContextLabel to be cleared"
+    // and abort()) assumes each usleep costs real time. Here usleep(1) is a
+    // host yield (~microseconds) while the label is written later by the
+    // emulated GPU, so the budget runs out before the GPU gets a chance.
+    //
+    // When the same call site sleeps repeatedly in a short burst while GPU
+    // label writes are in flight, wait for the GPU to catch up instead. Plain
+    // worker backoff loops are unaffected while the GPU is idle (the native
+    // intrinsic never even reaches this code), and the wait is bounded by
+    // GuestGpuProgress' per-call cap and stall guard.
+
+    private const int GpuPollBurstThreshold = 4;
+    private static readonly long GpuPollBurstWindowTicks = Stopwatch.Frequency / 200; // 5 ms
+    private static readonly int GpuPollMaxWaitMilliseconds = ReadGpuPollMaxWaitMilliseconds();
+    private static long _gpuPollWaitCount;
+
+    [ThreadStatic]
+    private static ulong _gpuPollCallSite;
+
+    [ThreadStatic]
+    private static int _gpuPollBurst;
+
+    [ThreadStatic]
+    private static long _gpuPollLastTicks;
+
+    internal static bool TryWaitForGpuInPollLoop()
+    {
+        if (GpuPollMaxWaitMilliseconds <= 0 || GuestGpuProgress.PendingLabelWrites <= 0)
+        {
+            _gpuPollBurst = 0;
+            return false;
+        }
+
+        var callSite = GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame)
+            ? frame.ReturnRip
+            : 0UL;
+        var now = Stopwatch.GetTimestamp();
+        if (callSite != _gpuPollCallSite || now - _gpuPollLastTicks > GpuPollBurstWindowTicks)
+        {
+            _gpuPollCallSite = callSite;
+            _gpuPollBurst = 0;
+        }
+
+        _gpuPollLastTicks = now;
+        if (++_gpuPollBurst < GpuPollBurstThreshold)
+        {
+            return false;
+        }
+
+        if (!GuestGpuProgress.WaitForCatchUp(GpuPollMaxWaitMilliseconds))
+        {
+            return false;
+        }
+
+        // The wait counts as this burst's latest activity.
+        _gpuPollLastTicks = Stopwatch.GetTimestamp();
+        var count = Interlocked.Increment(ref _gpuPollWaitCount);
+        if (count == 1 || (count >= 1024 && (count & (count - 1)) == 0))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] usleep.gpu_wait call_site=0x{callSite:X16} count={count} " +
+                $"pending={GuestGpuProgress.PendingLabelWrites} - guest polls a GPU label with " +
+                "short sleeps; waiting for the emulated GPU instead of burning its poll budget");
+        }
+
+        return true;
+    }
+
+    private static int ReadGpuPollMaxWaitMilliseconds()
+    {
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GPU_AWARE_USLEEP"),
+                "1",
+                StringComparison.Ordinal))
+        {
+            return 0;
+        }
+
+        var text = Environment.GetEnvironmentVariable("SHARPEMU_GPU_AWARE_USLEEP_MAX_MS");
+        return int.TryParse(text, out var value) && value >= 0
+            ? Math.Min(value, 100)
+            : GuestGpuProgress.DefaultMaxWaitMilliseconds;
     }
 
     private static void TraceUsleepSpin(CpuContext ctx, ulong micros)

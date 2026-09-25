@@ -15,6 +15,7 @@ using SharpEmu.Core.Loader;
 using SharpEmu.Core.Memory;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Diagnostics;
+using SharpEmu.Libs.Gpu;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -365,6 +366,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private bool _logGuestThreads;
 
 	private bool _logUsleep;
+
+	// SHARPEMU_DISABLE_GPU_AWARE_USLEEP=1 restores the plain native usleep
+	// intrinsic (no GPU-progress wait in bounded poll loops, Quake II Q4).
+	private bool _disableGpuAwareUsleep;
 
 	private bool _logFiber;
 
@@ -1202,6 +1207,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_ignoredGuestInt41Count = 0;
 		_logGuestThreads = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_THREADS"), "1", StringComparison.Ordinal);
 		_logUsleep = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_USLEEP"), "1", StringComparison.Ordinal);
+		_disableGpuAwareUsleep = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GPU_AWARE_USLEEP"), "1", StringComparison.Ordinal);
 		_logFiber = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal);
 		_logBootstrap = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOTSTRAP"), "1", StringComparison.Ordinal);
 		_logAllImports = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_ALL_IMPORTS"), "1", StringComparison.Ordinal);
@@ -1357,6 +1363,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				num++;
 				continue;
 			}
+			if (text2 == "1jfXLRVzisc" &&
+				!_logUsleep &&
+				!_disableGpuAwareUsleep &&
+				TryCreateGpuAwareUsleepIntrinsic(num, out var gpuAwareUsleepAddress))
+			{
+				if (!PatchImportStub((nint)(long)num4, gpuAwareUsleepAddress))
+				{
+					LastError = $"Failed to patch GPU-aware usleep import stub at 0x{num4:X16}";
+					return false;
+				}
+				num2++;
+				num++;
+				continue;
+			}
 			if (TryCreateNativeImportIntrinsic(text2, out var intrinsicAddress))
 			{
 				if (!PatchImportStub((nint)(long)num4, intrinsicAddress))
@@ -1408,6 +1428,71 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			hash = (hash ^ (byte)(entryHash & 0xFF)) * 1099511628211UL;
 		}
 		return hash ^ (xor * 1099511628211UL);
+	}
+
+	/// <summary>
+	/// Builds the <c>sceKernelUsleep</c> import as a native fast path guarded by
+	/// the emulated GPU's pending-label-write counter
+	/// (<see cref="GuestGpuProgress"/>). While the counter is zero it behaves
+	/// exactly like the historical intrinsic (yield for &lt;1 ms, Sleep
+	/// otherwise, never leaving native code). While label writes are in flight
+	/// it tail-jumps to the normal HLE import trampoline so
+	/// <c>KernelRuntimeCompatExports.KernelUsleep</c> can let a bounded GPU
+	/// poll loop wait for the GPU instead of exhausting its iteration budget
+	/// (Quake II <c>kexRHIStateGnm::StartFrame</c> → "GPU hanged" → abort).
+	/// The jump happens before any stack adjustment, so the trampoline sees
+	/// the same frame (return address at [rsp]) as a direct import call.
+	/// </summary>
+	private unsafe bool TryCreateGpuAwareUsleepIntrinsic(int importIndex, out nint address)
+	{
+		address = 0;
+		var hleTrampoline = CreateImportHandlerTrampoline(importIndex);
+		if (hleTrampoline == 0 ||
+			!TryCreateNativeImportIntrinsic("1jfXLRVzisc", out var fastPath))
+		{
+			return false;
+		}
+
+		const uint allocationSize = 64u;
+		void* memory = VirtualAlloc(null, allocationSize, 12288u, 64u);
+		if (memory == null)
+		{
+			return false;
+		}
+
+		byte* code = (byte*)memory;
+		var offset = 0;
+		// mov rax, imm64 (pending counter address) — RAX is volatile and the
+		// callee sets it anyway.
+		code[offset++] = 0x48; code[offset++] = 0xB8;
+		*(long*)(code + offset) = GuestGpuProgress.PendingCounterAddress;
+		offset += 8;
+		// cmp dword [rax], 0
+		code[offset++] = 0x83; code[offset++] = 0x38; code[offset++] = 0x00;
+		// jne +12 (skip the fast-path jump below)
+		code[offset++] = 0x75; code[offset++] = 0x0C;
+		// mov rax, imm64 (native fast path); jmp rax
+		code[offset++] = 0x48; code[offset++] = 0xB8;
+		*(long*)(code + offset) = fastPath;
+		offset += 8;
+		code[offset++] = 0xFF; code[offset++] = 0xE0;
+		// mov rax, imm64 (HLE trampoline); jmp rax
+		code[offset++] = 0x48; code[offset++] = 0xB8;
+		*(long*)(code + offset) = hleTrampoline;
+		offset += 8;
+		code[offset++] = 0xFF; code[offset++] = 0xE0;
+
+		uint oldProtect = 0;
+		if (!VirtualProtect(memory, allocationSize, 32u, &oldProtect))
+		{
+			VirtualFree(memory, 0u, 32768u);
+			return false;
+		}
+
+		FlushInstructionCache(GetCurrentProcess(), memory, (nuint)offset);
+		_importHandlerTrampolines.Add((nint)memory);
+		address = (nint)memory;
+		return true;
 	}
 
 	private unsafe bool TryCreateNativeImportIntrinsic(string nid, out nint address)

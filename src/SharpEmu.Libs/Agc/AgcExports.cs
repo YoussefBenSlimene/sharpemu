@@ -5621,9 +5621,29 @@ public static partial class AgcExports
             producerLength,
             debugName);
 
+        // Guest CPU threads bound their GPU-wait polls by iteration count, not
+        // time (Quake II's kexRHIStateGnm::StartFrame: 500 x usleep(1) then
+        // Com_Error "GPU hanged"). Publish the label write as in flight so a
+        // short guest sleep can wait for it instead of burning the budget.
+        var trackedProgress = producer is not null;
+        if (trackedProgress)
+        {
+            GuestGpuProgress.BeginLabelWrite();
+        }
+
+        var progressCompleted = 0;
+        void CompleteProgress()
+        {
+            if (trackedProgress && Interlocked.Exchange(ref progressCompleted, 1) == 0)
+            {
+                GuestGpuProgress.EndLabelWrite();
+            }
+        }
+
         void CompleteAndWake()
         {
             CompleteLabelProducer(producer);
+            CompleteProgress();
             lock (gpuState.WaitMonitorSignalGate)
             {
                 gpuState.WaitMonitorSignalVersion++;
@@ -5640,7 +5660,17 @@ public static partial class AgcExports
 
         void ApplyAndQueueCompletion()
         {
-            action();
+            try
+            {
+                action();
+            }
+            catch
+            {
+                // A throwing side effect must not leave a phantom in-flight
+                // write that stretches every later guest usleep.
+                CompleteProgress();
+                throw;
+            }
             // No label producer → nothing to wake; skip the follow-up enqueue
             // that was doubling OrderedGuestAction traffic during load.
             if (producer is null)
