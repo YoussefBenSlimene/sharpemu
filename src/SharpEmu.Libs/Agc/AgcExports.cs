@@ -1657,6 +1657,10 @@ public static partial class AgcExports
         // One-past the last fully-processed packet, so the orphan sweep can
         // reach packets a suspended queue never got back to.
         public ulong LastParsedAddress { get; set; }
+
+        // When the active submission first counted as suspended (see
+        // PublishInFlightSubmissions); 0 while not suspended.
+        public long SuspendedSinceTicks { get; set; }
     }
 
     private sealed class SubmittedGpuState
@@ -4633,6 +4637,78 @@ public static partial class AgcExports
         SubmittedGpuState gpuState,
         SubmittedDcbState state)
     {
+        try
+        {
+            PumpSubmittedQueueCore(ctx, gpuState, state);
+        }
+        finally
+        {
+            PublishInFlightSubmissions(gpuState);
+        }
+    }
+
+    // A GPU frame never legitimately sits suspended this long; past it a
+    // parked submission stops counting as "GPU busy" so it cannot make every
+    // guest poll loop sleep (see GuestGpuProgress).
+    private static readonly long InFlightSuspendHorizonTicks =
+        2 * System.Diagnostics.Stopwatch.Frequency;
+
+    /// <summary>
+    /// Publishes how many guest command buffers are queued or still being
+    /// parsed (including ones suspended on an unmet GPU wait) to
+    /// <see cref="GuestGpuProgress"/>. Their end-of-pipe label writes are not
+    /// even queued yet, so a guest polling for such a label must keep waiting
+    /// (Quake II kexRHIStateGnm::StartFrame, Q9). Ring-tail parks (waiting for
+    /// the guest to write more commands) and long-suspended queues are
+    /// excluded. Caller holds <c>gpuState.Gate</c>.
+    /// </summary>
+    private static void PublishInFlightSubmissions(SubmittedGpuState gpuState)
+    {
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var count = CountInFlight(gpuState.Graphics, now);
+        foreach (var queue in gpuState.ComputeQueues.Values)
+        {
+            count += CountInFlight(queue, now);
+        }
+
+        GuestGpuProgress.SetInFlightSubmissions(count);
+
+        static int CountInFlight(SubmittedDcbState state, long now)
+        {
+            var count = state.PendingSubmissions.Count;
+            if (!state.HasActiveSubmission)
+            {
+                state.SuspendedSinceTicks = 0;
+                return count;
+            }
+
+            if (!state.IsSuspended)
+            {
+                state.SuspendedSinceTicks = 0;
+                return count + 1;
+            }
+
+            if (state.RingTailParkAddress != 0)
+            {
+                return count;
+            }
+
+            if (state.SuspendedSinceTicks == 0)
+            {
+                state.SuspendedSinceTicks = now;
+            }
+
+            return now - state.SuspendedSinceTicks < InFlightSuspendHorizonTicks
+                ? count + 1
+                : count;
+        }
+    }
+
+    private static void PumpSubmittedQueueCore(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state)
+    {
         if (state.IsSuspended)
         {
             // An explicit new submission supersedes a ring-tail park — the
@@ -7505,6 +7581,10 @@ public static partial class AgcExports
         }
 
         var resumedCount = 0;
+        // Re-evaluate the in-flight count every drain (the wait monitor runs
+        // this every few ms) so a queue crossing the suspend horizon stops
+        // counting as busy even when nothing else changes.
+        PublishInFlightSubmissions(gpuState);
         for (var pass = 0; pass < 256; pass++)
         {
             var woken = GpuWaitRegistry.CollectSatisfied(ctx.Memory, (address, is64Bit) =>
@@ -7599,6 +7679,22 @@ public static partial class AgcExports
     }
 
     private static void ResumeSuspendedDcb(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        in GpuWaitRegistry.WaitingDcb waiter,
+        bool tracePackets)
+    {
+        try
+        {
+            ResumeSuspendedDcbCore(ctx, gpuState, waiter, tracePackets);
+        }
+        finally
+        {
+            PublishInFlightSubmissions(gpuState);
+        }
+    }
+
+    private static void ResumeSuspendedDcbCore(
         CpuContext ctx,
         SubmittedGpuState gpuState,
         in GpuWaitRegistry.WaitingDcb waiter,

@@ -62,6 +62,8 @@ $gpuWait  = (Select-String -Path $logFile -SimpleMatch "usleep.gpu_wait").Count
 $hang     = (Select-String -Path $logFile -SimpleMatch "GPU hanged").Count
 $abort    = (Select-String -Path $logFile -SimpleMatch "abort() called by guest").Count
 $presents = (Select-String -Path $logFile -SimpleMatch "presented guest frame").Count
+$lastWait = Select-String -Path $logFile -SimpleMatch "usleep.gpu_wait" | Select-Object -Last 1
+$gameLines = Select-String -Path $logFile -Pattern "^\d\d:\d\d:\d\d: " | Select-Object -Last 3
 Write-Host ""
 Write-Host "==== verdict ($arm) ===="
 Write-Host "exited before timer : $exitedEarly"
@@ -69,6 +71,9 @@ Write-Host "usleep.gpu_wait     : $gpuWait"
 Write-Host "'GPU hanged'        : $hang"
 Write-Host "guest abort()       : $abort"
 Write-Host "guest frame shown   : $presents"
+if ($lastWait) { Write-Host "last gpu_wait       : $($lastWait.Line.Substring(0, [Math]::Min(220, $lastWait.Line.Length)))" }
+Write-Host "last game output    :"
+$gameLines | ForEach-Object { Write-Host "   $($_.Line)" }
 if ($hang -eq 0 -and $abort -eq 0 -and -not $exitedEarly) {
     Write-Host "PASS: no GPU-hang abort in $TimerSeconds s" -ForegroundColor Green
 } else {

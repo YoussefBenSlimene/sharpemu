@@ -32,6 +32,7 @@ public sealed class GpuAwareUsleepTests : IDisposable
         GuestGpuProgress.BeginLabelWrite();
         GuestGpuProgress.BeginLabelWrite();
         Assert.Equal(2, GuestGpuProgress.PendingLabelWrites);
+        Assert.Equal(2, GuestGpuProgress.Busy);
         unsafe
         {
             Assert.Equal(2, *(int*)GuestGpuProgress.PendingCounterAddress);
@@ -112,6 +113,54 @@ public sealed class GpuAwareUsleepTests : IDisposable
 
         var budget = 500;
         while (Volatile.Read(ref label) != 0)
+        {
+            Assert.True(--budget > 0, "poll budget exhausted: GPU hanged");
+            context[CpuRegister.Rdi] = 1;
+            KernelRuntimeCompatExports.KernelUsleep(context);
+        }
+
+        gpu.Wait();
+    }
+
+    [Fact]
+    public void InFlightSubmissions_CountAsBusy()
+    {
+        GuestGpuProgress.SetInFlightSubmissions(3);
+        Assert.Equal(3, GuestGpuProgress.Busy);
+        GuestGpuProgress.BeginLabelWrite();
+        Assert.Equal(4, GuestGpuProgress.Busy);
+        unsafe
+        {
+            Assert.Equal(4, *(int*)GuestGpuProgress.PendingCounterAddress);
+        }
+
+        GuestGpuProgress.EndLabelWrite();
+        GuestGpuProgress.SetInFlightSubmissions(0);
+        Assert.Equal(0, GuestGpuProgress.Busy);
+    }
+
+    [Fact]
+    public void BoundedPollLoop_SurvivesALabelBehindAnUnparsedSubmission()
+    {
+        // Quake II map-load frame (second user log): the end-of-frame
+        // release_mem sits in a submission that is still suspended behind a
+        // GPU wait, so no label write is queued yet. The frame takes ~400 ms
+        // (pipeline compilation) - far longer than 500 x usleep(1) of yields.
+        var context = new CpuContext(new FakeCpuMemory(0x1000_0000, 0x1000), Generation.Gen5);
+        var label = 0;
+        GuestGpuProgress.SetInFlightSubmissions(1);
+        using var gpu = Task.Run(async () =>
+        {
+            await Task.Delay(400);
+            GuestGpuProgress.BeginLabelWrite();   // parse reaches release_mem
+            GuestGpuProgress.SetInFlightSubmissions(0);
+            await Task.Delay(20);                 // ordered action runs
+            Volatile.Write(ref label, 1);
+            GuestGpuProgress.EndLabelWrite();
+        });
+
+        var budget = 500;
+        while (Volatile.Read(ref label) == 0)
         {
             Assert.True(--budget > 0, "poll budget exhausted: GPU hanged");
             context[CpuRegister.Rdi] = 1;

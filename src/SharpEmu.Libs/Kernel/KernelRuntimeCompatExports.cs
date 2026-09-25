@@ -149,9 +149,15 @@ public static class KernelRuntimeCompatExports
     // GuestGpuProgress' per-call cap and stall guard.
 
     private const int GpuPollBurstThreshold = 4;
-    private static readonly long GpuPollBurstWindowTicks = Stopwatch.Frequency / 200; // 5 ms
+    private const int GpuPollLongBurstThreshold = 32;
+    private static readonly long GpuPollBurstWindowTicks = Stopwatch.Frequency / 10; // 100 ms
     private static readonly int GpuPollMaxWaitMilliseconds = ReadGpuPollMaxWaitMilliseconds();
+    private static readonly int GpuPollLongWaitMilliseconds =
+        GpuPollMaxWaitMilliseconds <= 0
+            ? 0
+            : Math.Max(GpuPollMaxWaitMilliseconds, GuestGpuProgress.DefaultLongWaitMilliseconds);
     private static long _gpuPollWaitCount;
+    private static long _gpuPollWaitTicks;
 
     [ThreadStatic]
     private static ulong _gpuPollCallSite;
@@ -164,7 +170,7 @@ public static class KernelRuntimeCompatExports
 
     internal static bool TryWaitForGpuInPollLoop()
     {
-        if (GpuPollMaxWaitMilliseconds <= 0 || GuestGpuProgress.PendingLabelWrites <= 0)
+        if (GpuPollMaxWaitMilliseconds <= 0 || GuestGpuProgress.Busy <= 0)
         {
             _gpuPollBurst = 0;
             return false;
@@ -181,25 +187,33 @@ public static class KernelRuntimeCompatExports
         }
 
         _gpuPollLastTicks = now;
-        if (++_gpuPollBurst < GpuPollBurstThreshold)
+        var burst = ++_gpuPollBurst;
+        if (burst < GpuPollBurstThreshold)
         {
             return false;
         }
 
-        if (!GuestGpuProgress.WaitForCatchUp(GpuPollMaxWaitMilliseconds))
+        // Escalate: a call site that keeps sleeping while the GPU makes no
+        // progress is a bounded GPU poll (KEX StartFrame: 500 polls); give
+        // each poll a real slice of time so the budget spans a slow frame.
+        var longPoll = burst >= GpuPollLongBurstThreshold;
+        var cap = longPoll ? GpuPollLongWaitMilliseconds : GpuPollMaxWaitMilliseconds;
+        if (!GuestGpuProgress.WaitForIdle(cap, untilIdle: longPoll))
         {
             return false;
         }
 
-        // The wait counts as this burst's latest activity.
-        _gpuPollLastTicks = Stopwatch.GetTimestamp();
+        var after = Stopwatch.GetTimestamp();
+        _gpuPollLastTicks = after;
+        var totalTicks = Interlocked.Add(ref _gpuPollWaitTicks, after - now);
         var count = Interlocked.Increment(ref _gpuPollWaitCount);
-        if (count == 1 || (count >= 1024 && (count & (count - 1)) == 0))
+        if (count <= 4 || (count & (count - 1)) == 0)
         {
             Console.Error.WriteLine(
                 $"[LOADER][INFO] usleep.gpu_wait call_site=0x{callSite:X16} count={count} " +
-                $"pending={GuestGpuProgress.PendingLabelWrites} - guest polls a GPU label with " +
-                "short sleeps; waiting for the emulated GPU instead of burning its poll budget");
+                $"burst={burst} total_ms={totalTicks * 1000 / Stopwatch.Frequency} " +
+                $"{GuestGpuProgress.Describe()} - guest polls GPU state with short sleeps; " +
+                "waiting for the emulated GPU instead of burning its poll budget");
         }
 
         return true;
