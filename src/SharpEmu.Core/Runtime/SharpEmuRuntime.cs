@@ -86,6 +86,10 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         // The compile-time generated registry (SharpEmu.SourceGenerators) is the sole
         // registration source; content tests in SharpEmu.Libs.Tests pin its invariants.
         moduleManager.RegisterExports(SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen4 | Generation.Gen5));
+        // Zero-marshaling leaf handlers for the hottest imports (getspecific,
+        // pthread_self, gettimeofday, ...). Must precede the first
+        // SetupImportStubs, i.e. any image load.
+        NativeFastPathRegistration.Register();
         moduleManager.Freeze();
 
         var virtualMemory = new PhysicalVirtualMemory();

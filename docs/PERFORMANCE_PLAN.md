@@ -49,6 +49,7 @@ hottest shims is the only C#→C++ step contemplated (phase E, optional).
 |---|---|---|
 | Stack-arg capture (`LastImportStack0-5` guest reads/import) gated behind `SHARPEMU_IMPORT_STACK_TRACKING=1` | 4.993 → 4.933 µs/dispatch avg | **−1%, kept** (strictly less work; zero functional loss) |
 | `TryCopy` thread-static last-region cache (+ version-guarded invalidation) | memcpy 3.04 → 2.83 µs; total HLE 767 → 700 CPU-s; dispatch 5.17 → 4.86 µs (Mortal Shell 180 s arms) | **~7% on memcpy, kept** |
+| **Phase B step 3 — native zero-marshaling leaf stubs** (Kyty model: PLT → tiny 4-arg SysV→Win64 call shim → `UnmanagedCallersOnly` handler). NIDs: `scePthreadGetspecific`/`pthread_getspecific`, `scePthreadSelf`/`pthread_self`, `gettimeofday`; opt-out `SHARPEMU_DISABLE_NATIVE_FASTPATH=1` | `scePthreadGetspecific`, `scePthreadSelf`, `gettimeofday` **vanish from the HLE profile** (were 65M+11M+7M calls/180 s). Mortal Shell 180 s: reads ~24k steady, guard kills 0. Smurfs reaches non-black frames faster than before (2/2 readbacks non-zero at 90 s vs 0/2 at 120 s earlier) | **shipped** (`NativeFastPathRegistry` + `NativeFastPathRegistration` + shim emit in `TryCreateNativeImportIntrinsic`) |
 
 ### Phase C findings (2026-09-26, 180 s Mortal Shell A/B)
 

@@ -1503,6 +1503,47 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return false;
 		}
 
+		// Registered zero-marshaling leaf handlers (PERFORMANCE_PLAN phase B):
+		// emit `sub rsp,0x28; move SysV rdi/rsi/rdx/rcx to Win64 rcx/rdx/r8/r9;
+		// call handler; add rsp,0x28; ret`. The handler is an
+		// UnmanagedCallersOnly C# function, so the guest PLT jumps straight to
+		// native code (Kyty model) instead of the full DispatchImport marshaling
+		// — ~0.5-3 µs/call down to ~tens of ns on the hot leaves.
+		if (NativeFastPathRegistry.TryGet(nid, out var handler) && handler != 0)
+		{
+			ReadOnlySpan<byte> shimTemplate =
+			[
+				0x48, 0x83, 0xEC, 0x28,       // sub rsp, 0x28 (shadow space + alignment)
+				0x49, 0x89, 0xFA,             // mov r10, rdi
+				0x49, 0x89, 0xF3,             // mov r11, rsi
+				0x49, 0x89, 0xD0,             // mov r8, rdx
+				0x49, 0x89, 0xC9,             // mov r9, rcx
+				0x4C, 0x89, 0xD1,             // mov rcx, r10
+				0x4C, 0x89, 0xDA,             // mov rdx, r11
+				0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, <handler> (patched at +24)
+				0xFF, 0xD0,                   // call rax
+				0x48, 0x83, 0xC4, 0x28,       // add rsp, 0x28
+				0xC3,                         // ret
+			];
+			const uint shimAllocSize = 128u;
+			void* shimMemory = VirtualAlloc(null, shimAllocSize, 12288u, 64u);
+			if (shimMemory != null)
+			{
+				shimTemplate.CopyTo(new Span<byte>(shimMemory, shimTemplate.Length));
+				*(nint*)((byte*)shimMemory + 24) = handler;
+				uint shimOldProtect = 0;
+				if (VirtualProtect(shimMemory, shimAllocSize, 32u, &shimOldProtect))
+				{
+					FlushInstructionCache(GetCurrentProcess(), shimMemory, (nuint)shimTemplate.Length);
+					address = (nint)shimMemory;
+					_importHandlerTrampolines.Add(address);
+					return true;
+				}
+
+				VirtualFree(shimMemory, 0u, 32768u);
+			}
+		}
+
 		if (nid == "1jfXLRVzisc" &&
 			string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_USLEEP"), "1", StringComparison.Ordinal))
 		{
@@ -1723,18 +1764,33 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				0x75, 0xF5,
 				0xC3,
 			],
+			// memcpy: rep movsb (out-of-order engines make this faster than a
+			// byte loop even for small copies; replaces the old per-byte loop
+			// which turned multi-KB pak staging copies into µs-eaters).
 			"Q3VBxCXhUHs" =>
 			[
-				0x48, 0x89, 0xF8,
-				0x48, 0x85, 0xD2,
-				0x74, 0x11,
-				0x44, 0x8A, 0x06,
-				0x44, 0x88, 0x07,
-				0x48, 0xFF, 0xC6,
-				0x48, 0xFF, 0xC7,
-				0x48, 0xFF, 0xCA,
-				0x75, 0xEF,
-				0xC3,
+				0x48, 0x89, 0xF8,       // mov rax, rdi (return dst)
+				0x48, 0x89, 0xD1,       // mov rcx, rdx
+				0xF3, 0xA4,             // rep movsb
+				0xC3,                   // ret
+			],
+			// memmove: forward or backward rep movsb chosen by overlap.
+			"+P6FRGH4LfA" =>
+			[
+				0x48, 0x89, 0xF8,       // mov rax, rdi
+				0x48, 0x39, 0xF7,       // cmp rdi, rsi
+				0x72, 0x12,             // jb fwd (dst < src -> forward copy is safe)
+				0xFD,                   // std
+				0x48, 0x8D, 0x7C, 0x17, 0xFF, // lea rdi, [rdi+rdx-1]
+				0x48, 0x8D, 0x74, 0x16, 0xFF, // lea rsi, [rsi+rdx-1]
+				0x48, 0x89, 0xD1,       // mov rcx, rdx
+				0xF3, 0xA4,             // rep movsb
+				0xFC,                   // cld
+				0xC3,                   // ret
+				// fwd:
+				0x48, 0x89, 0xD1,       // mov rcx, rdx
+				0xF3, 0xA4,             // rep movsb
+				0xC3,                   // ret
 			],
 			"8zTFvBIAIN8" =>
 			[

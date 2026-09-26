@@ -1431,6 +1431,21 @@ public static class KernelPthreadExtendedCompatExports
         LibraryName = "libKernel")]
     public static int OrbisPthreadSetspecific(CpuContext ctx) => PosixPthreadSetspecific(ctx);
 
+    // Zero-marshaling fast path (NativeFastPathRegistration): identical
+    // semantics to the ctx-based export, minus the CpuContext round-trip.
+    internal static ulong GetSpecificFast(ulong threadHandle, int key)
+    {
+        if (!_tlsKeys.ContainsKey(key))
+        {
+            return 0;
+        }
+
+        return _threadLocalSpecific.TryGetValue(threadHandle, out var values) &&
+            values.TryGetValue(key, out var value)
+                ? value
+                : 0;
+    }
+
     [SysAbiExport(
         Nid = "0-KXaS70xy4",
         ExportName = "pthread_getspecific",
