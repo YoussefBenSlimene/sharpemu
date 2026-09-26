@@ -286,6 +286,54 @@ public sealed class PthreadMutexSemanticsTests
     // re-checking for a waiter that queued during the release (the managed
     // unlock always did), so a managed-path contender could park forever.
     [Fact]
+    public void CondTimedwait_ZeroTimeoutReturnsTimedOutAndKeepsTheMutex()
+    {
+        const ulong memoryBase = 0x3_7100_0000;
+        const ulong condAddress = memoryBase + 0x100;
+        const ulong mutexAddress = memoryBase + 0x200;
+        var memory = new AllocatingCpuMemory(memoryBase, 0x4000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = mutexAddress;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
+
+        for (var i = 0; i < 1000; i++)
+        {
+            context[CpuRegister.Rdi] = condAddress;
+            context[CpuRegister.Rsi] = mutexAddress;
+            context[CpuRegister.Rdx] = 0;
+            Assert.Equal(
+                (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT,
+                KernelPthreadCompatExports.PthreadCondTimedwait(context));
+        }
+
+        // The caller still owns the mutex: another thread cannot take it.
+        // (Synchronous on purpose: an await could resume on another thread
+        // and change the calling thread's pthread identity.)
+        var otherTrylock = 0;
+        var probe = new Thread(() =>
+        {
+            var other = new CpuContext(memory, Generation.Gen5);
+            other[CpuRegister.Rdi] = mutexAddress;
+            otherTrylock = KernelPthreadCompatExports.PthreadMutexTrylock(other);
+        });
+        probe.Start();
+        probe.Join();
+        Assert.NotEqual(0, otherTrylock);
+
+        // A short non-zero timeout still takes the real wait path and re-locks.
+        context[CpuRegister.Rdi] = condAddress;
+        context[CpuRegister.Rsi] = mutexAddress;
+        context[CpuRegister.Rdx] = 2_000;
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT,
+            KernelPthreadCompatExports.PthreadCondTimedwait(context));
+
+        context[CpuRegister.Rdi] = mutexAddress;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+        Assert.NotEqual(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+    }
+
+    [Fact]
     public async Task NativeUnlock_NeverStrandsAManagedWaiter()
     {
         const ulong memoryBase = 0x3_7000_0000;

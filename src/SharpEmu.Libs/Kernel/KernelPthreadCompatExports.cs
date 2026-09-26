@@ -39,6 +39,9 @@ public static class KernelPthreadCompatExports
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_FASTPATH"), "1", StringComparison.Ordinal);
     private static readonly HashSet<ulong>? _tracePthreadMutexFilter = ParseTraceAddressFilter(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_PTHREAD_MUTEX_FILTER"));
+    // A/B switch for the zero-timeout cond_timedwait fast path (PERFORMANCE_PLAN Phase C.1).
+    private static readonly bool _disableCondZeroTimeoutFastPath =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_COND_ZERO_TIMEOUT_FASTPATH"), "1", StringComparison.Ordinal);
     private static long _nextSynchronizationWaiterId;
     private static int _pthreadFastPathTraceWritten;
     private static readonly ConcurrentDictionary<ulong, byte> _pthreadFastPathBusyTraced = new();
@@ -2093,6 +2096,19 @@ public static class KernelPthreadCompatExports
                     ? (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT
                     : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED;
             }
+        }
+
+        // Already-expired timed wait (relative 0 µs, or an absolute deadline in
+        // the past): FreeBSD umtx and Kyty's cond_cv.wait_for(0) report the
+        // timeout without sleeping, and the caller keeps the mutex. Doing the
+        // full enqueue → unlock → block → re-lock cycle for these polls was a
+        // pure HLE round-trip cost in the loader cond-poll storms. No signal
+        // can be lost: a zero-length wait could never have observed one.
+        if (timed && timeoutUsec == 0 && !_disableCondZeroTimeoutFastPath)
+        {
+            return posixErrors
+                ? 60 // ETIMEDOUT
+                : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
         }
 
         var cooperative = GuestThreadExecution.IsGuestThread &&
