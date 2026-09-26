@@ -843,6 +843,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 if (_regions[i].VirtualAddress == address)
                 {
                     _regions.RemoveAt(i);
+                    _regionsVersion++;
                     break;
                 }
             }
@@ -1035,6 +1036,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
                     _fixedGranuleReservationBases.Clear();
                     _regions.Clear();
+                    _regionsVersion++;
                     _pageProtections.Clear();
                     lock (_allocationSearchHintGate)
                     {
@@ -1384,6 +1386,24 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
     }
 
+    // libc memcpy reaches here ~57 bytes per call on UE4 titles (29M calls in
+    // one Mortal Shell boot); a thread-static last-region cache turns the two
+    // binary searches in TryCopy into a hit for the loader's repeated
+    // same-region copies. PERFORMANCE_PLAN Phase B.
+    [ThreadStatic]
+    private static MemoryRegion? _copySourceRegionCache;
+    [ThreadStatic]
+    private static MemoryRegion? _copyDestinationRegionCache;
+    [ThreadStatic]
+    private static int _copyCacheVersion;
+
+    // Bumped on every region-list mutation (map/unmap/remap/merge) so a cached
+    // region can never outlive the memory it refers to.
+    private static int _regionsVersion;
+
+    private static bool RegionCovers(MemoryRegion region, ulong address, ulong size) =>
+        region.VirtualAddress <= address && address - region.VirtualAddress + size <= region.Size;
+
     public bool TryCopy(ulong destinationAddress, ulong sourceAddress, ulong length)
     {
         if (length == 0)
@@ -1402,8 +1422,25 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         _gate.EnterReadLock();
         try
         {
-            var sourceRegion = FindRegion(sourceAddress, length);
-            var destinationRegion = FindRegion(destinationAddress, length);
+            var version = Volatile.Read(ref _regionsVersion);
+            if (version != _copyCacheVersion)
+            {
+                _copySourceRegionCache = null;
+                _copyDestinationRegionCache = null;
+                _copyCacheVersion = version;
+            }
+            var sourceRegion = _copySourceRegionCache;
+            if (sourceRegion is null || !RegionCovers(sourceRegion, sourceAddress, length))
+            {
+                sourceRegion = FindRegion(sourceAddress, length);
+                _copySourceRegionCache = sourceRegion;
+            }
+            var destinationRegion = _copyDestinationRegionCache;
+            if (destinationRegion is null || !RegionCovers(destinationRegion, destinationAddress, length))
+            {
+                destinationRegion = FindRegion(destinationAddress, length);
+                _copyDestinationRegionCache = destinationRegion;
+            }
             if (sourceRegion is null || destinationRegion is null ||
                 !TryResolveRegionOffset(sourceAddress, length, sourceRegion, out var sourceOffset) ||
                 !TryResolveRegionOffset(destinationAddress, length, destinationRegion, out var destinationOffset))
@@ -1624,6 +1661,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     private void InsertRegionSorted(MemoryRegion region)
     {
+        _regionsVersion++;
         var low = 0;
         var high = _regions.Count;
         while (low < high)

@@ -19,6 +19,16 @@ public sealed partial class DirectExecutionBackend
 
 	private static readonly bool _perfHleHistogram =
 		string.Equals(System.Environment.GetEnvironmentVariable("SHARPEMU_PERF_HLE"), "1", System.StringComparison.Ordinal);
+
+	/// <summary>
+	/// When set, every import dispatch also captures the six stack arguments for
+	/// the native-exception dump. Off by default (PERFORMANCE_PLAN Phase B): six
+	/// guest-memory reads per import × up to ~450k imports/s (Mortal Shell
+	/// loaders) is pure steady-state overhead for data only a crash dump reads.
+	/// Enable with SHARPEMU_IMPORT_STACK_TRACKING=1.
+	/// </summary>
+	private static readonly bool _trackImportStackArgs =
+		string.Equals(System.Environment.GetEnvironmentVariable("SHARPEMU_IMPORT_STACK_TRACKING"), "1", System.StringComparison.Ordinal);
 	private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _perfHleCounts = new();
 	private static long _perfHleTotal;
 	private static long _perfHleDispatchTicks;
