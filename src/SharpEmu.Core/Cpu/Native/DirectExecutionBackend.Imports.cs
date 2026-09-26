@@ -19,6 +19,8 @@ namespace SharpEmu.Core.Cpu.Native;
 
 public sealed partial class DirectExecutionBackend
 {
+	private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _unresolvedImportCounts = new(System.StringComparer.Ordinal);
+
 	// The native import trampoline keeps the original guest GPR stack layout at
 	// argPackPtr and stores volatile SysV-only state immediately below it.  This
 	// lets the managed gateway observe AL (the variadic vector-argument count)
@@ -620,9 +622,16 @@ public sealed partial class DirectExecutionBackend
 				{
 					DumpIl2CppExceptionDiagnostic(cpuContext, value, num7);
 				}
-				Console.Error.WriteLine(
-					$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} ret=0x{num7:X16} " +
-					$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} r8=0x{num5:X16} r9=0x{num6:X16}");
+				// Rate-limited per NID: UE online subsystems poll unimplemented
+				// NIDs from a dedicated thread, and each line is a blocking stderr
+				// write (Smurfs/Mortal Shell: ~188 calls per NID per run).
+				var unresolvedCount = _unresolvedImportCounts.AddOrUpdate(importStubEntry.Nid, 1, static (_, n) => n + 1);
+				if (unresolvedCount <= 4 || (unresolvedCount & (unresolvedCount - 1)) == 0)
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][WARN] Import#{num} unresolved: nid={importStubEntry.Nid} count={unresolvedCount} ret=0x{num7:X16} " +
+						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} r8=0x{num5:X16} r9=0x{num6:X16}");
+				}
 				if (importStubEntry.Nid == "L-Q3LEjIbgA")
 				{
 					string value18 = string.Join(" ", importStubEntry.Nid.Select(delegate (char c)

@@ -17,11 +17,38 @@ public static class GameDebug
     private static int _rateBucket;
     private static readonly object Gate = new();
 
-    public static bool Enabled =>
+    // Read once: this is consulted on per-draw hot paths, and an environment
+    // lookup (plus string compare) per draw/compute/present added up.
+    private static readonly bool _enabled =
         !string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_GAME_DBG"),
             "1",
             StringComparison.Ordinal);
+
+    public static bool Enabled => _enabled;
+
+    /// <summary>
+    /// True when the next <see cref="RateLimited"/> call would actually print.
+    /// Callers on per-draw paths check this before formatting the message, so
+    /// the (usually suppressed) string is never built. Advances the bucket.
+    /// </summary>
+    public static bool ShouldEmitRateLimited(int maxPerRun = 64)
+    {
+        if (!_enabled)
+        {
+            return false;
+        }
+
+        var counter = Interlocked.Increment(ref _rateBucket);
+        return counter <= maxPerRun || counter % 64 == 0;
+    }
+
+    /// <summary>Prints a message already admitted by <see cref="ShouldEmitRateLimited"/>.</summary>
+    public static void Emit(string tag, string message)
+    {
+        Console.Error.WriteLine($"[GAME-DBG:{tag}] {message}");
+        Console.Error.Flush();
+    }
 
     /// <summary>
     /// Prints once per key (e.g. an address or call site) — for one-shot

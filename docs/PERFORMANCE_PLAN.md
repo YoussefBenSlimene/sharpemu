@@ -133,3 +133,9 @@ of a C++ rewrite's boundary benefit for ~1% of the code.
   run no longer gets killed mid-poll.
 - Mortal Shell: load measured at ~162 MB/min against an 8.69 GB pak — the
   black screen is dominated by load progress, which Phase C targets.
+
+### Load-time overhead trims (Mortal Shell loader report)
+- Unresolved-import warnings are rate-limited per NID (they used to print on every call, with a stderr flush).
+- GAME-DBG per-draw/compute/present strings are formatted only when the rate limiter admits them (`GameDebug.ShouldEmitRateLimited`/`Emit`); `GameDebug.Enabled` is cached.
+- Kyty-parity offline NpWebApi2 stubs, so the UE online task thread gets a clean offline result instead of unresolved-import traps.
+- Next: make the `DescribeGuestWork` label lazy (it allocates per work item), a cond_timedwait fast path (Kyty `wait_for` shape), an allocation-source audit.

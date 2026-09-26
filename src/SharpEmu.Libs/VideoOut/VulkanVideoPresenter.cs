@@ -15839,21 +15839,26 @@ internal static unsafe class VulkanVideoPresenter
 
                 var traceWork = ShouldTracePresentedGuestImageContentsForDiagnostics();
                 var workStart = traceWork ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
-                if (work is VulkanOffscreenGuestDraw offscreenTrace)
+                // GAME-DBG: which render targets each draw uses — the Mortal
+                // Shell / Quake II black-screen hunt. The rate limiter admits a
+                // tiny fraction of calls, so decide first and only then format:
+                // building these strings unconditionally allocated on every
+                // draw/dispatch (hundreds of thousands per minute while loading).
+                if (work is VulkanOffscreenGuestDraw offscreenTrace &&
+                    SharpEmu.Libs.Diagnostics.GameDebug.ShouldEmitRateLimited())
                 {
-                    // GAME-DBG: which render targets each draw uses — the
-                    // Mortal Shell / Quake II black-screen hunt.
                     var targets = string.Join(
                         ',',
                         offscreenTrace.Targets.Select(static target => $"0x{target.Address:X12}"));
-                    SharpEmu.Libs.Diagnostics.GameDebug.RateLimited(
+                    SharpEmu.Libs.Diagnostics.GameDebug.Emit(
                         "draw",
                         $"seq={pendingGuestWork.Sequence} mrt={offscreenTrace.Targets.Count} " +
                         $"targets=[{targets}] ps=0x{offscreenTrace.ShaderAddress:X12}");
                 }
-                else if (work is VulkanComputeGuestDispatch computeTrace)
+                else if (work is VulkanComputeGuestDispatch computeTrace &&
+                         SharpEmu.Libs.Diagnostics.GameDebug.ShouldEmitRateLimited())
                 {
-                    SharpEmu.Libs.Diagnostics.GameDebug.RateLimited(
+                    SharpEmu.Libs.Diagnostics.GameDebug.Emit(
                         "compute",
                         $"seq={pendingGuestWork.Sequence} cs=0x{computeTrace.ShaderAddress:X12} " +
                         $"groups={computeTrace.GroupCountX}x{computeTrace.GroupCountY}x{computeTrace.GroupCountZ} " +
@@ -16448,13 +16453,16 @@ internal static unsafe class VulkanVideoPresenter
             // fingerprint if known. The Mortal Shell / Quake II black-screen
             // hunt: a present with a valid image but no prior draw into it
             // shows as black.
-            SharpEmu.Libs.Diagnostics.GameDebug.RateLimited(
+            if (SharpEmu.Libs.Diagnostics.GameDebug.ShouldEmitRateLimited())
+            {
+                SharpEmu.Libs.Diagnostics.GameDebug.Emit(
                 "present",
                 $"seq={presentation.Sequence} addr=0x{presentation.GuestImageAddress:X16} " +
                 $"version={presentation.GuestImageVersion} kind={presentation.DrawKind} " +
                 $"pixels={(presentation.Pixels is not null)} " +
                 $"translated={(presentation.TranslatedDraw is not null)} " +
                 $"image={(presentedGuestImage is not null ? $"0x{presentedGuestImage.Address:X16} {presentedGuestImage.Width}x{presentedGuestImage.Height} fmt={presentedGuestImage.Format} init={presentedGuestImage.Initialized}" : "null")}");
+            }
 
             if (recreateAfterPresent)
             {
