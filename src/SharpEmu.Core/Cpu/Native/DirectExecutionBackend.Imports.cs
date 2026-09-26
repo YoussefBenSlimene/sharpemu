@@ -1554,6 +1554,12 @@ public sealed partial class DirectExecutionBackend
 		var expectedMutexTrylockBusy =
 			(nid is "K-jXhbt2gn4" or "upoVrzMHFeE") &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+		// Self-lock on an error-check mutex is PS5-correct and the UE titles
+		// probe it in tight loops (Mortal Shell stormed thousands/sec; each line
+		// is a blocking stderr write and visibly stalls the frame pump).
+		var expectedMutexSelfDeadlock =
+			(nid is "9UK1vLZQft4" or "7H0iTOciTLo") &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
 		var expectedSemaphoreTrywaitAgain =
 			string.Equals(nid, "H2a+IN9TP0E", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN;
@@ -1576,6 +1582,7 @@ public sealed partial class DirectExecutionBackend
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
 			!expectedMutexTrylockBusy &&
+			!expectedMutexSelfDeadlock &&
 			!expectedSemaphoreTrywaitAgain &&
 			!expectedPollSemaBusy &&
 			!expectedNetAcceptWouldBlock &&
@@ -1918,7 +1925,9 @@ public sealed partial class DirectExecutionBackend
 			"lLMT9vJAck0" or // clock_gettime
 			"4J2sUJmuHZQ" or // sceKernelGetProcessTime
 			"fgxnMeTNUtY" or // sceKernelGetProcessTimeCounter
-			"1j3S3n-tTW4";   // sceKernelGetTscFrequency
+			"1j3S3n-tTW4" or // sceKernelGetTscFrequency
+			"EI-5-jlq2dE" or // scePthreadGetthreadid (pure TLS read; UE worker pools poll it in wait loops)
+			"sIlRvQqsN2Y";   // pthread_self (posix alias of the same pattern)
 
 	private void ResetImportLoopPattern()
 	{

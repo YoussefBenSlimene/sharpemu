@@ -1184,8 +1184,8 @@ public static class KernelPthreadCompatExports
         if (state.OwnerThreadId == self)
         {
             // Mirror the fast branch in PthreadMutexLockCore exactly; the
-            // adaptive/error-check semantics (IsGuestTrackedSelfLock) stay in
-            // the managed path.
+            // adaptive type needs IsGuestTrackedSelfLock (guest-memory reads),
+            // which stays in the managed path.
             if (state.Type == MutexTypeRecursive)
             {
                 state.IncrementRecursion();
@@ -1196,6 +1196,16 @@ public static class KernelPthreadCompatExports
             {
                 state.IncrementRecursion();
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            // ErrorCheck (the default mutex type) self-lock: PS5-defined
+            // DEADLOCK (lock) / BUSY (trylock). UE games probe this
+            // deliberately in tight loops — never route them into the slow path.
+            if (state.Type == MutexTypeErrorCheck)
+            {
+                return tryOnly
+                    ? unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY)
+                    : unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK);
             }
 
             return FastPathFallback;
