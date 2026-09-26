@@ -70,9 +70,12 @@ foreach ($m in (Select-String -Path $logFile -Pattern "guest_thread.snapshot han
 }
 foreach ($v in $lastByHandle.Values) { $totalImports += $v }
 
-# "presented guest frame" is a one-shot log (M16); the per-present swapchain
-# readback (TRACE_GUEST_IMAGES=present, enabled above) is the per-frame count.
-$presents = (Select-String -Path $logFile -Pattern "vk\.swapchain_image").Count
+# "presented guest frame" is a one-shot log (M16). vk.swapchain_image is NOT a
+# frame counter: in TRACE_GUEST_IMAGES=present mode the readback only samples
+# frame 1 (ShouldSamplePresentedGuestImageForDiagnostics), so it always read 1.
+# vk.present_taken is logged once per presented guest flip.
+$presents = (Select-String -Path $logFile -Pattern "vk\.present_taken").Count
+$nonBlack = (Select-String -Path $logFile -Pattern "vk\.swapchain_image.*nonblack_pixels=[1-9]").Count
 
 $readCount = 0; $readBytes = 0L
 Select-String -Path $logFile -Pattern "ampr\.read_file.*read=0x([0-9A-Fa-f]+)" |
@@ -82,6 +85,6 @@ $wall = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 $ips  = if ($wall -gt 0) { [int64]($totalImports / $wall) } else { 0 }
 $mbm  = if ($wall -gt 0) { [math]::Round($readBytes / 1MB / ($wall / 60), 1) } else { 0 }
 
-Write-Host ("BENCH game={0} seconds={1} wall_s={2} imports={3} imports_per_s={4} presents={5} reads={6} read_mb={7} read_mb_per_min={8}" -f
-    $Game, $TimerSeconds, $wall, $totalImports, $ips, $presents, $readCount, [math]::Round($readBytes/1MB,1), $mbm)
+Write-Host ("BENCH game={0} seconds={1} wall_s={2} imports={3} imports_per_s={4} presents={5} reads={6} read_mb={7} read_mb_per_min={8} nonblack_readbacks={9}" -f
+    $Game, $TimerSeconds, $wall, $totalImports, $ips, $presents, $readCount, [math]::Round($readBytes/1MB,1), $mbm, $nonBlack)
 Write-Host "Log: $logFile"
