@@ -1225,8 +1225,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Environment.GetEnvironmentVariable("SHARPEMU_PROBE_IMPORT_RET_ADDRESS"));
 		_probeImportReturnAddressCount = 0;
 		_importFilter = Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FILTER");
-		_disableImportLoopGuard = string.Equals(
-			Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD"),
+		// The loop guard is now OPT-IN. Every false fire so far was a legitimate
+		// guest busy-wait (M33 gettimeofday; later getthreadid/mutex poll pairs),
+		// and with fast-path transparency whole classes of valid spin loops
+		// degenerate to a single repeating signature. A wrong kill is worse for
+		// users than a wrong hang; enable with SHARPEMU_IMPORT_LOOP_GUARD=1
+		// when actively hunting a deadlock.
+		_disableImportLoopGuard = !string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_IMPORT_LOOP_GUARD"),
 			"1",
 			StringComparison.Ordinal);
 		_importLoopGuardSeconds = GetImportLoopGuardSeconds();
