@@ -1235,9 +1235,55 @@ public static class KernelPthreadCompatExports
 
         // No waiters + no recursion ⇒ plain release; everything else (waiter
         // handoff, error returns) belongs to the managed core.
-        return state.TryReleaseUncontended(self)
-            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
-            : FastPathFallback;
+        if (!state.TryReleaseUncontended(self))
+        {
+            return FastPathFallback;
+        }
+
+        // P0 (1 present / 300 s after 1035a7d): TryReleaseUncontended checks
+        // QueuedWaiterCount and then clears the owner with a CAS, without
+        // SyncRoot. A contender that finds the mutex owned, takes SyncRoot and
+        // enqueues itself between those two steps sees owner != 0, fails its
+        // TryGrantMutexWaiterLocked and parks — with nobody left to wake it
+        // (WaitForHostMutexLock parks on an untimed ManualResetEventSlim). The
+        // managed unlock always had this re-check; the native unlock dropped
+        // it. Mirror it: if a waiter queued up during the release, run the
+        // same hand-off the managed path runs.
+        if (state.QueuedWaiterCount != 0)
+        {
+            GrantHeadMutexWaiter(state);
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    /// <summary>
+    /// Same hand-off the managed unlock performs under SyncRoot: give the
+    /// free mutex directly to the head waiter and signal it. If another
+    /// locker barged in first, that owner's unlock sees the queued waiter
+    /// (TryReleaseUncontended refuses) and takes the managed hand-off path.
+    /// </summary>
+    private static void GrantHeadMutexWaiter(PthreadMutexState state)
+    {
+        PthreadMutexWaiter? nextWaiter = null;
+        lock (state.SyncRoot)
+        {
+            if (state.OwnerThreadId == 0 &&
+                state.Waiters.First is { } headNode &&
+                TryGrantMutexWaiterLocked(state, headNode.Value))
+            {
+                nextWaiter = headNode.Value;
+                if (!nextWaiter.Cooperative)
+                {
+                    nextWaiter.HostSignal!.Set();
+                }
+            }
+        }
+
+        if (nextWaiter is { Cooperative: true })
+        {
+            _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(nextWaiter.WakeKey, 1);
+        }
     }
 
     private static bool TryFastResolveMutex(ulong mutexAddress, [NotNullWhen(true)] out PthreadMutexState? state)

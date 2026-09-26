@@ -281,6 +281,94 @@ public sealed class PthreadMutexSemanticsTests
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
     }
 
+    // P0 regression (Mortal Shell: ~2,300 presents / 300 s at 3a00b0f, 1 present
+    // after 1035a7d): the native fast unlock released the owner without
+    // re-checking for a waiter that queued during the release (the managed
+    // unlock always did), so a managed-path contender could park forever.
+    [Fact]
+    public async Task NativeUnlock_NeverStrandsAManagedWaiter()
+    {
+        const ulong memoryBase = 0x3_7000_0000;
+        const ulong mutexAddress = memoryBase + 0x100;
+        var memory = new AllocatingCpuMemory(memoryBase, 0x4000);
+        var initContext = new CpuContext(memory, Generation.Gen5);
+        initContext[CpuRegister.Rdi] = mutexAddress;
+        initContext[CpuRegister.Rsi] = 0;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexInit(initContext));
+
+        // Resolve once through the managed path so the fast path has its
+        // SharedMemory reader (exactly what happens in a running game).
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(initContext));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(initContext));
+
+        // Mixed native/managed traffic, like a UE title: most calls hit the
+        // native PLT fast path, contended ones fall back to the managed core
+        // and queue. Bounded by wall time, not iterations, so a stranded
+        // waiter shows up as "no progress" instead of a hung test run.
+        const int fastThreads = 3;
+        const int slowThreads = 3;
+        var stop = DateTime.UtcNow + TimeSpan.FromSeconds(4);
+        var completed = new long[fastThreads + slowThreads];
+        var insideCriticalSection = 0;
+        var violations = 0;
+
+        void Critical()
+        {
+            if (Interlocked.Increment(ref insideCriticalSection) != 1)
+            {
+                Interlocked.Increment(ref violations);
+            }
+
+            Thread.SpinWait(20);
+            Interlocked.Decrement(ref insideCriticalSection);
+        }
+
+        Task Start(int index, bool fast) => Task.Factory.StartNew(() =>
+        {
+            var ctx = new CpuContext(memory, Generation.Gen5) { [CpuRegister.Rdi] = mutexAddress };
+            while (DateTime.UtcNow < stop)
+            {
+                if (!fast ||
+                    KernelPthreadCompatExports.FastMutexLock(mutexAddress) ==
+                    KernelPthreadCompatExports.FastPathFallback)
+                {
+                    Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(ctx));
+                }
+
+                Critical();
+                if (!fast ||
+                    KernelPthreadCompatExports.FastMutexUnlock(mutexAddress) ==
+                    KernelPthreadCompatExports.FastPathFallback)
+                {
+                    Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(ctx));
+                }
+
+                completed[index]++;
+            }
+        }, TaskCreationOptions.LongRunning);
+
+        var tasks = new List<Task>();
+        for (var i = 0; i < fastThreads; i++)
+        {
+            tasks.Add(Start(i, fast: true));
+        }
+
+        for (var i = 0; i < slowThreads; i++)
+        {
+            tasks.Add(Start(fastThreads + i, fast: false));
+        }
+
+        var all = Task.WhenAll(tasks);
+        var finished = await Task.WhenAny(all, Task.Delay(TimeSpan.FromSeconds(30)));
+        Assert.True(
+            ReferenceEquals(finished, all),
+            "mutex hand-off stalled: a waiter was never woken (completed=" +
+            string.Join(",", completed) + ")");
+        await all;
+        Assert.Equal(0, violations);
+        Assert.All(completed, count => Assert.True(count > 0));
+    }
+
     private sealed class AllocatingCpuMemory : ICpuMemory, IGuestMemoryAllocator
     {
         private readonly ulong _baseAddress;
