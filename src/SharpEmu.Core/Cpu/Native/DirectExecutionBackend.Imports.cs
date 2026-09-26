@@ -337,12 +337,15 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.LastImportRcx = num4;
 			activeGuestThreadState.LastImportR8 = num5;
 			activeGuestThreadState.LastImportR9 = num6;
-			activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
-			activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
-			activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
-			activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
-			activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
-			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
+			if (_trackImportStackArgs)
+			{
+				activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
+				activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
+				activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
+				activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
+				activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
+				activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
+			}
 			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, num7);
 			// Publish the NID last so readers cannot pair a new import name with
@@ -1377,12 +1380,15 @@ public sealed partial class DirectExecutionBackend
 			activeGuestThreadState.LastImportRcx = *(ulong*)(argPackPtr + 24);
 			activeGuestThreadState.LastImportR8 = *(ulong*)(argPackPtr + 32);
 			activeGuestThreadState.LastImportR9 = *(ulong*)(argPackPtr + 40);
-			activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
-			activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
-			activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
-			activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
-			activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
-			activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
+			if (_trackImportStackArgs)
+			{
+				activeGuestThreadState.LastImportStack0 = ReadImportStackArgument(argPackPtr, 0);
+				activeGuestThreadState.LastImportStack1 = ReadImportStackArgument(argPackPtr, 1);
+				activeGuestThreadState.LastImportStack2 = ReadImportStackArgument(argPackPtr, 2);
+				activeGuestThreadState.LastImportStack3 = ReadImportStackArgument(argPackPtr, 3);
+				activeGuestThreadState.LastImportStack4 = ReadImportStackArgument(argPackPtr, 4);
+				activeGuestThreadState.LastImportStack5 = ReadImportStackArgument(argPackPtr, 5);
+			}
 			Volatile.Write(ref activeGuestThreadState.LastImportResultValid, 0);
 			Volatile.Write(ref activeGuestThreadState.LastReturnRip, returnRip);
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
@@ -1852,6 +1858,16 @@ public sealed partial class DirectExecutionBackend
 			ResetImportLoopPattern();
 			return false;
 		}
+		if (IsImportLoopGuardTransparent(entry.Nid))
+		{
+			// Non-blocking, side-effect-free time queries: a guest thread
+			// polling gettimeofday/clock_gettime is *waiting for a deadline*,
+			// not stuck in a hung import sequence. Under emulation a short
+			// guest-visible busy tail can sustain seconds of host time (M33:
+			// the watchdog killed Mortal Shell's loader mid-poll, freezing the
+			// game at ~79 s), so these calls must not build loop-guard hits.
+			return false;
+		}
 		var value = entry.NidHash;
 		RecordImportLoopSignature(value, returnRip, BuildImportLoopSignature(value, returnRip, arg0, arg1));
 		// The O(period x repeats) pattern scan is a boot/hang watchdog, not a
@@ -1895,6 +1911,14 @@ public sealed partial class DirectExecutionBackend
 			"BmMjYxmew1w" or // scePthreadCondTimedwait
 			"Op8TBGY5KHg" or // pthread_cond_wait
 			"27bAgiJmOh0";   // pthread_cond_timedwait
+
+	private static bool IsImportLoopGuardTransparent(string nid) =>
+		nid is
+			"n88vx3C5nW8" or // gettimeofday
+			"lLMT9vJAck0" or // clock_gettime
+			"4J2sUJmuHZQ" or // sceKernelGetProcessTime
+			"fgxnMeTNUtY" or // sceKernelGetProcessTimeCounter
+			"1j3S3n-tTW4";   // sceKernelGetTscFrequency
 
 	private void ResetImportLoopPattern()
 	{

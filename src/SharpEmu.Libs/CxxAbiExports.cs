@@ -16,11 +16,24 @@ public static class CxaGuardExports
 
     private sealed class GuardState
     {
-        public int OwnerThreadId { get; set; }
+        public ulong OwnerThreadId { get; set; }
         public int RecursionDepth { get; set; }
     }
 
     private static readonly ConcurrentDictionary<ulong, GuardState> _inProgress = new();
+
+    // Guest-thread identity, NOT the host managed thread id: guest threads are
+    // resumed on different host threads by the native worker pool (M14), so a
+    // guard acquired on host thread X can be released while running on host
+    // thread Y. Keying on Environment.CurrentManagedThreadId made such
+    // releases return INVALID_ARGUMENT, leaving the guard pending forever and
+    // every later __cxa_guard_acquire spinning (Smurfs S5: wedge right after
+    // RenderThread/RHIThread spawn).
+    private static ulong CurrentGuardThreadId()
+    {
+        var guest = GuestThreadExecution.CurrentGuestThreadHandle;
+        return guest != 0 ? guest : (ulong)Environment.CurrentManagedThreadId;
+    }
 
     [SysAbiExport(
         Nid = "3GPpjQdAMTw",
@@ -36,7 +49,7 @@ public static class CxaGuardExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var currentThreadId = Environment.CurrentManagedThreadId;
+        var currentThreadId = CurrentGuardThreadId();
         var spinner = new SpinWait();
         while (true)
         {
@@ -107,7 +120,7 @@ public static class CxaGuardExports
         }
 
         if (_inProgress.TryGetValue(guardPtr, out var state) &&
-            state.OwnerThreadId != Environment.CurrentManagedThreadId)
+            state.OwnerThreadId != CurrentGuardThreadId())
         {
             ctx[CpuRegister.Rax] = 0;
             LogGuardResult("guard_release", guardPtr, result: 0, initialized: false, inProgress: true, ownerThreadId: state.OwnerThreadId);
@@ -156,7 +169,7 @@ public static class CxaGuardExports
         }
 
         if (_inProgress.TryGetValue(guardPtr, out var state) &&
-            state.OwnerThreadId != Environment.CurrentManagedThreadId)
+            state.OwnerThreadId != CurrentGuardThreadId())
         {
             ctx[CpuRegister.Rax] = 0;
             LogGuardResult("guard_abort", guardPtr, result: 0, initialized: false, inProgress: true, ownerThreadId: state.OwnerThreadId);
@@ -209,7 +222,7 @@ public static class CxaGuardExports
             $"[LOADER][TRACE] {op}: guard=0x{guardPtr:X16} init={initialized} in_progress={inProgress} word={(readable ? $"0x{word:X16}" : "<unreadable>")}");
     }
 
-    private static void LogGuardResult(string op, ulong guardPtr, int result, bool initialized, bool inProgress, int ownerThreadId)
+    private static void LogGuardResult(string op, ulong guardPtr, int result, bool initialized, bool inProgress, ulong ownerThreadId)
     {
         if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUARDS"), "1", StringComparison.Ordinal))
         {
