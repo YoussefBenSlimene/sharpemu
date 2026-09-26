@@ -1141,6 +1141,135 @@ public static class KernelPthreadCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // ---- Zero-marshaling mutex fast path (PERFORMANCE_PLAN next lever) ----
+    //
+    // FastMutexLock/Unlock run directly from the guest PLT stub (raw function
+    // pointer via NativeFastPathRegistry) and return FastPathFallback for any
+    // case the full managed PthreadMutexLockCore must decide (contention,
+    // blocking, DEADLOCK checks, waiter handoff). The shared guest-memory
+    // reader is installed from the ctx-carrying resolve path, so alias
+    // resolution (`[mutexAddress]` slot outranks the cached handle — the
+    // Demon's Souls reusable-slot case) is still honored on every call.
+    internal const ulong FastPathFallback = SharpEmu.HLE.NativeFastPathRegistry.FallbackSentinel;
+
+    internal static ICpuMemory? SharedMemory { get; private set; }
+
+    internal static void FastMutexReset()
+    {
+        SharedMemory = null;
+    }
+
+    internal static ulong FastMutexLock(ulong mutexAddress) => FastMutexLockCore(mutexAddress, tryOnly: false);
+
+    internal static ulong FastMutexTrylock(ulong mutexAddress) => FastMutexLockCore(mutexAddress, tryOnly: true);
+
+    private static ulong FastMutexLockCore(ulong mutexAddress, bool tryOnly)
+    {
+        if (mutexAddress == 0 || !TryFastResolveMutex(mutexAddress, out var state))
+        {
+            return FastPathFallback;
+        }
+
+        var self = KernelPthreadState.GetCurrentThreadHandle();
+        if (self == 0)
+        {
+            return FastPathFallback;
+        }
+
+        if (state.TryAcquireUncontended(self, allowWaiterBarge: tryOnly))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        if (state.OwnerThreadId == self)
+        {
+            // Mirror the fast branch in PthreadMutexLockCore exactly; the
+            // adaptive/error-check semantics (IsGuestTrackedSelfLock) stay in
+            // the managed path.
+            if (state.Type == MutexTypeRecursive)
+            {
+                state.IncrementRecursion();
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            if (state.Type == MutexTypeNormal && !tryOnly)
+            {
+                state.IncrementRecursion();
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            return FastPathFallback;
+        }
+
+        return FastPathFallback;
+    }
+
+    internal static ulong FastMutexUnlock(ulong mutexAddress)
+    {
+        if (mutexAddress == 0 || !TryFastResolveMutex(mutexAddress, out var state))
+        {
+            return FastPathFallback;
+        }
+
+        var self = KernelPthreadState.GetCurrentThreadHandle();
+        if (self == 0 || state.OwnerThreadId != self)
+        {
+            return FastPathFallback;
+        }
+
+        if (state.RecursionCount > 1)
+        {
+            state.DecrementRecursion();
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        // No waiters + no recursion ⇒ plain release; everything else (waiter
+        // handoff, error returns) belongs to the managed core.
+        return state.TryReleaseUncontended(self)
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : FastPathFallback;
+    }
+
+    private static bool TryFastResolveMutex(ulong mutexAddress, [NotNullWhen(true)] out PthreadMutexState? state)
+    {
+        state = null;
+        if (SharedMemory is not { } memory)
+        {
+            return false;
+        }
+
+        ulong pointedHandle = 0;
+        Span<byte> pointedBytes = stackalloc byte[sizeof(ulong)];
+        if (memory.TryRead(mutexAddress, pointedBytes))
+        {
+            pointedHandle = BinaryPrimitives.ReadUInt64LittleEndian(pointedBytes);
+        }
+
+        if (_mutexStates.TryGetValue(mutexAddress, out var cached))
+        {
+            if (pointedHandle != 0 &&
+                pointedHandle != mutexAddress &&
+                _mutexStates.TryGetValue(pointedHandle, out var pointedState) &&
+                !ReferenceEquals(pointedState, cached))
+            {
+                state = pointedState;
+                return true;
+            }
+
+            state = cached;
+            return true;
+        }
+
+        if (pointedHandle != 0 && pointedHandle != mutexAddress && _mutexStates.TryGetValue(pointedHandle, out var viaHandle))
+        {
+            _mutexStates[mutexAddress] = viaHandle;
+            state = viaHandle;
+            return true;
+        }
+
+        return false;
+    }
+
     private static int PthreadMutexLockCore(CpuContext ctx, ulong mutexAddress, bool tryOnly)
     {
         if (mutexAddress == 0)
@@ -1549,6 +1678,9 @@ public static class KernelPthreadCompatExports
 
     private static bool TryResolveMutexState(CpuContext ctx, ulong mutexAddress, bool createIfZero, out ulong resolvedAddress, [NotNullWhen(true)] out PthreadMutexState? state)
     {
+        // Feed the native fast path (FastMutexLock/Unlock): the shim has no
+        // CpuContext, so it needs the address-space reader captured here.
+        SharedMemory ??= ctx.Memory;
         resolvedAddress = 0;
         state = null;
         if (mutexAddress == 0)

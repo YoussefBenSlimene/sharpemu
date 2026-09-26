@@ -66,10 +66,29 @@ public static class NativeFastPathRegistration
             return;
         }
 
+        // Mutex fast paths return KernelPthreadCompatExports.FastPathFallback
+        // whenever the managed core must decide (contention, blocking, waiter
+        // handoff); the backend's shim tail-jumps to the full trampoline then.
+        NativeFastPathRegistry.RegisterWithFallback("9UK1vLZQft4", (nint)(delegate* unmanaged[Cdecl]<ulong, ulong>)&FastMutexLock);      // scePthreadMutexLock
+        NativeFastPathRegistry.RegisterWithFallback("7H0iTOciTLo", (nint)(delegate* unmanaged[Cdecl]<ulong, ulong>)&FastMutexLock);      // pthread_mutex_lock
+        NativeFastPathRegistry.RegisterWithFallback("upoVrzMHFeE", (nint)(delegate* unmanaged[Cdecl]<ulong, ulong>)&FastMutexTrylock);   // scePthreadMutexTrylock
+        NativeFastPathRegistry.RegisterWithFallback("K-jXhbt2gn4", (nint)(delegate* unmanaged[Cdecl]<ulong, ulong>)&FastMutexTrylock);   // pthread_mutex_trylock
+        NativeFastPathRegistry.RegisterWithFallback("tn3VlD0hG60", (nint)(delegate* unmanaged[Cdecl]<ulong, ulong>)&FastMutexUnlock);    // scePthreadMutexUnlock
+        NativeFastPathRegistry.RegisterWithFallback("2Z+PpY6CaJg", (nint)(delegate* unmanaged[Cdecl]<ulong, ulong>)&FastMutexUnlock);    // pthread_mutex_unlock
+
         NativeFastPathRegistry.Register("eoht7mQOCmo", (nint)(delegate* unmanaged[Cdecl]<ulong, ulong>)&FastGetspecific); // scePthreadGetspecific
         NativeFastPathRegistry.Register("0-KXaS70xy4", (nint)(delegate* unmanaged[Cdecl]<ulong, ulong>)&FastGetspecific); // pthread_getspecific
         NativeFastPathRegistry.Register("aI+OeCz8xrQ", (nint)(delegate* unmanaged[Cdecl]<ulong>)&FastPthreadSelf);        // scePthreadSelf
         NativeFastPathRegistry.Register("EotR8a3ASf4", (nint)(delegate* unmanaged[Cdecl]<ulong>)&FastPthreadSelf);        // pthread_self
         NativeFastPathRegistry.Register("n88vx3C5nW8", (nint)(delegate* unmanaged[Cdecl]<ulong, ulong, ulong>)&FastGettimeofday); // gettimeofday
     }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static ulong FastMutexLock(ulong mutexAddress) => KernelPthreadCompatExports.FastMutexLock(mutexAddress);
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static ulong FastMutexTrylock(ulong mutexAddress) => KernelPthreadCompatExports.FastMutexTrylock(mutexAddress);
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static ulong FastMutexUnlock(ulong mutexAddress) => KernelPthreadCompatExports.FastMutexUnlock(mutexAddress);
 }

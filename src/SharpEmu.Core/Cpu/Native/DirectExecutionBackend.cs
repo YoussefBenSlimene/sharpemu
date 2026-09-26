@@ -1377,6 +1377,29 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				num++;
 				continue;
 			}
+			// Fast handlers that can DECLINE the call (return the sentinel) get a
+			// shim that tail-jumps into the full trampoline, preserving the guest
+			// argument registers across the fast probe.
+			if (NativeFastPathRegistry.TryGet(text2, out var fallbackHandler) &&
+				fallbackHandler != 0 &&
+				NativeFastPathRegistry.HasFallback(text2))
+			{
+				nint slowTrampoline = CreateImportHandlerTrampoline(num);
+				if (slowTrampoline == 0)
+				{
+					LastError = "Failed to create import trampoline for NID " + text2;
+					return false;
+				}
+				if (!TryCreateNativeFastShim(fallbackHandler, slowTrampoline, out var fastShim) ||
+					!PatchImportStub((nint)(long)num4, fastShim))
+				{
+					LastError = $"Failed to patch native fast-path stub with fallback at 0x{num4:X16}";
+					return false;
+				}
+				num2++;
+				num++;
+				continue;
+			}
 			if (TryCreateNativeImportIntrinsic(text2, out var intrinsicAddress))
 			{
 				if (!PatchImportStub((nint)(long)num4, intrinsicAddress))
@@ -1495,6 +1518,75 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return true;
 	}
 
+	/// <summary>
+	/// Builds a fast-path shim for a registered handler that can decline the
+	/// call by returning <see cref="NativeFastPathRegistry.FallbackSentinel"/>.
+	/// Layout: save guest rdi/rsi/rdx/rcx, marshal them to Win64 rcx/rdx/r8/r9,
+	/// call the handler; on the sentinel restore the saved registers and
+	/// tail-jump to the full import trampoline (which rebuilds everything
+	/// itself, so the fast probe must leave the guest-visible registers intact).
+	/// </summary>
+	private unsafe bool TryCreateNativeFastShim(nint handler, nint slowTrampoline, out nint address)
+	{
+		byte[] code =
+		[
+			0x57,                               // push rdi
+			0x56,                               // push rsi
+			0x52,                               // push rdx
+			0x51,                               // push rcx
+			0x48, 0x83, 0xEC, 0x28,             // sub rsp, 0x28
+			0x49, 0x89, 0xFA,                   // mov r10, rdi
+			0x49, 0x89, 0xF3,                   // mov r11, rsi
+			0x49, 0x89, 0xD0,                   // mov r8, rdx
+			0x49, 0x89, 0xC9,                   // mov r9, rcx
+			0x4C, 0x89, 0xD1,                   // mov rcx, r10
+			0x4C, 0x89, 0xDA,                   // mov rdx, r11
+			0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, <handler>     (imm @28)
+			0xFF, 0xD0,                         // call rax
+			0x48, 0x83, 0xC4, 0x28,             // add rsp, 0x28
+			0x49, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, // mov r11, <sentinel>    (imm @44)
+			0x4C, 0x39, 0xD8,                   // cmp rax, r11
+			0x75, 0x10,                         // jne good (+16 -> off 73)
+			0x59,                               // pop rcx  (restore guest args)
+			0x5A,                               // pop rdx
+			0x5E,                               // pop rsi
+			0x5F,                               // pop rdi
+			0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, <slow>        (imm @63)
+			0xFF, 0xE0,                         // jmp rax
+			// off 73:
+			0x59,                               // good: pop rcx
+			0x5A,                               // pop rdx
+			0x5E,                               // pop rsi
+			0x5F,                               // pop rdi
+			0xC3,                               // ret
+		];
+
+		void* memory = VirtualAlloc(null, 128u, 12288u, 64u);
+		if (memory == null)
+		{
+			address = 0;
+			return false;
+		}
+
+		code.CopyTo(new Span<byte>(memory, code.Length));
+		*(nint*)((byte*)memory + 28) = handler;
+		*(ulong*)((byte*)memory + 44) = NativeFastPathRegistry.FallbackSentinel;
+		*(nint*)((byte*)memory + 63) = slowTrampoline;
+
+		uint oldProtect = 0;
+		if (!VirtualProtect(memory, 128u, 32u, &oldProtect))
+		{
+			VirtualFree(memory, 0u, 32768u);
+			address = 0;
+			return false;
+		}
+
+		FlushInstructionCache(GetCurrentProcess(), memory, (nuint)code.Length);
+		address = (nint)memory;
+		_importHandlerTrampolines.Add(address);
+		return true;
+	}
+
 	private unsafe bool TryCreateNativeImportIntrinsic(string nid, out nint address)
 	{
 		if (IsHlePreferredNid(nid))
@@ -1509,7 +1601,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		// UnmanagedCallersOnly C# function, so the guest PLT jumps straight to
 		// native code (Kyty model) instead of the full DispatchImport marshaling
 		// — ~0.5-3 µs/call down to ~tens of ns on the hot leaves.
-		if (NativeFastPathRegistry.TryGet(nid, out var handler) && handler != 0)
+		// Fallback-capable handlers (mutex lock/unlock) are installed by
+		// SetupImportStubs itself so it can pass the full-trampoline address.
+		if (!NativeFastPathRegistry.HasFallback(nid) &&
+			NativeFastPathRegistry.TryGet(nid, out var handler) && handler != 0)
 		{
 			ReadOnlySpan<byte> shimTemplate =
 			[
