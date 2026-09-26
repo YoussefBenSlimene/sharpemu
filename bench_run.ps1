@@ -28,9 +28,18 @@ $gamePath = $games[$Game]
 
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFile = "${LogPrefix}_${Game}_$stamp.txt"
-$exePath = (Resolve-Path "artifacts\bin\Debug\net10.0\win-x64\SharpEmu.exe").Path
-
-if (-not (Test-Path -LiteralPath $exePath)) { Write-Host "ERROR: exe missing"; exit 1 }
+# Stale-binary guard (GAME_TRACKING M13): `dotnet build` writes Debug and
+# `dotnet build -c Release` writes Release. Run whichever is NEWER and print
+# its timestamp, so a Release rebuild is never silently benchmarked with an
+# old Debug exe.
+$candidates = @("artifacts\bin\Debug\net10.0\win-x64\SharpEmu.exe",
+                "artifacts\bin\Release\net10.0\win-x64\SharpEmu.exe") |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    ForEach-Object { Get-Item -LiteralPath $_ } |
+    Sort-Object LastWriteTime -Descending
+if (-not $candidates) { Write-Host "ERROR: exe missing (run dotnet build)"; exit 1 }
+$exePath = $candidates[0].FullName
+Write-Host ("Exe: {0}  built {1}  (HEAD {2})" -f $exePath, $candidates[0].LastWriteTime, (git log -1 --format="%h %ci" 2>$null))
 if (-not (Test-Path -LiteralPath $gamePath)) { Write-Host "ERROR: game missing: $gamePath"; exit 1 }
 
 # Fixed measurement set (see header). Everything else stays off.
