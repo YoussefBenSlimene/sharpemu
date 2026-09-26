@@ -333,6 +333,51 @@ public sealed class PthreadMutexSemanticsTests
         Assert.NotEqual(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
     }
 
+    // Mortal Shell livelock (bench_mortal_20260926_215631): a thread that
+    // holds the mutex and polls cond_timedwait(0) must still release it on each
+    // poll whenever a locker is queued, or that locker starves forever.
+    [Fact]
+    public void CondTimedwait_ZeroTimeoutPollLetsAQueuedLockerIn()
+    {
+        const ulong memoryBase = 0x3_7200_0000;
+        const ulong condAddress = memoryBase + 0x100;
+        const ulong mutexAddress = memoryBase + 0x200;
+        var memory = new AllocatingCpuMemory(memoryBase, 0x4000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = mutexAddress;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
+
+        var lockerAcquired = 0;
+        var locker = new Thread(() =>
+        {
+            var other = new CpuContext(memory, Generation.Gen5);
+            other[CpuRegister.Rdi] = mutexAddress;
+            if (KernelPthreadCompatExports.PthreadMutexLock(other) == 0)
+            {
+                Volatile.Write(ref lockerAcquired, 1);
+                other[CpuRegister.Rdi] = mutexAddress;
+                _ = KernelPthreadCompatExports.PthreadMutexUnlock(other);
+            }
+        }) { IsBackground = true };
+        locker.Start();
+
+        var deadline = Environment.TickCount64 + 5_000;
+        while (Volatile.Read(ref lockerAcquired) == 0 && Environment.TickCount64 < deadline)
+        {
+            context[CpuRegister.Rdi] = condAddress;
+            context[CpuRegister.Rsi] = mutexAddress;
+            context[CpuRegister.Rdx] = 0;
+            Assert.Equal(
+                (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT,
+                KernelPthreadCompatExports.PthreadCondTimedwait(context));
+        }
+
+        Assert.Equal(1, Volatile.Read(ref lockerAcquired));
+        Assert.True(locker.Join(5_000));
+        context[CpuRegister.Rdi] = mutexAddress;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+    }
+
     [Fact]
     public async Task NativeUnlock_NeverStrandsAManagedWaiter()
     {

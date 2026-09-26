@@ -2099,12 +2099,19 @@ public static class KernelPthreadCompatExports
         }
 
         // Already-expired timed wait (relative 0 µs, or an absolute deadline in
-        // the past): FreeBSD umtx and Kyty's cond_cv.wait_for(0) report the
-        // timeout without sleeping, and the caller keeps the mutex. Doing the
-        // full enqueue → unlock → block → re-lock cycle for these polls was a
-        // pure HLE round-trip cost in the loader cond-poll storms. No signal
-        // can be lost: a zero-length wait could never have observed one.
-        if (timed && timeoutUsec == 0 && !_disableCondZeroTimeoutFastPath)
+        // the past). Kyty and FreeBSD umtx still UNLOCK the mutex, see the
+        // timeout, and RE-LOCK it, and that release matters: a thread polling
+        // cond_timedwait(0) in a loop gives queued lockers a turn on every
+        // iteration. The first version of this fast path skipped the
+        // unlock/relock completely and livelocked Mortal Shell
+        // (SlateLoadingThread1 / AudioMixer / AgcCleanup starved in
+        // pthread_mutex_lock forever, presents stopped at ~2000). With nobody
+        // queued on the mutex, unlock+relock is a no-op, so only then do we
+        // skip the full enqueue → unlock → block → re-lock cycle. Any contender
+        // (native fast path included) that fails to lock enqueues itself, so
+        // QueuedWaiterCount covers every thread that could be starved.
+        if (timed && timeoutUsec == 0 && !_disableCondZeroTimeoutFastPath &&
+            mutexState.QueuedWaiterCount == 0)
         {
             return posixErrors
                 ? 60 // ETIMEDOUT
