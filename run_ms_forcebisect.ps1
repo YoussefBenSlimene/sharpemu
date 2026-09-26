@@ -30,6 +30,8 @@ param(
     [string]$TraceGuestTextureAddresses = "",
     [string]$TraceStorageImageInit = "",
     [switch]$ForceTexelUpload,
+    [switch]$ThreadSnapshots,
+    [switch]$AmprTrace,
     [int]$TimerSeconds = 150
 )
 $ErrorActionPreference = "Stop"
@@ -97,24 +99,27 @@ $env:SHARPEMU_GUEST_IMAGE_DUMP_DIR = $dumpDir
 # Always on: the upload-known audit is cheap (once per address) and is the
 # difference between "no upload happened" and "the upload was silently skipped".
 $env:SHARPEMU_TRACE_UPLOAD_KNOWN = "1"
+if ($ThreadSnapshots) {
+    # Per-second per-thread state table — answers "are the loaders still
+    # churning?" for the M32 slow-load vs stuck-load verdict.
+    $env:SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS = "1"
+}
+if ($AmprTrace) {
+    # ampr.read_file lines with byte counts — proves the pak is still being
+    # read (and how fast) at any point in the run.
+    $env:SHARPEMU_LOG_AMPR = "1"
+}
 
 Write-Host "Arm: $arm   Targets: $Targets   WhiteTextures: $WhiteTextureTargets   Timer: $TimerSeconds s"
 Write-Host "Log: $logFile"
 
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $exePath
-$psi.Arguments = "`"$gamePath`""
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError = $true
-$psi.UseShellExecute = $false
-$psi.CreateNoWindow = $true
-
-$process = New-Object System.Diagnostics.Process
-$process.StartInfo = $psi
-$process.Start() | Out-Null
-
-$outputTask = $process.StandardOutput.ReadToEndAsync()
-$stderrOutput = $process.StandardError.ReadToEndAsync()
+# Redirect straight to the log file with native redirection so the log is
+# written incrementally and survives a Ctrl+C / window kill of this harness
+# (the previous ReadToEndAsync buffer lost the whole log when the run froze
+# and had to be killed — 2026-09-26 01:19 freeze, M33).
+$process = Start-Process -FilePath "cmd.exe" `
+    -ArgumentList "/c `"`"$exePath`" `"$gamePath`" > `"$logFile`" 2>&1`"" `
+    -WindowStyle Hidden -PassThru
 
 Start-Sleep -Seconds $TimerSeconds
 
@@ -127,6 +132,4 @@ if (!$process.HasExited) { $process.Kill() }
 # running while the next arm starts. Clean up both.
 Get-Process SharpEmu -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-$combinedOutput = $outputTask.Result + $stderrOutput.Result
-$combinedOutput | Out-File -FilePath $logFile -Encoding UTF8
 Write-Host "Logs saved to: $logFile"
