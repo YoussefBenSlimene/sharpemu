@@ -49,76 +49,52 @@ if (-not (Test-Path $gamePath)) { Write-Host "ERROR: game missing"; exit 1 }
 if (Test-Path $dumpDir) { Remove-Item $dumpDir -Recurse -Force }
 New-Item -ItemType Directory -Path $dumpDir | Out-Null
 
-$env:SHARPEMU_WRITABLE_APP0 = "1"
-$env:SHARPEMU_GUEST_IMAGE_CPU_SYNC = "0"
-$env:SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC = "1"
+# Env vars go into the CHILD process only. PowerShell's env: provider mutates
+# the *session* environment (harness runs poisoned every later manual game run
+# in the same terminal — the "fps 52 -> 2.4" user report was exactly that),
+# so never $env:X = ... here.
+$childEnv = @{
+    SHARPEMU_WRITABLE_APP0 = "1"
+    SHARPEMU_GUEST_IMAGE_CPU_SYNC = "0"
+    SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC = "1"
+    # Verdict: read the presented image back and dump frames.
+    SHARPEMU_TRACE_GUEST_IMAGES = "present"
+    SHARPEMU_SWAPCHAIN_DUMP_EVERY = "100"
+    SHARPEMU_GUEST_IMAGE_DUMP_DIR = $dumpDir
+    # Always on: the upload-known audit is cheap (once per address).
+    SHARPEMU_TRACE_UPLOAD_KNOWN = "1"
+}
 if ($Targets) {
-    $env:SHARPEMU_FORCE_FULLSCREEN_VERTEX_TARGETS = $Targets
-    $env:SHARPEMU_FORCE_SOLID_FRAGMENT_TARGETS = $Targets
-    $env:SHARPEMU_FORCE_DEFAULT_RASTER_STATE_TARGETS = $Targets
-    # Proof that the override reached a draw: the presenter writes this file iff
-    # forceSolidFragment was true for some pipeline (VulkanVideoPresenter:7438).
-    $env:SHARPEMU_DUMP_FIXED_SOLID_FRAGMENT = (Join-Path $PSScriptRoot "forced_solid_fragment.spv")
+    $childEnv.SHARPEMU_FORCE_FULLSCREEN_VERTEX_TARGETS = $Targets
+    $childEnv.SHARPEMU_FORCE_SOLID_FRAGMENT_TARGETS = $Targets
+    $childEnv.SHARPEMU_FORCE_DEFAULT_RASTER_STATE_TARGETS = $Targets
+    $childEnv.SHARPEMU_DUMP_FIXED_SOLID_FRAGMENT = (Join-Path $PSScriptRoot "forced_solid_fragment.spv")
 }
 if ($WhiteTextureTargets) {
-    $env:SHARPEMU_FORCE_WHITE_TEXTURE_TARGETS = $WhiteTextureTargets
-    # Without this the white fill can be hidden by the upload-known short-cut
-    # (it is only applied where a texture upload is actually prepared), so the
-    # two belong together.
-    $env:SHARPEMU_FORCE_GUEST_TEXEL_UPLOAD = "1"
+    $childEnv.SHARPEMU_FORCE_WHITE_TEXTURE_TARGETS = $WhiteTextureTargets
+    $childEnv.SHARPEMU_FORCE_GUEST_TEXEL_UPLOAD = "1"
 }
-if ($TracePixelShaderAddress) {
-    # Dump every image binding of one pixel shader:
-    # agc.texture_binding ps=… es=… pc=… op=… storage=… decoded=addr=… WxH …
-    # Use the ps= value from the agc.texture_1x1_linear_binding warning.
-    $env:SHARPEMU_TRACE_PIXEL_SHADER_ADDRESS = $TracePixelShaderAddress
-}
-if ($TraceGuestTextureAddresses) {
-    # vk.texture_upload_contents addr=… size=WxH nonzero_bytes=n/N
-    #   nonblack_pixels=… center=HEX sample_unique=… hash=…
-    # "*" traces every upload, which is the only way to catch the 1x1
-    # placeholder whose address changes on every boot.
-    $env:SHARPEMU_TRACE_GUEST_IMAGE_ADDRS = $TraceGuestTextureAddresses
-}
-if ($ForceTexelUpload) {
-    # Needed together with the content trace: with the upload-known short-cut
-    # active the upload never happens, so there would be nothing to fingerprint.
-    $env:SHARPEMU_FORCE_GUEST_TEXEL_UPLOAD = "1"
-}
-if ($TraceStorageImageInit) {
-    # agc.storage_initial_data addr=… op_storage=… upload_known=… read=… nonzero=…
-    #   initial_bytes=… logical_bytes=… size=WxH pitch=… fmt=… num=… tile=… mip=…
-    # "*" reports every storage address once — the addresses change per boot, so
-    # a single pre-set address cannot catch the one that matters.
-    $env:SHARPEMU_TRACE_STORAGE_IMAGE_INIT_ADDRESS = $TraceStorageImageInit
-}
-# Verdict: read the presented image back and dump frames.
-$env:SHARPEMU_TRACE_GUEST_IMAGES = "present"
-$env:SHARPEMU_SWAPCHAIN_DUMP_EVERY = "100"
-$env:SHARPEMU_GUEST_IMAGE_DUMP_DIR = $dumpDir
-# Always on: the upload-known audit is cheap (once per address) and is the
-# difference between "no upload happened" and "the upload was silently skipped".
-$env:SHARPEMU_TRACE_UPLOAD_KNOWN = "1"
-if ($ThreadSnapshots) {
-    # Per-second per-thread state table — answers "are the loaders still
-    # churning?" for the M32 slow-load vs stuck-load verdict.
-    $env:SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS = "1"
-}
-if ($AmprTrace) {
-    # ampr.read_file lines with byte counts — proves the pak is still being
-    # read (and how fast) at any point in the run.
-    $env:SHARPEMU_LOG_AMPR = "1"
-}
+if ($TracePixelShaderAddress) { $childEnv.SHARPEMU_TRACE_PIXEL_SHADER_ADDRESS = $TracePixelShaderAddress }
+if ($TraceGuestTextureAddresses) { $childEnv.SHARPEMU_TRACE_GUEST_IMAGE_ADDRS = $TraceGuestTextureAddresses }
+if ($ForceTexelUpload) { $childEnv.SHARPEMU_FORCE_GUEST_TEXEL_UPLOAD = "1" }
+if ($TraceStorageImageInit) { $childEnv.SHARPEMU_TRACE_STORAGE_IMAGE_INIT_ADDRESS = $TraceStorageImageInit }
+if ($ThreadSnapshots) { $childEnv.SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS = "1" }
+if ($AmprTrace) { $childEnv.SHARPEMU_LOG_AMPR = "1" }
 
 Write-Host "Arm: $arm   Targets: $Targets   WhiteTextures: $WhiteTextureTargets   Timer: $TimerSeconds s"
 Write-Host "Log: $logFile"
 
-# Redirect straight to the log file with native redirection so the log is
-# written incrementally and survives a Ctrl+C / window kill of this harness
-# (the previous ReadToEndAsync buffer lost the whole log when the run froze
-# and had to be killed — 2026-09-26 01:19 freeze, M33).
+# Redirect straight to the log file so the log is written incrementally and
+# survives a Ctrl+C / window kill of this harness (the previous
+# ReadToEndAsync buffer lost the whole log when the run froze, M33).
+# Env goes in the cmd string: env: would poison this PowerShell session.
+# Env goes into a generated .cmd so nothing leaks into this PowerShell session.
+# (Nested-quote parsing of cmd /c with inline `set` chains is unreliable.)
+$cmdFile = "$env:TEMP\sharpemu_run_$stamp.cmd"
+$cmdLines = @($childEnv.GetEnumerator() | ForEach-Object { "set `"$($_.Key)=$($_.Value)`"" }) + @("`"$exePath`" `"$gamePath`" > `"$logFile`" 2>&1")
+Set-Content -Path $cmdFile -Value $cmdLines
 $process = Start-Process -FilePath "cmd.exe" `
-    -ArgumentList "/c `"`"$exePath`" `"$gamePath`" > `"$logFile`" 2>&1`"" `
+    -ArgumentList "/c `"$cmdFile`"" `
     -WindowStyle Hidden -PassThru
 
 Start-Sleep -Seconds $TimerSeconds

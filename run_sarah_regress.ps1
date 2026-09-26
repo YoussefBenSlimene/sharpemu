@@ -12,8 +12,6 @@ $gamePath = "C:\ps5-emulator\ps5-games\PPSA02929-app0\eboot.bin"
 if (-not (Test-Path $exePath)) { Write-Host "ERROR: exe missing"; exit 1 }
 if (-not (Test-Path $gamePath)) { Write-Host "ERROR: game missing"; exit 1 }
 
-$env:SHARPEMU_WRITABLE_APP0 = "1"
-
 Write-Host "Starting Dreaming Sarah regression run ($timerSeconds s)..."
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -23,6 +21,7 @@ $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
+$psi.EnvironmentVariables["SHARPEMU_WRITABLE_APP0"] = "1"
 
 $process = New-Object System.Diagnostics.Process
 $process.StartInfo = $psi

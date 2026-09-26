@@ -34,17 +34,23 @@ if (-not (Test-Path -LiteralPath $exePath)) { Write-Host "ERROR: exe missing"; e
 if (-not (Test-Path -LiteralPath $gamePath)) { Write-Host "ERROR: game missing: $gamePath"; exit 1 }
 
 # Fixed measurement set (see header). Everything else stays off.
-$env:SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS = "1"
-$env:SHARPEMU_LOG_AMPR = "1"
-$env:SHARPEMU_TRACE_GUEST_IMAGES = "present"   # one swapchain readback per present = the frame counter
-$env:SHARPEMU_WRITABLE_APP0 = "1"
-$env:SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC = "1"
+# Child-process env only (env: would poison this session).
+$childEnv = @{
+    SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS = "1"
+    SHARPEMU_LOG_AMPR = "1"
+    SHARPEMU_TRACE_GUEST_IMAGES = "present"   # one swapchain readback per present = the frame counter
+    SHARPEMU_WRITABLE_APP0 = "1"
+    SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC = "1"
+}
 
 Write-Host "Game: $Game   Timer: $TimerSeconds s   Log: $logFile"
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
+$cmdFile = "$env:TEMP\sharpemu_run_$stamp.cmd"
+$cmdLines = @($childEnv.GetEnumerator() | ForEach-Object { "set `"$($_.Key)=$($_.Value)`"" }) + @("`"$exePath`" `"$gamePath`" > `"$logFile`" 2>&1")
+Set-Content -Path $cmdFile -Value $cmdLines
 $process = Start-Process -FilePath "cmd.exe" `
-    -ArgumentList "/c `"`"$exePath`" `"$gamePath`" > `"$logFile`" 2>&1`"" `
+    -ArgumentList "/c `"$cmdFile`"" `
     -WindowStyle Hidden -PassThru
 
 Start-Sleep -Seconds $TimerSeconds
