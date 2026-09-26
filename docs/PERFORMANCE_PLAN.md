@@ -138,4 +138,5 @@ of a C++ rewrite's boundary benefit for ~1% of the code.
 - Unresolved-import warnings are rate-limited per NID (they used to print on every call, with a stderr flush).
 - GAME-DBG per-draw/compute/present strings are formatted only when the rate limiter admits them (`GameDebug.ShouldEmitRateLimited`/`Emit`); `GameDebug.Enabled` is cached.
 - Kyty-parity offline NpWebApi2 stubs, so the UE online task thread gets a clean offline result instead of unresolved-import traps.
-- Next: make the `DescribeGuestWork` label lazy (it allocates per work item), a cond_timedwait fast path (Kyty `wait_for` shape), an allocation-source audit.
+- The render thread keeps the guest-work and submit labels as raw references (`GuestWorkRef`) and formats them only on device loss or submit failure. Before this, it built about 3 strings per work item plus one per `vkQueueSubmit`.
+- Next: a cond_timedwait fast path (Kyty `wait_for` shape), an allocation-source audit.

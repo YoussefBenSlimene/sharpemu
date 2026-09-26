@@ -3594,11 +3594,35 @@ internal static unsafe class VulkanVideoPresenter
         private bool _deviceLostLogged;
         // Last guest work the render thread entered; included in device-lost
         // reports so QueueSubmit faults name the offending dispatch/draw.
-        private string _activeGuestWorkLabel = string.Empty;
+        // Stored as raw references and formatted only when a diagnostic
+        // actually needs the text (device loss / submit failure): formatting
+        // per work item and per vkQueueSubmit allocated several strings on
+        // every draw during loading.
+        private GuestWorkRef? _activeGuestWorkRef;
         // Survives the per-work finally clear: batched submits often flush
         // after the label is reset (queue switch / end-of-drain).
-        private string _lastGuestWorkLabel = string.Empty;
-        private string _lastSubmitDebugName = string.Empty;
+        private GuestWorkRef? _lastGuestWorkRef;
+        private GuestWorkRef? _lastSubmitWorkRef;
+        private string _lastSubmitResourceName = string.Empty;
+
+        private readonly record struct GuestWorkRef(
+            object Work,
+            VulkanGuestQueueIdentity Queue,
+            long Sequence)
+        {
+            public string Describe() => DescribeGuestWork(Work, Queue, Sequence);
+        }
+
+        private string _activeGuestWorkLabel =>
+            _activeGuestWorkRef is { } active ? active.Describe() : string.Empty;
+
+        private string _lastGuestWorkLabel =>
+            _lastGuestWorkRef is { } last ? last.Describe() : string.Empty;
+
+        private string _lastSubmitDebugName =>
+            FormatSubmitContext(
+                _lastSubmitWorkRef is { } submitWork ? submitWork.Describe() : string.Empty,
+                _lastSubmitResourceName);
         private int _directPresentationCount;
         private readonly Dictionary<ulong, long> _presentedGuestImageTraceCounts = new();
         private readonly Dictionary<ulong, GuestImageResource> _guestImages = new();
@@ -5593,16 +5617,21 @@ internal static unsafe class VulkanVideoPresenter
                     CommandBufferCount = 1,
                     PCommandBuffers = &commandBuffer,
                 };
-                var submitContext = ResolveGuestSubmitContext(resources);
-                _lastSubmitDebugName = submitContext;
-                var submitLabel = string.IsNullOrEmpty(submitContext)
-                    ? "vkQueueSubmit(guest)"
-                    : $"vkQueueSubmit(guest) during {submitContext}";
+                RecordGuestSubmitContext(resources);
+                Result submitResult;
                 using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.QueueSubmit))
                 {
+                    submitResult = _vk.QueueSubmit(_queue, 1, &submitInfo, fence);
+                }
+
+                if (submitResult != Result.Success)
+                {
+                    var submitContext = _lastSubmitDebugName;
                     Check(
-                        _vk.QueueSubmit(_queue, 1, &submitInfo, fence),
-                        submitLabel);
+                        submitResult,
+                        string.IsNullOrEmpty(submitContext)
+                            ? "vkQueueSubmit(guest)"
+                            : $"vkQueueSubmit(guest) during {submitContext}");
                 }
             }
             catch
@@ -15828,13 +15857,13 @@ internal static unsafe class VulkanVideoPresenter
                 var work = pendingGuestWork.Work;
                 using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.Describe))
                 {
-                    _activeGuestWorkLabel = DescribeGuestWork(
+                    _activeGuestWorkRef = new GuestWorkRef(
                         work,
                         pendingGuestWork.Queue,
                         pendingGuestWork.Sequence);
                 }
 
-                _lastGuestWorkLabel = _activeGuestWorkLabel;
+                _lastGuestWorkRef = _activeGuestWorkRef;
                 var deferGuestWork = false;
 
                 var traceWork = ShouldTracePresentedGuestImageContentsForDiagnostics();
@@ -15952,7 +15981,7 @@ internal static unsafe class VulkanVideoPresenter
 
                     _enqueueAsImmediateQueueFollowup = false;
                     _immediateFollowupTail = null;
-                    _activeGuestWorkLabel = string.Empty;
+                    _activeGuestWorkRef = null;
                     Volatile.Write(ref _executingGuestWorkSequence, 0);
                 }
 
@@ -19979,17 +20008,19 @@ internal static unsafe class VulkanVideoPresenter
             return true;
         }
 
-        private string ResolveGuestSubmitContext(
+        private void RecordGuestSubmitContext(
             IReadOnlyList<TranslatedDrawResources> resources)
         {
-            var workLabel = !string.IsNullOrEmpty(_activeGuestWorkLabel)
-                ? _activeGuestWorkLabel
-                : _lastGuestWorkLabel;
-            var resourceName = resources.Count > 0
+            _lastSubmitWorkRef = _activeGuestWorkRef ?? _lastGuestWorkRef;
+            _lastSubmitResourceName = resources.Count > 0
                 ? resources[0].DebugName
                 : _batchResources.Count > 0
                     ? _batchResources[0].DebugName
                     : string.Empty;
+        }
+
+        private static string FormatSubmitContext(string workLabel, string resourceName)
+        {
             if (string.IsNullOrEmpty(workLabel))
             {
                 return string.IsNullOrEmpty(resourceName)
