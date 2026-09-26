@@ -54,7 +54,12 @@ hottest shims is the only C#→C++ step contemplated (phase E, optional).
 
 - **`SHARPEMU_DISABLE_GPU_AWARE_USLEEP=1` A/B:** ON = 25,042 pak reads / 767 HLE CPU-s; OFF = 15,977 reads / 381 CPU-s. The GPU-aware usleep is **not** a loading throttle — disabled, sleeper threads *spin* (more HLE churn, *fewer* reads); enabled, they park and free cores for the loaders. **Keep it.** Do not disable for Mortal Shell.
 - **Pak read latency is NOT the floor either:** 46k reads × ~0.3-0.4 ms ≈ 18 s of 180 s wall. The load is bounded by guest-side work (decompression/copy) executing between HLE calls — i.e. total CPU throughput and core contention, not any single syscall.
-- **Next candidates** (in order): (1) lock-free region reads — `_gate` read-lock × ~84M tiny ops/s across 8 cores is contended cache-line bouncing; an immutable snapshot array would remove it (medium risk, needs care with the write tracker); (2) `scePthreadGetspecific` 65M calls → inline TLS read in the import stub itself; (3) profile guest-side hotspots with the existing `_profileGuestRip` sampler to find where loader wall time actually goes.
+- **Guest-RIP sampler run** (`SHARPEMU_PROFILE_GUEST_RIP=1`, 180 s, `phasec_ripsample_20260926_100524.txt`): **98.7% of guest thread-time is waiting**, top waits = `<idle-or-scheduler>` 78%, `sceAudioOut2ContextPush` 10%, mutex/submit ~6% — the sampler lands on *host* RIPs, i.e. threads parked in HLE waits. No single guest busy hotspot: the load is a long **producer→consumer wake-chain**, and each link costs HLE round-trips + host scheduling latency. Also captured: a periodic "Stall main-thread" watchdog dump at a `scePthreadGetthreadid` stub (benign reporting, no kill).
+- **Revised conclusion:** the biggest lever is *reducing per-transition latency on sync primitives/boundaries* (they gate every task handoff), not removing the waits:
+  1. lock-free region reads (immutable snapshot array instead of the read-lock on ~84M tiny ops/s),
+  2. inline TLS read for `scePthreadGetspecific` (65M calls) in the stub itself,
+  3. audio push pacing is real-time and necessary — exclude.
+- Status: Phase B shipped (~7% memcpy, 4.86 µs dispatch down from 5.17). Expect further gains to be incremental-per-primitive; measure each with `bench_run.ps1 mortal 600`.
 3. Record the baseline table in this doc before changing code.
 
 ### Baseline (2026-09-26, bench_run.ps1, snapshots+AMPR+present-readback on)
