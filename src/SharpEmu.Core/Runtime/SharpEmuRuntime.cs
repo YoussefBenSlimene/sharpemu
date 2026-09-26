@@ -129,6 +129,42 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         return _selfLoader.Load(bytes.AsSpan(), _virtualMemory, _moduleManager, _fileSystem, mountRoot);
     }
 
+    // The Vulkan pipeline cache is created during LoadImage, so configuring the
+    // identity only after the load lands every title in the shared "UNKNOWN"
+    // cache: cross-title pipeline reuse is wasted space and per-title warm-up
+    // (Kyty-style _PipelineCache\PPSA*.bin) never kicks in. Read param.json up
+    // front and configure identity before any GPU object exists.
+    private void ConfigureApplicationInfoEarly(string normalizedEbootPath)
+    {
+        try
+        {
+            var paramPath = Path.Combine(
+                Path.GetDirectoryName(normalizedEbootPath) ?? string.Empty,
+                "sce_sys",
+                "param.json");
+            if (!File.Exists(paramPath))
+            {
+                return;
+            }
+
+            var (title, titleId, version) = Ps5ParamJsonReader.TryReadPs5Param(File.ReadAllBytes(paramPath));
+            if (string.IsNullOrWhiteSpace(titleId))
+            {
+                return;
+            }
+
+            VideoOutExports.ConfigureApplicationInfo(title, titleId, version);
+            KernelMemoryCompatExports.ConfigureApplicationInfo(titleId);
+            SaveDataExports.ConfigureApplicationInfo(titleId);
+            SystemServiceExports.ConfigureApplicationInfo(titleId);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Early identity is a best-effort cache-keying optimisation; the
+            // post-load ConfigureApplicationInfo call below is authoritative.
+        }
+    }
+
     public OrbisGen2Result Run(string ebootPath)
     {
         var bootStarted = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -143,6 +179,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         LastMilestoneLog = null;
         FiberExports.ResetRuntimeState();
         KernelModuleRegistry.Reset();
+        ConfigureApplicationInfoEarly(normalizedEbootPath);
         var image = LoadImage(normalizedEbootPath);
         Console.Error.WriteLine(
             $"[BOOT] main image loaded in {System.Diagnostics.Stopwatch.GetElapsedTime(bootStarted).TotalSeconds:F1}s");
