@@ -3436,10 +3436,17 @@ internal static unsafe class VulkanVideoPresenter
     // (≤64×64) are cheap to copy back to guest memory so the next bind uploads
     // real content through the normal path.
     private static Presenter? _activeInstance;
+    // The 2026-09-27 user crash (Vulkan device lost during a 2048-group compute
+    // under load) is not yet proven unrelated to this new GPU copy path, so it
+    // stays until the in-game A/B clears it; enable with
+    // SHARPEMU_TINY_STORAGE_SYNC=1.
+    private static readonly bool _tinyStorageSyncEnabled =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_TINY_STORAGE_SYNC"), "1", StringComparison.Ordinal);
 
     internal static bool TrySyncGpuWrittenTinyStorageToGuestMemory(
         ulong address,
         SharpEmu.HLE.ICpuMemory memory) =>
+        _tinyStorageSyncEnabled &&
         _activeInstance?.TrySyncGpuWrittenTinyStorageToGuestMemoryCore(address, memory) == true;
 
     private sealed class Presenter : IDisposable
