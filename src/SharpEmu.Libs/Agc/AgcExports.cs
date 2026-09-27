@@ -11873,19 +11873,6 @@ private static long _indirectDrawProbeCount;
             }
         }
 
-        // M22/M36: a tiny sampled descriptor whose address was just written by
-        // a compute storage view holds its content only on the GPU. Pull it
-        // back into guest memory first so the upload path below (and the
-        // upload-known probe) observes the real texel.
-        if (!isStorage &&
-            descriptor.Address != 0 &&
-            descriptor.Width <= 64 &&
-            descriptor.Height <= 64)
-        {
-            SharpEmu.Libs.VideoOut.VulkanVideoPresenter
-                .TrySyncGpuWrittenTinyStorageToGuestMemory(descriptor.Address, ctx.Memory);
-        }
-
         var sourceWidth = descriptor.TileMode == 0
             ? GetLinearTexturePitch(
                 Math.Max(descriptor.Width, descriptor.Pitch),

@@ -3446,7 +3446,14 @@ internal static unsafe class VulkanVideoPresenter
     internal static bool TrySyncGpuWrittenTinyStorageToGuestMemory(
         ulong address,
         SharpEmu.HLE.ICpuMemory memory) =>
-        _tinyStorageSyncEnabled &&
+        // The core implementation drives the presenter's command buffer — it
+        // must only run on the render-pump thread. The AgcExports bind-side
+        // caller runs on the AgcSubmission thread, and calling it from there
+        // corrupts the current command buffer (user-reported device loss,
+        // 2026-09-27). Keep the entry but make it a no-op until a
+        // pump-thread-safe entry point exists (enqueue into the presenter's
+        // work queue instead of calling directly).
+        _tinyStorageSyncEnabled && false &&
         _activeInstance?.TrySyncGpuWrittenTinyStorageToGuestMemoryCore(address, memory) == true;
 
     private sealed class Presenter : IDisposable
@@ -14025,11 +14032,15 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var byteCount = (ulong)uploadPixels.Length;
+            // TransferSrc too: when a zeroed sampled view already exists at
+            // this address we push the storage bytes into it via this buffer
+            // (see PushStorageBytesToSampledImage below).
             var staging = CreateBuffer(
                 byteCount,
-                BufferUsageFlags.TransferSrcBit,
+                BufferUsageFlags.TransferDstBit | BufferUsageFlags.TransferSrcBit,
                 MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
                 out var stagingMemory);
+            var succeeded = false;
             try
             {
                 void* mapped;
@@ -16660,6 +16671,30 @@ internal static unsafe class VulkanVideoPresenter
                 BufferUsageFlags.TransferDstBit,
                 MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
                 out var stagingMemory);
+            // Also find an existing sampled image at the same address — if the
+            // composite created its (empty) view before the compute pass wrote
+            // the storage one, content must be pushed there directly, since
+            // "upload-known" reuses the GPU image without re-reading memory.
+            GuestImageResource? sampledSibling = null;
+            lock (_gate)
+            {
+                foreach (var pair in _guestImageVariants)
+                {
+                    if (pair.Key.Address == address && !ReferenceEquals(pair.Value, image))
+                    {
+                        sampledSibling = pair.Value;
+                        break;
+                    }
+                }
+
+                if (sampledSibling is null &&
+                    _guestImages.TryGetValue(address, out var main) &&
+                    !ReferenceEquals(main, image))
+                {
+                    sampledSibling = main;
+                }
+            }
+
             var succeeded = false;
             try
             {
@@ -16740,6 +16775,20 @@ internal static unsafe class VulkanVideoPresenter
                 if (succeeded)
                 {
                     image.GpuWrittenSinceGuestSync = false;
+
+                    // If a sampled image of this address already exists on the
+                    // GPU (zero-filled before the compute pass ran), copy the
+                    // bytes into it directly as well — re-upload is skipped by
+                    // the upload-known path, so it would stay zero otherwise.
+                    if (sampledSibling is not null &&
+                        sampledSibling.Initialized &&
+                        sampledSibling.Image.Handle != 0 &&
+                        sampledSibling.Width == image.Width &&
+                        sampledSibling.Height == image.Height &&
+                        sampledSibling.Format == image.Format)
+                    {
+                        PushStorageBytesToSampledImage(image, sampledSibling, staging, stagingMemory, byteCount);
+                    }
                 }
 
                 if (_traceGuestImageEvents)
@@ -16770,6 +16819,87 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     _vk.DestroyBuffer(_device, staging, null);
                 }
+            }
+        }
+
+        // Copy the freshly-read-back storage bytes into the sibling sampled
+        // image (same address, same small dims/format) that the upload-known
+        // path would otherwise keep serving as zero.
+        private void PushStorageBytesToSampledImage(
+            GuestImageResource source,
+            GuestImageResource target,
+            Silk.NET.Vulkan.Buffer staging,
+            DeviceMemory stagingMemory,
+            ulong byteCount)
+        {
+            Check(
+                _vk.ResetCommandBuffer(_commandBuffer, 0),
+                "vkResetCommandBuffer(storage sync push)");
+            var beginInfo = new CommandBufferBeginInfo
+            {
+                SType = StructureType.CommandBufferBeginInfo,
+                Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+            };
+            Check(_vk.BeginCommandBuffer(_commandBuffer, &beginInfo), "vkBeginCommandBuffer(storage sync push)");
+
+            var toTransferDst = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.ShaderReadBit,
+                DstAccessMask = AccessFlags.TransferWriteBit,
+                OldLayout = ImageLayout.ShaderReadOnlyOptimal,
+                NewLayout = ImageLayout.TransferDstOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = target.Image,
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.FragmentShaderBit,
+                PipelineStageFlags.TransferBit,
+                0, 0, null, 0, null, 1, &toTransferDst);
+            var copyRegion = new BufferImageCopy
+            {
+                BufferOffset = 0,
+                BufferRowLength = target.Width,
+                BufferImageHeight = 0,
+                ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                ImageOffset = new Offset3D(0, 0, 0),
+                ImageExtent = new Extent3D(target.Width, target.Height, 1),
+            };
+            _vk.CmdCopyBufferToImage(
+                _commandBuffer,
+                staging,
+                target.Image,
+                ImageLayout.TransferDstOptimal,
+                1,
+                &copyRegion);
+            var toShaderRead = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.TransferWriteBit,
+                DstAccessMask = AccessFlags.ShaderReadBit,
+                OldLayout = ImageLayout.TransferDstOptimal,
+                NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Image = target.Image,
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.TransferBit,
+                PipelineStageFlags.FragmentShaderBit,
+                0, 0, null, 0, null, 1, &toShaderRead);
+            Check(_vk.EndCommandBuffer(_commandBuffer), "vkEndCommandBuffer(storage sync push)");
+            SubmitGuestCommandBuffer(_commandBuffer, [], []);
+            Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle(storage sync push)");
+
+            if (_traceGuestImageEvents)
+            {
+                Console.Error.WriteLine(
+                    $"[GIMG] storage_to_sampled_push addr=0x{target.Address:X} bytes={byteCount}");
             }
         }
 
