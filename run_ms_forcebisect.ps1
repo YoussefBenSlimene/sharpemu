@@ -55,6 +55,7 @@ New-Item -ItemType Directory -Path $dumpDir | Out-Null
 # so never $env:X = ... here.
 $childEnv = @{
     SHARPEMU_WRITABLE_APP0 = "1"
+    SHARPEMU_CONSOLE = "verbose"   # full developer log (parsed below)
     SHARPEMU_GUEST_IMAGE_CPU_SYNC = "0"
     SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC = "1"
     # Verdict: read the presented image back and dump frames.

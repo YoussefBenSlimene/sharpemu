@@ -98,6 +98,12 @@ internal static partial class Program
         // itself to a console before the first write.
         EnsureCliConsole();
         UseUtf8ConsoleOutput();
+        // KytyPS5-style terminal: only the short Kyty lines (+ errors) reach
+        // the terminal. Installed before the --log-file mirror so the mirror
+        // wraps the filter and the log file still gets the full developer log.
+        // SHARPEMU_CONSOLE=verbose / --verbose-console restores the old stream.
+        SharpEmu.HLE.EmuConsole.ConfigureFromArguments(args);
+        SharpEmu.HLE.EmuConsole.Install();
         if (isMitigatedChild && TryGetLogFileArgument(args, out var earlyLogFilePath))
         {
             TryEnableConsoleFileMirror(earlyLogFilePath);
@@ -258,6 +264,16 @@ internal static partial class Program
         }
 
         SharpEmuLog.MinimumLevel = logLevel;
+        SharpEmu.HLE.EmuConsole.Initialized("Config");
+        SharpEmu.HLE.EmuConsole.Initialized("Log");
+        SharpEmu.HLE.EmuConsole.Initialized("Timer");
+        SharpEmu.HLE.EmuConsole.Initialized("Pthread");
+        SharpEmu.HLE.EmuConsole.Initialized("Profiler");
+        SharpEmu.HLE.EmuConsole.Initialized("Network");
+        SharpEmu.HLE.EmuConsole.Initialized("Memory");
+        SharpEmu.HLE.EmuConsole.Initialized("FileSystem");
+        SharpEmu.HLE.EmuConsole.Initialized("Controller");
+        SharpEmu.HLE.EmuConsole.Initialized("Audio");
         if (!HostVideoHost.TryConfigureVideo(videoOptions))
         {
             Console.Error.WriteLine("[LOADER][ERROR] Video options cannot change while a presenter is active.");
@@ -268,6 +284,7 @@ internal static partial class Program
         // the title's window is visible during ELF load + HLE JIT warmup
         // instead of only after the guest's first flip, minutes into boot.
         HostVideoHost.EnsureWindowStarted(videoOptions.Width, videoOptions.Height);
+        SharpEmu.HLE.EmuConsole.Initialized("Graphics");
 
         Log.Info(BuildInfo.Banner);
         Log.Info(HostSystemInfo.Summary);

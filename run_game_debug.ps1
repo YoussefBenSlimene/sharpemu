@@ -5,6 +5,7 @@ $exePath = "artifacts\bin\Debug\net10.0\win-x64\SharpEmu.dll"
 
 # Set environment variables to fix permission errors and enable debugging
 $env:SHARPEMU_WRITABLE_APP0 = "1"
+$env:SHARPEMU_CONSOLE = "verbose"   # full developer log (parsed below), not the Kyty console
 $env:SHARPEMU_LOG_AUDIO_QUEUE = "1"
 $env:SHARPEMU_LOG_GPU_DETILE = "1"
 $env:SHARPEMU_TRACE_VULKAN_SHADER = "1"
@@ -23,3 +24,7 @@ Write-Host "Press Ctrl+C to stop the emulator"
 
 # Start the emulator
 & dotnet $exePath
+
+# Do not leak the verbose console into the caller's session (a later manual
+# launch from this window must get the KytyPS5-style console).
+Remove-Item Env:SHARPEMU_CONSOLE -ErrorAction SilentlyContinue

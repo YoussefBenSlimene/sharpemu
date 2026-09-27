@@ -11,6 +11,8 @@ if (-not (Test-Path $exePath)) { Write-Host "ERROR: exe missing"; exit 1 }
 if (-not (Test-Path $gamePath)) { Write-Host "ERROR: game missing"; exit 1 }
 
 $env:SHARPEMU_WRITABLE_APP0 = "1"
+
+$env:SHARPEMU_CONSOLE = "verbose"   # full developer log (parsed below), not the Kyty console
 $env:SHARPEMU_LOG_IO = "1"
 $env:SHARPEMU_LOG_OPEN = "1"
 $timerSeconds = 60
@@ -43,3 +45,7 @@ if (!$process.HasExited) {
 $combinedOutput = $outputTask.Result + $stderrOutput.Result
 $combinedOutput | Out-File -FilePath $logFile -Encoding UTF8
 Write-Host "Logs saved to: $logFile"
+
+# Do not leak the verbose console into the caller's session (a later manual
+# launch from this window must get the KytyPS5-style console).
+Remove-Item Env:SHARPEMU_CONSOLE -ErrorAction SilentlyContinue

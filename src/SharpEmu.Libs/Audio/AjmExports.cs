@@ -197,6 +197,22 @@ public static class AjmExports
         return ctx.SetReturn(0);
     }
 
+    // Names as printed by KytyPS5 (ajm.cpp AjmCodecName).
+    private static string AjmCodecName(uint codec) => codec switch
+    {
+        0 => "MP3 decoder",
+        1 => "ATRAC9 decoder",
+        2 => "MPEG4-AAC decoder",
+        3 => "CELP8 decoder",
+        4 => "CELP8 encoder",
+        12 => "CELP16 decoder",
+        13 => "CELP16 encoder",
+        22 => "HE-VAG decoder",
+        23 => "LPCM decoder",
+        24 => "Opus decoder",
+        _ => "unknown",
+    };
+
     [SysAbiExport(
         Nid = "Q3dyFuwGn64",
         ExportName = "sceAjmModuleRegister",
@@ -225,6 +241,8 @@ public static class AjmExports
             }
         }
 
+        // KytyPS5 console parity (ajm.cpp: "AJM codec=%u, name=%s").
+        SharpEmu.HLE.EmuConsole.Line($"AJM codec={codecType}, name={AjmCodecName(codecType)}");
         if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AJM"), "1", StringComparison.Ordinal))
         {
             Console.Error.WriteLine(

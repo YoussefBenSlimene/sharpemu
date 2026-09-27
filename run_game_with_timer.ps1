@@ -10,6 +10,8 @@ if (-not (Test-Path $exePath)) { Write-Host "Error: SharpEmu.exe missing"; exit 
 if (-not (Test-Path $gamePath)) { Write-Host "Error: Mortal Shell eboot.bin missing"; exit 1 }
 
 $env:SHARPEMU_WRITABLE_APP0 = "1"
+
+$env:SHARPEMU_CONSOLE = "verbose"   # full developer log (parsed below), not the Kyty console
 $env:SHARPEMU_LOG_AUDIO_QUEUE = "1"
 
 Write-Host "Starting Mortal Shell with $timerSeconds second timer..."
@@ -43,3 +45,7 @@ $combinedOutput = $output + $stderrOutput
 $combinedOutput | Out-File -FilePath $logFile -Encoding UTF8
 
 Write-Host "Mortal Shell stopped. Logs saved to: $logFile"
+
+# Do not leak the verbose console into the caller's session (a later manual
+# launch from this window must get the KytyPS5-style console).
+Remove-Item Env:SHARPEMU_CONSOLE -ErrorAction SilentlyContinue

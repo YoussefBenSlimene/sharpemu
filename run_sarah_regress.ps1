@@ -23,6 +23,7 @@ $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $psi.EnvironmentVariables["SHARPEMU_WRITABLE_APP0"] = "1"
 
+$psi.EnvironmentVariables["SHARPEMU_CONSOLE"] = "verbose"   # full developer log
 $process = New-Object System.Diagnostics.Process
 $process.StartInfo = $psi
 $process.Start() | Out-Null

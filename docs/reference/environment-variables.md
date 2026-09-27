@@ -133,3 +133,12 @@ environment, so most users don't need to touch them:
 - [`guest-write-watch.md`](../guest-write-watch.md)
 - [`bink2-bridge.md`](../bink2-bridge.md)
 - [Debugging guide](../guides/debugging.md)
+
+## Console output (KytyPS5-style)
+
+| Variable | Effect |
+|---|---|
+| `SHARPEMU_CONSOLE=verbose` | Full developer log on the terminal (the old behaviour). Also selected by `--verbose-console`, `--log-level=debug/trace`, any `SHARPEMU_LOG_*`/`SHARPEMU_TRACE_*` switch, or stderr redirected to a file (all `run_*.ps1`/`bench_run.ps1` harnesses). |
+| `SHARPEMU_CONSOLE=kyty` | Force the KytyPS5-style terminal even when diagnostic switches are set. |
+| (default) | KytyPS5-style terminal: `Initialized: …`, `Vulkan pipeline cache: …`, `Title ID: …`, `version = N`, `AJM codec=…`, `Shaders: VS n \| PS n \| CS n …`, `Unresolved import stub called: …`, plus errors and guest printf. With `--log-file`, the complete developer log still goes to the file. |
+| `SHARPEMU_LOG_IMPORT_PERIODIC=1` | Re-enables the bring-up import probes (`ImportCtx#`, `ImportNV#`, `ImportStack#`, `ImportRet#`). |

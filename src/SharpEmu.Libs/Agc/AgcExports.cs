@@ -1738,6 +1738,7 @@ public static partial class AgcExports
         }
 
         TraceAgc($"agc.init state=0x{stateAddress:X16} version={version}");
+        SharpEmu.HLE.EmuConsole.Line($"version = {version}"); // KytyPS5 agc.cpp AgcInit
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
     #pragma warning restore SHEM004
@@ -8926,6 +8927,7 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
                 vertexShader!,
                 exportState.Program);
             GuestGpu.Current.CountShaderCompilation();
+            SharpEmu.HLE.EmuConsole.ShaderCompiled(SharpEmu.HLE.EmuConsole.ShaderStage.Vertex);
             _depthOnlyVertexShaderCache.TryAdd(cacheKey, vertexShader!);
         }
 
@@ -9433,6 +9435,9 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
                     compiled.Pixel,
                     pixelState.Program);
                 GuestGpu.Current.CountShaderCompilation();
+                // Kyty prints one totals line per compiled program.
+                SharpEmu.HLE.EmuConsole.ShaderCompiled(SharpEmu.HLE.EmuConsole.ShaderStage.Vertex);
+                SharpEmu.HLE.EmuConsole.ShaderCompiled(SharpEmu.HLE.EmuConsole.ShaderStage.Pixel);
                 _graphicsShaderCache.TryAdd(shaderKey, compiled);
             }
         }
@@ -13312,6 +13317,7 @@ private static long _indirectDrawProbeCount;
                     shaderKey.Item2,
                     computeShader!,
                     shaderState.Program);
+                SharpEmu.HLE.EmuConsole.ShaderCompiled(SharpEmu.HLE.EmuConsole.ShaderStage.Compute);
             }
 
             if (computeShader is not null)

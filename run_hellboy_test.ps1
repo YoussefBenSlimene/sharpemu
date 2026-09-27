@@ -12,6 +12,8 @@ if (-not (Test-Path $exePath)) { Write-Host "ERROR: exe missing"; exit 1 }
 if (-not (Test-Path $gamePath)) { Write-Host "ERROR: game missing"; exit 1 }
 
 $env:SHARPEMU_WRITABLE_APP0 = "1"
+
+$env:SHARPEMU_CONSOLE = "verbose"   # full developer log (parsed below), not the Kyty console
 $env:SHARPEMU_LOG_SEMA = "1"
 $env:SHARPEMU_LOG_AUDIO_QUEUE = "1"
 $env:SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS = "1"
@@ -28,3 +30,7 @@ $process = Start-Process -FilePath $exePath `
 Write-Host "Hellboy launched (PID $($process.Id))."
 Write-Host "stderr log: $errLog"
 Write-Host "stdout log: $outLog"
+
+# Do not leak the verbose console into the caller's session (a later manual
+# launch from this window must get the KytyPS5-style console).
+Remove-Item Env:SHARPEMU_CONSOLE -ErrorAction SilentlyContinue

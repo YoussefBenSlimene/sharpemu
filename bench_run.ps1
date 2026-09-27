@@ -49,6 +49,7 @@ $childEnv = @{
     SHARPEMU_LOG_AMPR = "1"
     SHARPEMU_TRACE_GUEST_IMAGES = "present"   # one swapchain readback per present = the frame counter
     SHARPEMU_WRITABLE_APP0 = "1"
+    SHARPEMU_CONSOLE = "verbose"   # full developer log (parsed below)
     SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC = "1"
 }
 

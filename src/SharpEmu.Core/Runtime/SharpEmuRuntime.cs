@@ -191,6 +191,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         KernelMemoryCompatExports.ConfigureApplicationInfo(image.TitleId);
         SaveDataExports.ConfigureApplicationInfo(image.TitleId);
         SystemServiceExports.ConfigureApplicationInfo(image.TitleId);
+        SharpEmu.HLE.EmuConsole.Line($"Title ID: {image.TitleId ?? "UNKNOWN"}"); // KytyPS5 emulator.cpp
         _ = RegisterLoadedModule(normalizedEbootPath, image, isMain: true, isSystemModule: false);
         KernelRuntimeCompatExports.ConfigureProcessProcParamAddress(image.ProcParamAddress);
         Console.Error.WriteLine($"[RUNTIME] Entry: 0x{image.EntryPoint:X16}");

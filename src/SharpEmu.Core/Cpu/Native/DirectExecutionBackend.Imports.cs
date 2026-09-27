@@ -394,9 +394,12 @@ public sealed partial class DirectExecutionBackend
 			}
 		}
 		bool flag0 = importStubEntry.SuppressStrlenTrace;
-		bool flag = num7 >= 2156221920u && num7 <= 2156225024u;
-		bool flag2 = num7 >= 2156351360u && num7 <= 2156352080u;
-		bool flag3 = num >= 1020 && num <= 1040;
+		// Hard-coded bring-up probes (a guest RIP window and imports
+		// #1020-1040). They printed ImportCtx/NV/Stack lines on EVERY run,
+		// cluttering the user console; opt in with SHARPEMU_LOG_IMPORT_PERIODIC=1.
+		bool flag = _logImportPeriodic && num7 >= 2156221920u && num7 <= 2156225024u;
+		bool flag2 = _logImportPeriodic && num7 >= 2156351360u && num7 <= 2156352080u;
+		bool flag3 = _logImportPeriodic && num >= 1020 && num <= 1040;
 		bool flag4 = !string.IsNullOrWhiteSpace(_importFilter);
 		bool flag5 = false;
 		ExportedFunction? matchedExport = importStubEntry.Export;
@@ -467,15 +470,15 @@ public sealed partial class DirectExecutionBackend
 				cpuContext[CpuRegister.Rsi],
 				cpuContext[CpuRegister.Rdx]);
 		}
-		if (importStubEntry.Nid == "8zTFvBIAIN8" && num <= 256)
+		if (_logImportPeriodic && importStubEntry.Nid == "8zTFvBIAIN8" && num <= 256)
 		{
 			Console.Error.WriteLine($"[LOADER][TRACE] memset#{num}: dst=0x{cpuContext[CpuRegister.Rdi]:X16} val=0x{cpuContext[CpuRegister.Rsi] & 0xFF:X2} len=0x{cpuContext[CpuRegister.Rdx]:X16} ret=0x{num7:X16}");
 		}
-		if (importStubEntry.Nid == "tsvEmnenz48" && num <= 64)
+		if (_logImportPeriodic && importStubEntry.Nid == "tsvEmnenz48" && num <= 64)
 		{
 			Console.Error.WriteLine($"[LOADER][TRACE] __cxa_atexit#{num}: func=0x{cpuContext[CpuRegister.Rdi]:X16} arg=0x{cpuContext[CpuRegister.Rsi]:X16} dso=0x{cpuContext[CpuRegister.Rdx]:X16} ret=0x{num7:X16}");
 		}
-		if (importStubEntry.Nid == "bzQExy189ZI" || importStubEntry.Nid == "8G2LB+A3rzg")
+		if (_logImportPeriodic && (importStubEntry.Nid == "bzQExy189ZI" || importStubEntry.Nid == "8G2LB+A3rzg"))
 		{
 			Console.Error.WriteLine($"[LOADER][TRACE] {importStubEntry.Nid}#{num}: rdi=0x{cpuContext[CpuRegister.Rdi]:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} rdx=0x{cpuContext[CpuRegister.Rdx]:X16} ret=0x{num7:X16}");
 		}
@@ -626,6 +629,14 @@ public sealed partial class DirectExecutionBackend
 				// NIDs from a dedicated thread, and each line is a blocking stderr
 				// write (Smurfs/Mortal Shell: ~188 calls per NID per run).
 				var unresolvedCount = _unresolvedImportCounts.AddOrUpdate(importStubEntry.Nid, 1, static (_, n) => n + 1);
+				if (unresolvedCount == 1)
+				{
+					// KytyPS5 runtimeLinker.cpp: "Unresolved import stub called: <name>".
+					var unresolvedName = Aerolib.Instance.TryGetByNid(importStubEntry.Nid, out var unresolvedSymbol)
+						? $"{importStubEntry.Nid} ({unresolvedSymbol.ExportName})"
+						: importStubEntry.Nid;
+					SharpEmu.HLE.EmuConsole.Line($"Unresolved import stub called: {unresolvedName}");
+				}
 				if (unresolvedCount <= 4 || (unresolvedCount & (unresolvedCount - 1)) == 0)
 				{
 					Console.Error.WriteLine(

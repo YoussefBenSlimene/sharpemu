@@ -34,6 +34,8 @@ if (Test-Path $dumpDir) { Remove-Item $dumpDir -Recurse -Force }
 New-Item -ItemType Directory -Path $dumpDir | Out-Null
 
 $env:SHARPEMU_WRITABLE_APP0 = "1"
+
+$env:SHARPEMU_CONSOLE = "verbose"   # full developer log (parsed below), not the Kyty console
 $env:SHARPEMU_GUEST_IMAGE_CPU_SYNC = "0"
 $env:SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC = "1"
 # Diagnosis of the short-cut itself.
@@ -72,3 +74,7 @@ if (!$process.HasExited) { $process.Kill() }
 $combinedOutput = $outputTask.Result + $stderrOutput.Result
 $combinedOutput | Out-File -FilePath $logFile -Encoding UTF8
 Write-Host "Logs saved to: $logFile"
+
+# Do not leak the verbose console into the caller's session (a later manual
+# launch from this window must get the KytyPS5-style console).
+Remove-Item Env:SHARPEMU_CONSOLE -ErrorAction SilentlyContinue

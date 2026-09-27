@@ -38,6 +38,7 @@ else { Remove-Item Env:SHARPEMU_DISABLE_GPU_AWARE_USLEEP -ErrorAction SilentlyCo
 
 Write-Host "Quake II, arm=$arm, $TimerSeconds s -> $logFile"
 $psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.EnvironmentVariables["SHARPEMU_CONSOLE"] = "verbose"   # full developer log (parsed below)
 $psi.FileName = $exePath
 $psi.Arguments = "`"$GamePath`""
 $psi.RedirectStandardOutput = $true

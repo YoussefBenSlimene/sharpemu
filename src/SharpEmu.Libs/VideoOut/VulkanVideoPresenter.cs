@@ -883,11 +883,16 @@ internal static unsafe class VulkanVideoPresenter
                     TranslatedDraw: null,
                     RequiredGuestWorkSequence: 0,
                     IsSplash: true)
+                // No pic0.png: present a real black frame (sequence 1) instead
+                // of an empty sequence-0 placeholder. The placeholder was never
+                // taken by the render loop, so NOTHING was presented until the
+                // guest's first flip — no FPS overlay, window looked frozen
+                // (Hellboy 2026-09-27). KytyPS5 shows its window + HUD at once.
                 : new Presentation(
-                    null,
+                    CreateBlackFrame(width, height),
                     width,
                     height,
-                    0,
+                    1,
                     GuestDrawKind.None,
                     TranslatedDraw: null,
                     RequiredGuestWorkSequence: 0,
@@ -2689,6 +2694,24 @@ internal static unsafe class VulkanVideoPresenter
     /// ticks where the guest produced no new flip, keeping the same presented
     /// sequence so guest presentation bookkeeping is untouched.
     /// </summary>
+    private static bool TryTakeIdleOverlayPresentation(out Presentation presentation)
+    {
+        lock (_gate)
+        {
+            if (_latestPresentation is { Pixels: not null } latest &&
+                latest.GuestImageAddress == 0 &&
+                latest.TranslatedDraw is null &&
+                _pendingGuestImagePresentations.Count == 0)
+            {
+                presentation = latest;
+                return true;
+            }
+        }
+
+        presentation = default;
+        return false;
+    }
+
     private static bool TryTakeHostMovieOnlyPresentation(
         long presentedSequence,
         out Presentation presentation)
@@ -3622,6 +3645,7 @@ internal static unsafe class VulkanVideoPresenter
         private DeviceMemory[] _overlayStagingMemory = [];
         private nint[] _overlayStagingMapped = [];
         private long _presentedSequence;
+        private long _lastIdleOverlayPresentTick;
         private long _presentNotTakenLoggedSequence = long.MinValue;
         private bool _vulkanReady;
         private bool _firstFramePresented;
@@ -4875,7 +4899,13 @@ internal static unsafe class VulkanVideoPresenter
             {
                 if (_pipelineCachePath is not null && File.Exists(_pipelineCachePath))
                 {
+                    // KytyPS5 pipelineCache.cpp console lines.
+                    SharpEmu.HLE.EmuConsole.Line($"Vulkan pipeline cache: loading {_pipelineCachePath}");
                     initialData = File.ReadAllBytes(_pipelineCachePath);
+                }
+                else if (_pipelineCachePath is not null)
+                {
+                    SharpEmu.HLE.EmuConsole.Line($"Vulkan pipeline cache: initializing {_pipelineCachePath}");
                 }
             }
             catch (Exception exception)
@@ -4889,7 +4919,17 @@ internal static unsafe class VulkanVideoPresenter
             {
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] Vulkan pipeline cache rejected ({result}); rebuilding it.");
+                SharpEmu.HLE.EmuConsole.Line(
+                    $"Vulkan pipeline cache: driver rejected {_pipelineCachePath} ({result}); starting empty");
+                initialData = [];
                 result = TryCreatePipelineCache([], out _pipelineCache);
+            }
+
+            if (result == Result.Success && _pipelineCachePath is not null)
+            {
+                SharpEmu.HLE.EmuConsole.Line(initialData.Length != 0
+                    ? $"Vulkan pipeline cache: loaded {initialData.Length} bytes from {_pipelineCachePath}"
+                    : "Vulkan pipeline cache: initialized empty");
             }
 
             if (result != Result.Success)
@@ -5047,6 +5087,11 @@ internal static unsafe class VulkanVideoPresenter
                 _lastPipelineCacheSaveTick = Environment.TickCount64;
                 Console.Error.WriteLine(
                     $"[LOADER][INFO] Vulkan pipeline cache saved: path={_pipelineCachePath} bytes={data.Length}");
+                if (force)
+                {
+                    SharpEmu.HLE.EmuConsole.Line(
+                        $"Vulkan pipeline cache: saved {data.Length} bytes to {_pipelineCachePath}");
+                }
             }
             catch (Exception exception)
             {
@@ -16146,6 +16191,21 @@ internal static unsafe class VulkanVideoPresenter
             if (!tookPresentation &&
                 TryTakeHostMovieOnlyPresentation(_presentedSequence, out presentation))
             {
+                tookPresentation = true;
+            }
+
+            // KytyPS5 keeps its HUD live while a game loads. Until the guest's
+            // first flip only a CPU splash/black frame exists and nothing new
+            // arrives, so re-present it ~2x/s to keep the FPS overlay drawing
+            // (the panel "did not appear" on Hellboy because no present ever
+            // happened). Guest frames are never re-presented here.
+            if (!tookPresentation &&
+                PerfOverlay.Enabled &&
+                !_firstGuestDrawPresented &&
+                Environment.TickCount64 - _lastIdleOverlayPresentTick >= 500 &&
+                TryTakeIdleOverlayPresentation(out presentation))
+            {
+                _lastIdleOverlayPresentTick = Environment.TickCount64;
                 tookPresentation = true;
             }
 

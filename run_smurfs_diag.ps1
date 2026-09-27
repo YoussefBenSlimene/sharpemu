@@ -25,6 +25,7 @@ if (-not (Test-Path -LiteralPath $gamePath)) { Write-Host "ERROR: game missing";
 $childEnv = @{
     SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS = "1"
     SHARPEMU_WRITABLE_APP0 = "1"
+    SHARPEMU_CONSOLE = "verbose"   # full developer log (parsed below)
     SHARPEMU_DISABLE_GUEST_IMAGE_CPU_SYNC = "1"
     # Verdict traces: did the game ever submit/present during this run?
     SHARPEMU_TRACE_GUEST_IMAGES = "present"
