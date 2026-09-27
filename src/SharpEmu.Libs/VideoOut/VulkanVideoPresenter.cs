@@ -17406,12 +17406,159 @@ internal static unsafe class VulkanVideoPresenter
             EndDebugLabel(_commandBuffer);
         }
 
+        // Lookup by address of a compute-dispatch-written storage image that
+        // has not been synced into this sampled view yet (same dims and format
+        // required; the copy is a raw vkCmdCopyImage).
+        internal bool TryGetGpuDirtyStorageSibling(
+            GuestImageResource sampled,
+            out GuestImageResource dirtyStorage)
+        {
+            dirtyStorage = null!;
+            lock (_gate)
+            {
+                if (_guestImages.TryGetValue(sampled.Address, out var main) &&
+                    !ReferenceEquals(main, sampled))
+                {
+                    dirtyStorage = main;
+                }
+                else
+                {
+                    foreach (var pair in _guestImageVariants)
+                    {
+                        if (pair.Key.Address == sampled.Address &&
+                            !ReferenceEquals(pair.Value, sampled))
+                        {
+                            dirtyStorage = pair.Value;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (dirtyStorage is null || !dirtyStorage.GpuWrittenSinceGuestSync ||
+                !dirtyStorage.Initialized || dirtyStorage.Image.Handle == 0)
+            {
+                dirtyStorage = null!;
+                return false;
+            }
+
+            return SameDims(sampled, dirtyStorage) && sampled.Format == dirtyStorage.Format;
+
+            static bool SameDims(GuestImageResource a, GuestImageResource b) =>
+                a.Width == b.Width && a.Height == b.Height;
+        }
+
+        private void RecordStorageToSampledCopy(GuestImageResource storage, GuestImageResource sampled)
+        {
+            if (_commandBuffer.Handle == 0)
+            {
+                return;
+            }
+
+            var extent = new Extent3D(sampled.Width, sampled.Height, 1);
+            ImageSubresourceLayers colorLayers = new(ImageAspectFlags.ColorBit, 0, 0, 1);
+
+            var storageToSrc = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.ShaderWriteBit | AccessFlags.ShaderReadBit,
+                DstAccessMask = AccessFlags.TransferReadBit,
+                OldLayout = ImageLayout.ShaderReadOnlyOptimal,
+                NewLayout = ImageLayout.TransferSrcOptimal,
+                Image = storage.Image,
+                SubresourceRange = ColorSubresourceRange(0, storage.MipLevels),
+            };
+            storageToSrc.SrcQueueFamilyIndex = Vk.QueueFamilyIgnored;
+            storageToSrc.DstQueueFamilyIndex = Vk.QueueFamilyIgnored;
+
+            var sampledToDst = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = 0,
+                DstAccessMask = AccessFlags.TransferWriteBit,
+                OldLayout = sampled.Initialized ? ImageLayout.ShaderReadOnlyOptimal : ImageLayout.Undefined,
+                NewLayout = ImageLayout.TransferDstOptimal,
+                Image = sampled.Image,
+                SubresourceRange = ColorSubresourceRange(0, sampled.MipLevels),
+            };
+            sampledToDst.SrcQueueFamilyIndex = Vk.QueueFamilyIgnored;
+            sampledToDst.DstQueueFamilyIndex = Vk.QueueFamilyIgnored;
+
+            var barriers = stackalloc ImageMemoryBarrier[2];
+            barriers[0] = storageToSrc;
+            barriers[1] = sampledToDst;
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.AllCommandsBit,
+                PipelineStageFlags.TransferBit,
+                0,
+                0, null,
+                0, null,
+                2,
+                barriers);
+
+            var copyRegion = new ImageCopy
+            {
+                SrcSubresource = colorLayers,
+                DstSubresource = colorLayers,
+                Extent = extent,
+            };
+            _vk.CmdCopyImage(
+                _commandBuffer,
+                storage.Image,
+                ImageLayout.TransferSrcOptimal,
+                sampled.Image,
+                ImageLayout.TransferDstOptimal,
+                1,
+                &copyRegion);
+
+            var backToSampled = new ImageMemoryBarrier
+            {
+                SType = StructureType.ImageMemoryBarrier,
+                SrcAccessMask = AccessFlags.TransferWriteBit,
+                DstAccessMask = AccessFlags.ShaderReadBit,
+                OldLayout = ImageLayout.TransferDstOptimal,
+                NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                Image = sampled.Image,
+                SubresourceRange = ColorSubresourceRange(0, sampled.MipLevels),
+            };
+            backToSampled.SrcQueueFamilyIndex = Vk.QueueFamilyIgnored;
+            backToSampled.DstQueueFamilyIndex = Vk.QueueFamilyIgnored;
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.TransferBit,
+                PipelineStageFlags.FragmentShaderBit,
+                0, 0, null, 0, null, 1, &backToSampled);
+
+            storage.GpuWrittenSinceGuestSync = false;
+            if (_storageSyncTraceOnce.Add(storage.Address))
+            {
+                Console.Error.WriteLine(
+                    $"[GIMG] storage_to_sampled addr=0x{storage.Address:X} " +
+                    $"{storage.Width}x{storage.Height} fmt={storage.Format} -> sampled img=0x{sampled.Image.Handle:X}");
+            }
+        }
+
+        private static readonly HashSet<ulong> _storageSyncTraceOnce = new();
+
         private void RecordTextureUploads(
             TranslatedDrawResources resources,
             PipelineStageFlags shaderStage)
         {
             foreach (var texture in resources.Textures)
             {
+                // M22/M36 coherence: if a compute pass wrote a storage image at
+                // this sampled texture's address since its last bind, copy the
+                // GPU-written bytes into the sampled view before it is used.
+                // Runs on the pump thread inside the open guest batch — never
+                // from the AgcExports bind thread (that was the device-lost bug).
+                if (!texture.IsStorage &&
+                    texture.GuestImage is { } sampledImage &&
+                    TryGetGpuDirtyStorageSibling(sampledImage, out var dirtyStorage))
+                {
+                    RecordStorageToSampledCopy(dirtyStorage, sampledImage);
+                }
+
                 if (texture.GuestDepth is { } depth)
                 {
                     RecordGuestDepthForSampling(depth, shaderStage);
