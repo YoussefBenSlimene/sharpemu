@@ -642,6 +642,12 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly Dictionary<ulong, byte[]> _pendingGuestImageInitialData = new();
     private static readonly Dictionary<ulong, (uint Width, uint Height, ulong ByteCount)>
         _guestImageExtents = new();
+    private static readonly bool _logPipelineCreateMs =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_PIPELINE_CREATE_MS"),
+            "1",
+            StringComparison.Ordinal);
+
     private static readonly bool _traceGuestImageEvents =
         string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_TRACE_DRAWS"),
@@ -8275,6 +8281,7 @@ internal static unsafe class VulkanVideoPresenter
                         RenderPass = renderPass,
                         Subpass = 0,
                     };
+                    var createStart = System.Diagnostics.Stopwatch.GetTimestamp();
                     Pipeline pipeline;
                     Check(
                         _vk.CreateGraphicsPipelines(
@@ -8285,6 +8292,15 @@ internal static unsafe class VulkanVideoPresenter
                         null,
                         out pipeline),
                     "vkCreateGraphicsPipelines(translated)");
+                    if (_logPipelineCreateMs)
+                    {
+                        var createMs =
+                            (System.Diagnostics.Stopwatch.GetTimestamp() - createStart) * 1000.0 /
+                            System.Diagnostics.Stopwatch.Frequency;
+                        Console.Error.WriteLine(
+                            $"[LOADER][INFO] vk.pipeline_create ms={createMs:F1} " +
+                            $"ps={fragmentSpirv.Length}b vs={vertexSpirv.Length}b");
+                    }
                     MarkPipelineCacheDirty();
                     resources.Pipeline = pipeline;
                     resources.PipelineCached = true;
