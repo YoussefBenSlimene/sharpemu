@@ -9042,6 +9042,222 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
         return true;
     }
 
+    // ---- Shader compilation: parallel VS/PS + optional async mode ----
+    //
+    // KytyPS5 (pipelineCache.cpp GetProgram) translates shaders synchronously on
+    // first use and prints "Shaders: VS n | PS n | ...". SharpEmu keeps that
+    // synchronous contract by default but translates the vertex and pixel
+    // halves of a new pair in parallel (Gen5 -> SPIR-V translation is pure CPU
+    // work on immutable inputs), cutting the first-use stall.
+    // SHARPEMU_ASYNC_SHADERS=1 enables shadPS4-style async compilation: the pair
+    // compiles on the thread pool and draws that need it are skipped until it is
+    // ready. Loading keeps moving, but a draw issued only once (e.g. a LUT bake)
+    // can be lost, so it is opt-in.
+    private static readonly bool _asyncShaderCompilation = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_SHADERS"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly bool _parallelShaderCompilation = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_PARALLEL_SHADER_COMPILE"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly ConcurrentDictionary<
+        (ulong Es, ulong EsState, ulong Ps, ulong PsState, ulong OutputLayout,
+         uint OutputCount, uint Attributes, uint PsInputEna, uint PsInputAddr,
+         ulong PsInputCntl, ulong AliasAlignment),
+        byte> _pendingAsyncGraphicsCompiles = new();
+    private static long _shaderCompileTicks;
+    private static long _shaderCompileCount;
+
+    private static bool TryCompileGraphicsShaderPair(
+        Gen5ShaderState exportState,
+        Gen5ShaderEvaluation exportEvaluation,
+        Gen5ShaderState pixelState,
+        Gen5ShaderEvaluation pixelEvaluation,
+        Gen5PixelOutputBinding[] pixelOutputs,
+        int totalGlobalBuffers,
+        int guestGlobalBuffers,
+        uint psInputEna,
+        uint psInputAddr,
+        IReadOnlyList<uint> psInputCntl,
+        out IGuestCompiledShader? vertexShader,
+        out IGuestCompiledShader? pixelShader,
+        out string error)
+    {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var backend = GuestGpu.Current;
+        IGuestCompiledShader? compiledPixel = null;
+        var pixelError = string.Empty;
+        var pixelOk = false;
+        void CompilePixel()
+        {
+            pixelOk = backend.TryCompilePixelShader(
+                pixelState,
+                pixelEvaluation,
+                pixelOutputs,
+                out compiledPixel,
+                out pixelError,
+                globalBufferBase: 0,
+                totalGlobalBufferCount: totalGlobalBuffers,
+                imageBindingBase: 0,
+                scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers,
+                pixelInputEnable: psInputEna,
+                pixelInputAddress: psInputAddr,
+                pixelInputCntl: psInputCntl,
+                storageBufferOffsetAlignment: _storageBufferOffsetAlignment);
+        }
+
+        // Pixel half on the pool, vertex half on this thread; both read only
+        // immutable shader state and evaluation records.
+        var pixelTask = _parallelShaderCompilation
+            ? System.Threading.Tasks.Task.Run(CompilePixel)
+            : null;
+        if (pixelTask is null)
+        {
+            CompilePixel();
+        }
+
+        var vertexOk = backend.TryCompileVertexShader(
+            exportState,
+            exportEvaluation,
+            out vertexShader,
+            out var vertexError,
+            globalBufferBase: pixelEvaluation.GlobalMemoryBindings.Count,
+            totalGlobalBufferCount: totalGlobalBuffers,
+            imageBindingBase: pixelEvaluation.ImageBindings.Count,
+            scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers + 1,
+            requiredVertexOutputCount: (int)GetInterpolatedAttributeCount(pixelState),
+            storageBufferOffsetAlignment: _storageBufferOffsetAlignment);
+        pixelTask?.GetAwaiter().GetResult();
+        pixelShader = compiledPixel;
+
+        Interlocked.Add(ref _shaderCompileTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+        var count = Interlocked.Increment(ref _shaderCompileCount);
+        if ((count & 63) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] shader_compile pairs={count} total_ms=" +
+                $"{Interlocked.Read(ref _shaderCompileTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} " +
+                $"parallel={_parallelShaderCompilation} async={_asyncShaderCompilation}");
+        }
+
+        // Same error precedence as the old sequential PS-then-VS chain.
+        error = !pixelOk ? pixelError : !vertexOk ? vertexError : string.Empty;
+        return pixelOk && vertexOk;
+    }
+
+    private static Gen5ShaderEvaluation DetachEvaluationForBackgroundCompile(
+        Gen5ShaderEvaluation evaluation)
+    {
+        // Pooled guest-data arrays return to the pool when the draw returns; a
+        // background compile must not read them afterwards. Give it private,
+        // non-pooled copies (translation only samples them for diagnostics).
+        static byte[] Copy(byte[] data, int length) =>
+            length <= 0 ? [] : data.AsSpan(0, Math.Min(length, data.Length)).ToArray();
+
+        var globals = new Gen5GlobalMemoryBinding[evaluation.GlobalMemoryBindings.Count];
+        for (var index = 0; index < globals.Length; index++)
+        {
+            var binding = evaluation.GlobalMemoryBindings[index];
+            globals[index] = binding with
+            {
+                Data = Copy(binding.Data, binding.DataLength),
+                DataPooled = false,
+            };
+        }
+
+        Gen5VertexInputBinding[]? vertexInputs = null;
+        if (evaluation.VertexInputs is { } inputs)
+        {
+            vertexInputs = new Gen5VertexInputBinding[inputs.Count];
+            for (var index = 0; index < vertexInputs.Length; index++)
+            {
+                var input = inputs[index];
+                vertexInputs[index] = input with
+                {
+                    Data = Copy(input.Data, input.DataLength),
+                    DataPooled = false,
+                };
+            }
+        }
+
+        return evaluation with
+        {
+            GlobalMemoryBindings = globals,
+            VertexInputs = vertexInputs ?? evaluation.VertexInputs,
+        };
+    }
+
+    private static bool TryQueueAsyncGraphicsCompile(
+        (ulong Es, ulong EsState, ulong Ps, ulong PsState, ulong OutputLayout,
+         uint OutputCount, uint Attributes, uint PsInputEna, uint PsInputAddr,
+         ulong PsInputCntl, ulong AliasAlignment) shaderKey,
+        ulong exportShaderAddress,
+        ulong exportStateFingerprint,
+        Gen5ShaderState exportState,
+        Gen5ShaderEvaluation exportEvaluation,
+        ulong pixelShaderAddress,
+        ulong pixelStateFingerprint,
+        Gen5ShaderState pixelState,
+        Gen5ShaderEvaluation pixelEvaluation,
+        Gen5PixelOutputBinding[] pixelOutputs,
+        int totalGlobalBuffers,
+        int guestGlobalBuffers,
+        uint psInputEna,
+        uint psInputAddr,
+        IReadOnlyList<uint> psInputCntl)
+    {
+        if (!_pendingAsyncGraphicsCompiles.TryAdd(shaderKey, 0))
+        {
+            return true; // already compiling: keep skipping this draw
+        }
+
+        var exportCopy = DetachEvaluationForBackgroundCompile(exportEvaluation);
+        var pixelCopy = DetachEvaluationForBackgroundCompile(pixelEvaluation);
+        var cntlCopy = psInputCntl.ToArray();
+        _ = System.Threading.Tasks.Task.Run(() =>
+        {
+            try
+            {
+                if (!TryCompileGraphicsShaderPair(
+                        exportState,
+                        exportCopy,
+                        pixelState,
+                        pixelCopy,
+                        pixelOutputs,
+                        totalGlobalBuffers,
+                        guestGlobalBuffers,
+                        psInputEna,
+                        psInputAddr,
+                        cntlCopy,
+                        out var vertexShader,
+                        out var pixelShader,
+                        out var compileError))
+                {
+                    // Leave the key pending: retrying a deterministic failure
+                    // on every draw would only burn CPU.
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] async shader compile failed es=0x{exportShaderAddress:X16} " +
+                        $"ps=0x{pixelShaderAddress:X16}: {compileError}");
+                    return;
+                }
+
+                DumpCompiledShader("vs", exportShaderAddress, exportStateFingerprint, vertexShader!, exportState.Program);
+                DumpCompiledShader("ps", pixelShaderAddress, pixelStateFingerprint, pixelShader!, pixelState.Program);
+                GuestGpu.Current.CountShaderCompilation();
+                SharpEmu.HLE.EmuConsole.ShaderCompiled(SharpEmu.HLE.EmuConsole.ShaderStage.Vertex);
+                SharpEmu.HLE.EmuConsole.ShaderCompiled(SharpEmu.HLE.EmuConsole.ShaderStage.Pixel);
+                _graphicsShaderCache.TryAdd(shaderKey, (vertexShader!, pixelShader!));
+                _pendingAsyncGraphicsCompiles.TryRemove(shaderKey, out _);
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine($"[LOADER][WARN] async shader compile threw: {exception.Message}");
+            }
+        });
+        return true;
+    }
+
     private static bool TryCreateTranslatedGuestDraw(
         CpuContext ctx,
         SubmittedDcbState state,
@@ -9388,33 +9604,46 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
                         renderTargetOutputKinds[location]);
                 }
 
-                if (!GuestGpu.Current.TryCompilePixelShader(
+                if (_asyncShaderCompilation &&
+                    TryQueueAsyncGraphicsCompile(
+                        shaderKey,
+                        exportShaderAddress,
+                        exportStateFingerprint,
+                        exportState,
+                        exportEvaluation,
+                        pixelShaderAddress,
+                        pixelStateFingerprint,
                         pixelState,
                         pixelEvaluation,
                         pixelOutputs,
-                        out var pixelShader,
-                        out error,
-                        globalBufferBase: 0,
-                        totalGlobalBufferCount: totalGlobalBuffers,
-                        imageBindingBase: 0,
-                        scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers,
-                        pixelInputEnable: psInputEna,
-                        pixelInputAddress: psInputAddr,
-                        pixelInputCntl: psInputCntl,
-                        storageBufferOffsetAlignment:
-                            _storageBufferOffsetAlignment) ||
-                    !GuestGpu.Current.TryCompileVertexShader(
+                        totalGlobalBuffers,
+                        guestGlobalBuffers,
+                        psInputEna,
+                        psInputAddr,
+                        psInputCntl))
+                {
+                    // shadPS4-style async mode: the pair compiles on a worker;
+                    // this draw is skipped until it is ready.
+                    error = "shader pair compiling asynchronously";
+                    ReturnPooledEvaluationArrays(exportEvaluation);
+                    ReturnPooledEvaluationArrays(pixelEvaluation);
+                    return false;
+                }
+
+                if (!TryCompileGraphicsShaderPair(
                         exportState,
                         exportEvaluation,
+                        pixelState,
+                        pixelEvaluation,
+                        pixelOutputs,
+                        totalGlobalBuffers,
+                        guestGlobalBuffers,
+                        psInputEna,
+                        psInputAddr,
+                        psInputCntl,
                         out var vertexShader,
-                        out error,
-                        globalBufferBase: pixelEvaluation.GlobalMemoryBindings.Count,
-                        totalGlobalBufferCount: totalGlobalBuffers,
-                        imageBindingBase: pixelEvaluation.ImageBindings.Count,
-                        scalarRegisterBufferIndex: _bakeScalars ? -1 : guestGlobalBuffers + 1,
-                        requiredVertexOutputCount: (int)GetInterpolatedAttributeCount(pixelState),
-                        storageBufferOffsetAlignment:
-                            _storageBufferOffsetAlignment))
+                        out var pixelShader,
+                        out error))
                 {
                     ReturnPooledEvaluationArrays(exportEvaluation);
                     ReturnPooledEvaluationArrays(pixelEvaluation);

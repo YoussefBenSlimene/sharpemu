@@ -142,3 +142,5 @@ environment, so most users don't need to touch them:
 | `SHARPEMU_CONSOLE=kyty` | Force the KytyPS5-style terminal even when diagnostic switches are set. |
 | (default) | KytyPS5-style terminal: `Initialized: …`, `Vulkan pipeline cache: …`, `Title ID: …`, `version = N`, `AJM codec=…`, `Shaders: VS n \| PS n \| CS n …`, `Unresolved import stub called: …`, plus errors and guest printf. With `--log-file`, the complete developer log still goes to the file. |
 | `SHARPEMU_LOG_IMPORT_PERIODIC=1` | Re-enables the bring-up import probes (`ImportCtx#`, `ImportNV#`, `ImportStack#`, `ImportRet#`). |
+| `SHARPEMU_ASYNC_SHADERS=1` | Compile new VS/PS pairs in the background and skip the draws that need them until ready (shadPS4-style async; faster loading, may drop one-shot draws). |
+| `SHARPEMU_DISABLE_PARALLEL_SHADER_COMPILE=1` | Translate the VS and PS halves of a pair sequentially (the old behaviour). |
