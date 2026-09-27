@@ -9698,6 +9698,46 @@ var renderTargets = GetRenderTargets(state.CxRegisters);
     private static readonly string? _storageInitTraceFilter =
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_STORAGE_IMAGE_INIT_ADDRESS");
     private static readonly bool _storageInitTraceAll = _storageInitTraceFilter == "*";
+    // EXPERIMENT (black screen): tiny texture descriptors (the composite's 1x1
+    // luminance/eye-adaptation dummies) get a mid-gray seed instead of zero.
+    // If Mortal Shell's screen lights up dimly with =64, the black screen is
+    // the compute→sampled-view coherence gap (M22) — the histogram values
+    // written by compute never reach the texture view.
+    private static readonly int _smallTexelSeed = ParseSmallTexelSeed();
+
+    private static int ParseSmallTexelSeed()
+    {
+        var text = Environment.GetEnvironmentVariable("SHARPEMU_SEED_SMALL_TEXELS");
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return -1;
+        }
+
+        return int.TryParse(
+                text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                    ? text[2..]
+                    : text,
+                text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                    ? System.Globalization.NumberStyles.HexNumber
+                    : System.Globalization.NumberStyles.Integer,
+                null,
+                out var value) && value is >= 0 and <= 255
+            ? value
+            : -1;
+    }
+
+    private static byte[]? SeedSmallTexelsIfTiny(ulong address, ulong width, ulong height, int sourceByteCount)
+    {
+        if (_smallTexelSeed < 0 || address == 0 || sourceByteCount <= 0 ||
+            sourceByteCount > 64 * 64 * 16 || width > 64 || height > 64)
+        {
+            return null;
+        }
+
+        var seeded = new byte[sourceByteCount];
+        Array.Fill(seeded, (byte)_smallTexelSeed);
+        return seeded;
+    }
     private static readonly ConcurrentDictionary<ulong, byte> _tracedStorageInitAddresses = new();
     private static readonly ConcurrentDictionary<(ulong Address, ulong Ps), byte> _rebound1x1LinearTextures = new();
 
@@ -12156,15 +12196,15 @@ private static long _indirectDrawProbeCount;
 
                     if (readAllLayers)
                     {
-                        NoteSampledAddress(descriptor.Address, descriptor.Format, descriptor.NumberType);
+            NoteSampledAddress(descriptor.Address, descriptor.Format, descriptor.NumberType);
             texture = new GuestDrawTexture(
-                            descriptor.Address,
-                            descriptor.Width,
-                            descriptor.Height,
-                            descriptor.Format,
-                            descriptor.NumberType,
-                            [],
-                            IsFallback: false,
+                descriptor.Address,
+                descriptor.Width,
+                descriptor.Height,
+                descriptor.Format,
+                descriptor.NumberType,
+                [],
+                IsFallback: false,
                             IsStorage: false,
                             MipLevels: descriptor.MipLevels,
                             MipLevel: mipLevel,
@@ -12262,6 +12302,17 @@ private static long _indirectDrawProbeCount;
                 descriptor.Type,
                 textureDepth);
             return true;
+        }
+
+        // EXPERIMENT (SHARPEMU_SEED_SMALL_TEXELS): tiny sampled descriptors
+        // whose guest memory is all zero get a flat mid-gray texel instead —
+        // if Mortal Shell's black screen lights up (dimly), the composite is
+        // sampling a compute-written 1x1 view (eye-adaptation/histogram) and
+        // the loss is our missing storage→texture sync (M22), not bad reads.
+        if (SeedSmallTexelsIfTiny(descriptor.Address, descriptor.Width, descriptor.Height, checked((int)sourceByteCount)) is { } seeded &&
+            source.AsSpan(0, Math.Min(source.Length, (int)sourceByteCount)).IndexOfAnyExcept((byte)0) < 0)
+        {
+            seeded.CopyTo(source.AsSpan(0, Math.Min(seeded.Length, source.Length)));
         }
 
         if (_traceAgcShader)
