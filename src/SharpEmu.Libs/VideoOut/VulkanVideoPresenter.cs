@@ -145,6 +145,13 @@ internal static unsafe class VulkanVideoPresenter
         public Dictionary<GuestDepthKey, DepthFramebufferResource> DepthFramebuffers { get; } = new();
         public bool Initialized;
         public bool InitialUploadPending;
+        /// <summary>
+        /// Set when a compute dispatch wrote this image as a storage image and
+        /// no GPU→guest-memory sync has run since (M22/M36: on console the
+        /// sampled view of that address reads the same bytes; here the views
+        /// are separate VkImages, so a tiny bind must pull these bytes back).
+        /// </summary>
+        public bool GpuWrittenSinceGuestSync;
         public bool IsCpuBacked;
         public ulong CpuContentFingerprint;
         public bool SupportsStorageUsage;
@@ -3419,6 +3426,22 @@ internal static unsafe class VulkanVideoPresenter
         long GuestImageVersion = 0,
         bool IsHdr = false);
 
+    // ---- M22/M36: storage→sampled coherence ----
+    //
+    // On the console the bytes a compute shader writes to a storage image are
+    // the same bytes a later sampled read sees (unified memory). Here each
+    // VkImage is private, so a sampled bind of that address would re-read
+    // stale guest memory and build a zero image (UE4's eye-adaptation/
+    // histogram 1x1 case — the Mortal Shell black screen). Tiny surfaces
+    // (≤64×64) are cheap to copy back to guest memory so the next bind uploads
+    // real content through the normal path.
+    private static Presenter? _activeInstance;
+
+    internal static bool TrySyncGpuWrittenTinyStorageToGuestMemory(
+        ulong address,
+        SharpEmu.HLE.ICpuMemory memory) =>
+        _activeInstance?.TrySyncGpuWrittenTinyStorageToGuestMemoryCore(address, memory) == true;
+
     private sealed class Presenter : IDisposable
     {
         private const string FullscreenBarycentricVertexSpirv =
@@ -3873,6 +3896,7 @@ internal static unsafe class VulkanVideoPresenter
                 VideoOutExports.GetWindowTitle(),
                 _videoOptions,
                 SdlGraphicsApi.Vulkan);
+            VulkanVideoPresenter._activeInstance = this;
         }
 
         public void Run()
@@ -16579,6 +16603,169 @@ internal static unsafe class VulkanVideoPresenter
 
         private sealed record DrawContents(int NonZeroBytes, int TotalBytes, int NonBlackPixels, int TotalPixels);
 
+        internal bool TrySyncGpuWrittenTinyStorageToGuestMemoryCore(
+            ulong address,
+            SharpEmu.HLE.ICpuMemory memory)
+        {
+            GuestImageResource? image;
+            lock (_gate)
+            {
+                if (!_guestImages.TryGetValue(address, out image))
+                {
+                    foreach (var pair in _guestImageVariants)
+                    {
+                        if (pair.Key.Address == address)
+                        {
+                            image = pair.Value;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (image is null ||
+                !image.Initialized ||
+                !image.GpuWrittenSinceGuestSync ||
+                image.Image.Handle == 0)
+            {
+                return false;
+            }
+
+            var bytesPerPixel = GetReadbackBytesPerPixel(image.Format);
+            if (bytesPerPixel == 0 || image.Width == 0 || image.Height == 0)
+            {
+                return false;
+            }
+
+            var byteCount = checked((ulong)image.Width * image.Height * bytesPerPixel);
+            if (byteCount == 0 || byteCount > (64UL * 64 * 16))
+            {
+                return false;
+            }
+
+            if (_deviceLost || _queue.Handle == 0)
+            {
+                return false;
+            }
+
+            var staging = CreateBuffer(
+                byteCount,
+                BufferUsageFlags.TransferDstBit,
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                out var stagingMemory);
+            var succeeded = false;
+            try
+            {
+                Check(
+                    _vk.ResetCommandBuffer(_commandBuffer, 0),
+                    "vkResetCommandBuffer(storage sync)");
+                var beginInfo = new CommandBufferBeginInfo
+                {
+                    SType = StructureType.CommandBufferBeginInfo,
+                    Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+                };
+                Check(_vk.BeginCommandBuffer(_commandBuffer, &beginInfo), "vkBeginCommandBuffer(storage sync)");
+
+                var toTransfer = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.ShaderWriteBit | AccessFlags.ShaderReadBit | AccessFlags.ColorAttachmentWriteBit,
+                    DstAccessMask = AccessFlags.TransferReadBit,
+                    OldLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    NewLayout = ImageLayout.TransferSrcOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = image.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.AllCommandsBit,
+                    PipelineStageFlags.TransferBit,
+                    0, 0, null, 0, null, 1, &toTransfer);
+                var copy = new BufferImageCopy
+                {
+                    ImageSubresource = new ImageSubresourceLayers(
+                        ImageAspectFlags.ColorBit, 0, 0, 1),
+                    ImageExtent = new Extent3D(image.Width, image.Height, 1),
+                };
+                _vk.CmdCopyImageToBuffer(
+                    _commandBuffer,
+                    image.Image,
+                    ImageLayout.TransferSrcOptimal,
+                    staging,
+                    1,
+                    &copy);
+                var backToSampled = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferReadBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferSrcOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = image.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.FragmentShaderBit,
+                    0, 0, null, 0, null, 1, &backToSampled);
+                Check(_vk.EndCommandBuffer(_commandBuffer), "vkEndCommandBuffer(storage sync)");
+                SubmitGuestCommandBuffer(_commandBuffer, [], []);
+                Check(_vk.QueueWaitIdle(_queue), "vkQueueWaitIdle(storage sync)");
+
+                void* mapped;
+                Check(
+                    _vk.MapMemory(_device, stagingMemory, 0, byteCount, 0, &mapped),
+                    "vkMapMemory(storage sync)");
+                var bytes = new ReadOnlySpan<byte>(mapped, checked((int)byteCount)).ToArray();
+                _vk.UnmapMemory(_device, stagingMemory);
+
+                // Storage images may be cache-line padded on the guest side
+                // (physical_bytes 65536); the guest array lives at
+                // image.Address. Write the packed texel block back so a later
+                // sampled bind (which reads linear guest memory) sees the new
+                // content instead of the stale zero fill.
+                succeeded = memory.TryWrite(address, bytes);
+                if (succeeded)
+                {
+                    image.GpuWrittenSinceGuestSync = false;
+                }
+
+                if (_traceGuestImageEvents)
+                {
+                    Console.Error.WriteLine(
+                        $"[GIMG] storage_to_guest_sync addr=0x{address:X} " +
+                        $"{image.Width}x{image.Height} fmt={image.Format} bytes={byteCount} ok={succeeded}");
+                }
+
+                return succeeded;
+            }
+            catch (AccessViolationException)
+            {
+                return false;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+            finally
+            {
+                if (stagingMemory.Handle != 0)
+                {
+                    _vk.FreeMemory(_device, stagingMemory, null);
+                }
+
+                if (staging.Handle != 0)
+                {
+                    _vk.DestroyBuffer(_device, staging, null);
+                }
+            }
+        }
+
         private DrawContents? ReadbackImageContents(GuestImageResource image)
         {
             var bytesPerPixel = GetReadbackBytesPerPixel(image.Format);
@@ -17865,6 +18052,14 @@ internal static unsafe class VulkanVideoPresenter
 
                     guestImage.Initialized = true;
                     guestImage.InitialUploadPending = false;
+                    // M22/M36: a storage write means the sampled view of the
+                    // same address is now stale. Tiny surfaces (UE4's 1x1..64x64
+                    // eye-adaptation/histogram class) are cheap to sync back to
+                    // guest memory; larger ones wait for the alias-in-place fix.
+                    if (guestImage.Width <= 64 && guestImage.Height <= 64)
+                    {
+                        guestImage.GpuWrittenSinceGuestSync = true;
+                    }
                     if (guestImage.GuestFormat != 0)
                     {
                         _availableGuestImages[texture.Address] = guestImage.GuestFormat;
