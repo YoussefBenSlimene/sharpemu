@@ -918,6 +918,43 @@ public static class Ngs2Exports
         LibraryName = "libSceNgs2")]
     public static int Ngs2PanInit(CpuContext ctx) => ctx.SetReturn(0);
 
+    // KytyPS5 ngs2.cpp parity. Quake II calls this per voice per frame with
+    // SCE_NGS2_PAN_MATRIX_FORMAT_7_1CH and logs the unresolved 0x80020002 every
+    // time. rdi=work, rsi=params (4 floats each), edx=num_params,
+    // ecx=matrix_format (channel count; 0 = stereo), r8=out float matrix
+    // [num_params][channels]. Kyty routes everything to channel 0 at unit gain.
+    [SysAbiExport(
+        Nid = "gbMKV+8Enuo",
+        ExportName = "sceNgs2PanGetVolumeMatrix",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2PanGetVolumeMatrix(CpuContext ctx)
+    {
+        var numParams = (uint)ctx[CpuRegister.Rdx];
+        var matrixFormat = (uint)ctx[CpuRegister.Rcx];
+        var outMatrix = ctx[CpuRegister.R8];
+        if (numParams == 0)
+        {
+            return ctx.SetReturn(0);
+        }
+
+        if (outMatrix == 0 || numParams > 4096)
+        {
+            return ctx.SetReturn(OrbisNgs2ErrorInvalidOutAddress);
+        }
+
+        var channels = matrixFormat == 0 ? 2u : Math.Min(matrixFormat, 8u);
+        var bytes = new byte[numParams * channels * sizeof(float)];
+        for (var p = 0u; p < numParams; p++)
+        {
+            BitConverter.TryWriteBytes(bytes.AsSpan((int)(p * channels * sizeof(float)), 4), 1.0f);
+        }
+
+        return ctx.Memory.TryWrite(outMatrix, bytes)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisNgs2ErrorInvalidOutAddress);
+    }
+
     [SysAbiExport(
         Nid = "1WsleK-MTkE",
         ExportName = "sceNgs2GeomCalcListener",
