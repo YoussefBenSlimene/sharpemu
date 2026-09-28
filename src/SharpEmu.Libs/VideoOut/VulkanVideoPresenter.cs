@@ -9374,8 +9374,118 @@ internal static unsafe class VulkanVideoPresenter
         /// from guest memory, evict matching texture-cache entries, then
         /// re-arm each address once. Must not enqueue <see cref="VulkanGuestImageWrite"/>.
         /// </summary>
+        // Q15: GPU writes published into guest memory by the global-buffer
+        // writeback (compute/shader stores) bypass the CPU write tracker, so a
+        // texture-cache entry sampled from that memory would stay stale forever
+        // now that the AGC layer skips per-draw texel copies for cached
+        // identities (Q14). Record the written pages here and evict every cached
+        // texture overlapping them on the next drain.
+        private readonly List<(ulong Start, ulong End)> _gpuWrittenGuestRanges = new();
+
+        private static readonly bool _gpuWriteTextureEvictionDisabled = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_NO_GPU_WRITE_TEXTURE_EVICT"),
+            "1",
+            StringComparison.Ordinal);
+
+        private void NoteGpuWrittenGuestRange(ulong address, ulong length)
+        {
+            if (_gpuWriteTextureEvictionDisabled || length == 0 || _textureCache.Count == 0)
+            {
+                return;
+            }
+
+            var end = address + length;
+            if (_gpuWrittenGuestRanges.Count > 0)
+            {
+                var last = _gpuWrittenGuestRanges[^1];
+                if (address <= last.End && end >= last.Start)
+                {
+                    _gpuWrittenGuestRanges[^1] = (Math.Min(last.Start, address), Math.Max(last.End, end));
+                    return;
+                }
+            }
+
+            if (_gpuWrittenGuestRanges.Count >= 4096)
+            {
+                // Pathological fragmentation: collapse to one covering range.
+                var first = _gpuWrittenGuestRanges[0].Start;
+                var lastEnd = _gpuWrittenGuestRanges[^1].End;
+                _gpuWrittenGuestRanges.Clear();
+                _gpuWrittenGuestRanges.Add((Math.Min(first, address), Math.Max(lastEnd, end)));
+                return;
+            }
+
+            _gpuWrittenGuestRanges.Add((address, end));
+        }
+
+        private void EvictTexturesOverlappingGpuWrites()
+        {
+            if (_gpuWrittenGuestRanges.Count == 0)
+            {
+                return;
+            }
+
+            if (_textureCache.Count == 0)
+            {
+                _gpuWrittenGuestRanges.Clear();
+                return;
+            }
+
+            List<TextureContentIdentity>? evicted = null;
+            foreach (var entry in _textureCache)
+            {
+                var start = entry.Key.Address;
+                var byteCount = GetTextureByteCount(
+                    entry.Key.Format,
+                    Math.Max(entry.Key.Pitch, Math.Max(entry.Key.Width, 1u)),
+                    Math.Max(entry.Key.Height, 1u),
+                    Math.Max(entry.Key.Depth, 1u) * Math.Max(entry.Key.ArrayLayers, 1u));
+                var end = start + Math.Max(byteCount, 1UL);
+                foreach (var range in _gpuWrittenGuestRanges)
+                {
+                    if (start < range.End && range.Start < end)
+                    {
+                        (evicted ??= []).Add(entry.Key);
+                        break;
+                    }
+                }
+            }
+
+            _gpuWrittenGuestRanges.Clear();
+            if (evicted is null)
+            {
+                return;
+            }
+
+            if (_batchOpen)
+            {
+                FlushBatchedGuestCommands();
+            }
+
+            var retireTimeline = _submitTimeline;
+            foreach (var key in evicted)
+            {
+                if (_textureCache.Remove(key, out var resource))
+                {
+                    UnmarkTextureContentCached(key);
+                    _deferredTextureDestroys.Enqueue((resource, retireTimeline));
+                }
+            }
+
+            var count = Interlocked.Add(ref _gpuWriteTextureEvictions, evicted.Count);
+            if (count == evicted.Count || (count & (count - 1)) == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] vk.texture_evict_gpu_write count={count} batch={evicted.Count} " +
+                    $"first=0x{evicted[0].Address:X16} - cached texture overlapped a GPU write-back");
+            }
+        }
+
+        private static long _gpuWriteTextureEvictions;
+
         private void DrainGuestImageCpuSync()
         {
+            EvictTexturesOverlappingGpuWrites();
             var syncEnabled = SharpEmu.HLE.GuestImageWriteTracker.Enabled;
             HashSet<ulong>? dirtyAddresses = null;
             List<(ulong Address, uint Width, uint Height, ulong ByteCount)>? extents = null;
@@ -12776,6 +12886,9 @@ internal static unsafe class VulkanVideoPresenter
                                             shadowBytes.Slice(run.Start, run.Length));
                                     }
 
+                                    NoteGpuWrittenGuestRange(
+                                        guestAddress + (ulong)pageStart,
+                                        (ulong)pageLength);
                                     writtenPages++;
                                     writtenRuns += runsToWrite.Count;
                                     continue;

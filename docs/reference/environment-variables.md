@@ -56,6 +56,7 @@ Consumed in `src/SharpEmu.CLI/Program.cs` and `src/SharpEmu.Core/Runtime/SharpEm
 | `SHARPEMU_DISABLE_GPU_AWARE_USLEEP` | unset | `1` restores the plain `sceKernelUsleep` intrinsic. By default a short sleep issued repeatedly from one call site while emulated-GPU label writes are pending waits for the GPU instead of yielding (Quake II Q4: `kexRHIStateGnm::StartFrame` "GPU hanged" abort). |
 | `SHARPEMU_LEGACY_MULTI_DCB_SUBMIT` | unset | `1` restores the old direct parse in `sceAgcDriverSubmitMultiDcbs` (kill switch for Q13). By default each DCB is queued like `sceAgcDriverSubmitDcb`, so a frame that parks on a WAIT_REG_MEM resumes instead of being dropped. |
 | `SHARPEMU_TEXTURE_SKIP_REQUIRE_GPU_IMAGE` | unset | `1` restores the 2a75ad4 gate: the per-draw texel copy is skipped only when a GPU guest image is resident at the texture address (kill switch for Q14). By default a texture already in the presenter cache is never re-copied. |
+| `SHARPEMU_NO_GPU_WRITE_TEXTURE_EVICT` | unset | `1` disables Q15: cached textures are no longer evicted when the GPU global-buffer write-back publishes new bytes into their guest memory. |
 | `SHARPEMU_GPU_AWARE_USLEEP_MAX_MS` | `8` | Cap (0–100 ms) on one GPU catch-up wait; `0` disables the wait. |
 
 Consumed in `src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend*.cs`.
