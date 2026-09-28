@@ -135,6 +135,62 @@ public sealed class AgcCommandBufferChainTests
         }
     }
 
+    // Q13 (Quake II): sceAgcDriverSubmitMultiDcbs used to parse each DCB directly and
+    // ignore the "suspended" result, so a frame that parked on a WAIT_REG_MEM left the
+    // graphics queue inactive; its resume was then dropped as stale and the rest of the
+    // frame (end-of-frame release_mem) never ran. It must now park and resume like
+    // sceAgcDriverSubmitDcb.
+    [Fact]
+    public void SubmitMultiDcbs_SuspendedFrame_ResumesAndCompletesOnceLabelIsWritten()
+    {
+        var memory = new FakeCpuMemory(BaseAddress, MemorySize);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        var equeue = CreateEqueue(ctx, memory);
+
+        try
+        {
+            RegisterGraphicsCompletion(equeue);
+
+            var waitDwords = WriteUnsatisfiedWait(ctx, memory, FirstLinkAddress);
+            SubmitMultiDcbs(ctx, memory, FirstLinkAddress, waitDwords);
+
+            // Parked on the label: no completion yet.
+            Assert.NotEqual(
+                (int)OrbisGen2Result.ORBIS_GEN2_OK,
+                WaitEqueue(ctx, memory, equeue));
+
+            // The producer writes the label; the next submission drains the resume.
+            WriteUInt32(memory, WaitLabelAddress, 1);
+            var emptyDwords = WriteChain(ctx, memory, SecondLinkAddress, target: 0, targetDwords: 0);
+            SubmitMultiDcbs(ctx, memory, SecondLinkAddress, emptyDwords);
+
+            Assert.Equal(
+                (int)OrbisGen2Result.ORBIS_GEN2_OK,
+                WaitEqueue(ctx, memory, equeue));
+        }
+        finally
+        {
+            DeleteEqueue(ctx, equeue);
+        }
+    }
+
+    private const ulong MultiAddressArray = BaseAddress + 0x700;
+    private const ulong MultiSizeArray = BaseAddress + 0x780;
+
+    private static void SubmitMultiDcbs(
+        CpuContext ctx,
+        FakeCpuMemory memory,
+        ulong commandAddress,
+        uint dwordCount)
+    {
+        WriteUInt64(memory, MultiAddressArray, commandAddress);
+        WriteUInt32(memory, MultiSizeArray, dwordCount);
+        ctx[CpuRegister.Rdi] = MultiAddressArray;
+        ctx[CpuRegister.Rsi] = MultiSizeArray;
+        ctx[CpuRegister.Rdx] = 1;
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, AgcExports.DriverSubmitMultiDcbs(ctx));
+    }
+
     private static void RegisterGraphicsCompletion(ulong equeue) =>
         Assert.True(KernelEventQueueCompatExports.RegisterEvent(
             equeue,

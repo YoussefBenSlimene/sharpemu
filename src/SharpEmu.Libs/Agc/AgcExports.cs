@@ -4374,6 +4374,10 @@ public static partial class AgcExports
         ExportName = "sceAgcDriverSubmitDcb",
         Target = Generation.Gen5,
         LibraryName = "libSceAgcDriver")]
+    [SysAbiExport(
+        Nid = "AhGvpITrf4M",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
     public static int DriverSubmitDcb(CpuContext ctx)
     {
         Interlocked.Increment(ref _dcbSubmitCount);
@@ -16724,11 +16728,22 @@ GuestImageWriteTracker.Track(
             : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
+    // Kill switch for Q13: SHARPEMU_LEGACY_MULTI_DCB_SUBMIT=1 restores the old
+    // direct (unqueued) parse in sceAgcDriverSubmitMultiDcbs.
+    private static readonly bool _legacyMultiDcbSubmit = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LEGACY_MULTI_DCB_SUBMIT"),
+        "1",
+        StringComparison.Ordinal);
+
     // ABI (reversed from Quake): rdi = array of DCB base addresses (u64 each),
     // rsi = array of DCB sizes in dwords (u32 each), rdx = buffer count.
     [SysAbiExport(
         Nid = "6UzEidRZwkg",
         ExportName = "sceAgcDriverSubmitMultiDcbs",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    [SysAbiExport(
+        Nid = "+T8Xo6LtFJI",
         Target = Generation.Gen5,
         LibraryName = "libSceAgcDriver")]
     public static int DriverSubmitMultiDcbs(CpuContext ctx)
@@ -16770,7 +16785,28 @@ GuestImageWriteTracker.Track(
                             $"addr=0x{commandAddress:X16} dwords={dwordCount}");
                     }
 
-                    ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
+                    if (_legacyMultiDcbSubmit)
+                    {
+                        ParseSubmittedDcb(ctx, gpuState, gpuState.Graphics, commandAddress, dwordCount, tracePackets);
+                        continue;
+                    }
+
+                    // Q13: queue each DCB exactly like sceAgcDriverSubmitDcb. The
+                    // direct parse ignored the "suspended" result, so a frame that
+                    // parked on a WAIT_REG_MEM left the graphics state inactive and
+                    // its resume was dropped as stale (resume_skipped_stale) —
+                    // losing the end-of-frame release_mem that clears Quake II's
+                    // m_pContextLabel → "GPU hanged" abort.
+                    RecordGameSubmittedRange(commandAddress, dwordCount);
+                    gpuState.Graphics.QueueName = "dcb.graphics";
+                    EnqueueSubmittedDcb(
+                        ctx,
+                        gpuState,
+                        gpuState.Graphics,
+                        commandAddress,
+                        dwordCount,
+                        ++gpuState.SubmissionSequence,
+                        tracePackets);
                 }
 
                 DrainResumableDcbs(ctx, gpuState, tracePackets);

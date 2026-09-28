@@ -54,6 +54,7 @@ Consumed in `src/SharpEmu.CLI/Program.cs` and `src/SharpEmu.Core/Runtime/SharpEm
 | `SHARPEMU_NATIVE_WORKER_MAX_CONCURRENT` | `2` | Cap on pooled native guest workers (1–64). |
 | `SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS` | unset | Use the inline `calli` fallback instead of the worker pool. |
 | `SHARPEMU_DISABLE_GPU_AWARE_USLEEP` | unset | `1` restores the plain `sceKernelUsleep` intrinsic. By default a short sleep issued repeatedly from one call site while emulated-GPU label writes are pending waits for the GPU instead of yielding (Quake II Q4: `kexRHIStateGnm::StartFrame` "GPU hanged" abort). |
+| `SHARPEMU_LEGACY_MULTI_DCB_SUBMIT` | unset | `1` restores the old direct parse in `sceAgcDriverSubmitMultiDcbs` (kill switch for Q13). By default each DCB is queued like `sceAgcDriverSubmitDcb`, so a frame that parks on a WAIT_REG_MEM resumes instead of being dropped. |
 | `SHARPEMU_GPU_AWARE_USLEEP_MAX_MS` | `8` | Cap (0–100 ms) on one GPU catch-up wait; `0` disables the wait. |
 
 Consumed in `src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend*.cs`.
