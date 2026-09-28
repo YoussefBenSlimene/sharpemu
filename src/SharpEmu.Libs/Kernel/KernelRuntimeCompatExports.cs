@@ -101,6 +101,11 @@ public static class KernelRuntimeCompatExports
 
         GuestThreadExecution.Scheduler?.Pump(ctx, "sceKernelUsleep");
 
+        if (micros < 1000)
+        {
+            TraceShortSleepBurst(micros);
+        }
+
         if (micros < 1000 && TryWaitForGpuInPollLoop())
         {
             ctx[CpuRegister.Rax] = 0;
@@ -217,6 +222,43 @@ public static class KernelRuntimeCompatExports
         }
 
         return true;
+    }
+
+    // Q11 triage: KEX StartFrame gives up after 500 usleep(1) polls. Report a
+    // long same-call-site burst once per call site, with the GPU state, so a
+    // user log tells whether the budget ran out while SharpEmu believed the
+    // GPU idle (label write never queued/dropped) or busy (too slow).
+    [ThreadStatic]
+    private static ulong _burstTraceCallSite;
+
+    [ThreadStatic]
+    private static int _burstTraceCount;
+
+    [ThreadStatic]
+    private static long _burstTraceLastTicks;
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, byte> _burstTraced = new();
+
+    private static void TraceShortSleepBurst(ulong micros)
+    {
+        var callSite = GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame)
+            ? frame.ReturnRip
+            : 0UL;
+        var now = Stopwatch.GetTimestamp();
+        if (callSite != _burstTraceCallSite || now - _burstTraceLastTicks > GpuPollBurstWindowTicks)
+        {
+            _burstTraceCallSite = callSite;
+            _burstTraceCount = 0;
+        }
+
+        _burstTraceLastTicks = now;
+        if (++_burstTraceCount == 400 && _burstTraced.TryAdd(callSite, 0))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][ERROR] usleep.poll_burst call_site=0x{callSite:X16} polls=400 micros={micros} " +
+                $"{GuestGpuProgress.Describe()} - a guest bounded poll loop is about to exhaust its budget " +
+                "(busy=0 means the awaited GPU write was never queued)");
+        }
     }
 
     private static int ReadGpuPollMaxWaitMilliseconds()

@@ -241,6 +241,14 @@ public static class EmuConsole
             line.Contains("[CRIT", StringComparison.Ordinal) ||
             line.Contains("Unhandled exception", StringComparison.Ordinal) ||
             line.Contains("abort() called by guest", StringComparison.Ordinal) ||
+            // Crash triage lines must survive the Kyty console: the user pastes
+            // the terminal, and the frames/dialog text are the only evidence.
+            line.StartsWith("[LOADER][INFO] abort ", StringComparison.Ordinal) ||
+            line.StartsWith("[LOADER][INFO]   abort ", StringComparison.Ordinal) ||
+            line.StartsWith("[LOADER][INFO]   err-global", StringComparison.Ordinal) ||
+            line.StartsWith("[LOADER][INFO] sceMsgDialogOpen", StringComparison.Ordinal) ||
+            line.StartsWith("[LOADER][INFO]   param+", StringComparison.Ordinal) ||
+            line.StartsWith("[LOADER][ERROR]", StringComparison.Ordinal) ||
             line.Contains("device lost", StringComparison.OrdinalIgnoreCase))
         {
             return true;

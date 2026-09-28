@@ -522,7 +522,7 @@ public static class KernelExports
 
                 // The frame above: caller return + its stack args.
                 var rbp = ctx[CpuRegister.Rbp];
-                for (var frame = 0; frame < 3; frame++)
+                for (var frame = 0; frame < 12; frame++)
                 {
                     var nextRbp = ReadU64(rbp);
                     var callerRet = ReadU64(rbp + 8);

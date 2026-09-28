@@ -25,6 +25,9 @@ public sealed class EmuConsoleTests
     [InlineData("[ERROR][SharpEmu.CLI] Program.cs:1 EBOOT file was not found")]
     [InlineData("[LOADER][INFO] abort() called by guest - terminating")]
     [InlineData("[DEBUG][PRINF] Argument Count = 1")]
+    [InlineData("[LOADER][INFO]   abort frame#0: rbp=0x00007FFFF01FD8C0 ret=0x000000080053BE5D")]
+    [InlineData("[LOADER][INFO]   param+0x98 -> 0x000802AB1650 text=\"ERROR\"")]
+    [InlineData("[LOADER][ERROR] Stall guest-thread: handle=0x1")]
     public void ErrorsAndGuestPrintf_ReachTheTerminal(string line)
     {
         Assert.True(EmuConsole.ShouldShowOnTerminal(line));
