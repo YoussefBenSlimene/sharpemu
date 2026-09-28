@@ -1293,6 +1293,12 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_NO_TEXTURE_SKIP"),
         "1",
         StringComparison.Ordinal);
+    // Kill switch for P1: restore the 2a75ad4 gate (skip only when a GPU guest
+    // image is resident at the address).
+    private static readonly bool _textureSkipRequiresGpuImage = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_TEXTURE_SKIP_REQUIRE_GPU_IMAGE"),
+        "1",
+        StringComparison.Ordinal);
 
     // GPU deswizzle: ship raw tiled bytes + params to the backend instead of
     // detiling on the CPU. On by default; SHARPEMU_GPU_DETILE=0 forces the CPU
@@ -12348,12 +12354,21 @@ private static long _indirectDrawProbeCount;
             SharpEmu.HLE.GuestImageWriteTracker.TryGetWriteGeneration(
                 descriptor.Address,
                 out var writeGeneration);
+        // P1 (Quake II 4 fps, ALLOC 1.8 GB/s): requiring IsGpuGuestImageAvailable
+        // here (2a75ad4) disabled the skip for every plain sampled texture -
+        // that flag is only set for render targets / CPU-backed guest images,
+        // never for texture-cache entries - so static atlases (Quake's 128 MB
+        // of WAL arrays) were re-read and re-detiled on every draw. The cache
+        // path is safe without it: the presenter resolves RT aliases before
+        // the texture cache, and a cache miss self-heals by re-reading texels.
+        // SHARPEMU_TEXTURE_SKIP_REQUIRE_GPU_IMAGE=1 restores the old gate.
         if (!_textureCopySkipDisabled &&
             descriptor.Address != 0 &&
-            GuestGpu.Current.IsGpuGuestImageAvailable(
+            (!_textureSkipRequiresGpuImage ||
+             GuestGpu.Current.IsGpuGuestImageAvailable(
                 descriptor.Address,
                 descriptor.Format,
-                descriptor.NumberType) &&
+                descriptor.NumberType)) &&
             !SharpEmu.HLE.GuestImageWriteTracker.PeekDirty(descriptor.Address) &&
             GuestGpu.Current.IsTextureContentCached(
                 new TextureContentIdentity(
